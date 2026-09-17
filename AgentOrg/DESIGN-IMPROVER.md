@@ -129,16 +129,25 @@ keeping a snapshot for one-command revert. Everything else stays gated.
   snapshot-revertible.
 - **What it would need first:** snapshot/restore with the *same* atomicity as `state.py`'s writes, a
   revert command, and a recorded rollback that the effect journal understands. None of that exists
-  yet — which is the honest reason this is not built rather than a policy preference.
+  yet in the engine — which is the honest reason this is not built rather than a policy preference.
+  (Version control now covers the *workspace*, so a bad commit is recoverable with `git revert`; what
+  is still missing is the engine's own per-proposal snapshot, which is what an unattended loop would
+  need in order to undo one change without touching the rest.)
 
 ### Option 3 — Auto-apply including engine source *(documented, not recommended)*
 
 - **Costs:** the engine *is* the enforcement. An improver editing `evals/` or `guardrail.py` is
   unguarded, and the boundary in §4 exists precisely to prevent it.
-- **Additionally blocked here by the environment:** **this workspace is not a git repository.** A
-  self-modifying agent with no revert path has no way back from a bad change. That is a
-  *precondition*, not a preference: Option 3 requires version control with a tested revert, and
-  saying so is more useful than pretending it is a tuning decision.
+- **The environment precondition is now met, and it does not change the recommendation.** This
+  workspace became a git repository after this document was first written, so a revert path now exists
+  — `git checkout .` after a bad proposal, which was the missing precondition the earlier draft named.
+  That removes one objection and leaves the decisive one standing: **a self-modifying agent that can
+  edit its own eval gate can make anything pass.** Version control makes a bad change *recoverable*; it
+  does not make the gate *trustworthy*, and the gate is what decides whether a change is bad. Revert
+  protects you from the change you noticed; the boundary protects you from the change you did not.
+
+  A revert path is necessary for Option 3 and not sufficient, which is why the boundary in §4 stays
+  hard-coded whether or not the repository exists.
 
 ### Beyond these
 
