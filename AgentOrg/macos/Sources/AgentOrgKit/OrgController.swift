@@ -780,10 +780,12 @@ public final class OrgController: ObservableObject {
         let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 await self?.refresh()
-                if self?.lastEventAt == nil
-                    || Date().timeIntervalSince(self?.lastEventAt ?? .distantPast) > 6 {
-                    await self?.loadModels()
-                }
+                // Models are refreshed on the *same* cadence as everything else, not gated behind
+                // "no event in the last 6s". That gate was self-defeating: adding a provider emits
+                // `model.catalog.refreshed`, which sets `lastEventAt`, which suppressed the very
+                // refresh that would have shown the new provider's models. The result was a panel that
+                // never populated after a change it had just made — the bug this fixes.
+                await self?.loadModels()
             }
         }
         // **`.common`, not `.default`.** A timer scheduled the usual way is paused while a menu is open

@@ -703,3 +703,66 @@ def test_a_slow_command_is_acknowledged_before_the_server_exits(config, library)
     assert acks, "the slow command was executed but its acknowledgement never reached the client"
     assert acks[0]["payload"].get("ok") is True
     assert calls == ["slow"], "the command should have run exactly once"
+
+
+# ── the picker data a hire form needs ────────────────────────────────────────
+#
+# Found by using the app: the People panel loaded only the roster, so its provider and model pickers
+# were empty and hiring looked impossible — while the engine could serve it perfectly. The panel was
+# fixed; these tests pin the *engine* half, which is what the panel depends on.
+
+
+def test_providers_lists_a_provider_with_its_own_models(tmp_path):
+    """A provider that reports models must report them here, or the picker has nothing to offer."""
+    server, creds = _server_with_creds(tmp_path)
+    payload = server._cmd_providers({})
+    entry = next(p for p in payload["providers"] if p["id"] == "ollama")
+    # Ollama is local and may be absent in CI, so assert the *shape* the picker reads rather than a
+    # count: the panel filters `models` by `provider_id` and needs both keys present.
+    assert "models" in entry and isinstance(entry["models"], list)
+    assert "has_key" in entry and "status" in entry
+
+
+def test_models_are_scoped_by_provider_id(tmp_path):
+    """The panel's model picker filters on `provider_id`, so that key must be the id it selects with."""
+    server, creds = _server_with_creds(tmp_path)
+    detail = server._cmd_models({})
+    for entry in detail["models"]:
+        assert entry["provider_id"], "a model without a provider_id cannot be matched to a provider"
+        assert entry["model_id"], "a model without an id cannot be chosen"
+
+
+def test_a_hire_with_an_explicit_provider_and_model_is_accepted(tmp_path):
+    """The path the picker drives — and the one that was unreachable when the pickers were empty."""
+    server, creds = _server_with_creds(tmp_path)
+    # A model the curated table declares a window for, since a probed one needs a live endpoint.
+    result = server._cmd_hire({"name": "Picked", "skill": "code-reviewer",
+                               "provider": "ollama", "model": "qwen2.5-coder:7b"})
+    assert result["agent"]["provider"] == "ollama"
+    assert result["agent"]["model"] == "qwen2.5-coder:7b"
+    assert result["agent"]["context_window"] == 32768
+
+
+def test_a_provider_add_is_visible_to_the_next_providers_and_models_read(tmp_path):
+    """The sequence the panel performs: save, then reload both lists.
+
+    The bug this guards is subtle and was real: adding a provider emitted an event that suppressed the
+    model refresh, so the panel never populated after a change it had just made. The engine half is
+    that the reload must *report* the new provider immediately.
+    """
+    server, creds = _server_with_creds(tmp_path)
+    server._cmd_provider_add({"provider_id": "fresh", "kind": "openai",
+                              "base_url": "https://example.invalid/v1", "api_key": "k" * 20})
+    providers = server._cmd_providers({})
+    assert "fresh" in [p["id"] for p in providers["providers"]]
+    models = server._cmd_models({})
+    assert "fresh" in (models.get("providers") or {}), \
+        "the reloaded catalog must know about the provider it was just told about"
+
+
+def test_the_status_snapshot_carries_what_every_panel_needs(tmp_path):
+    """One poll feeds every panel, so a missing key is a panel that renders blank forever."""
+    server, creds = _server_with_creds(tmp_path)
+    detail = server._cmd_status({})
+    for key in ("org", "goal", "subagents", "proposals", "workspace", "cache", "swarm"):
+        assert key in detail, f"the snapshot omits {key}, so that panel can never populate"

@@ -380,7 +380,15 @@ struct PeoplePanel: View {
             .padding(14)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .task { await controller.loadRoster() }
+        // All three, because the hire form depends on all three: the roster to list agents, the
+        // providers to choose an endpoint, and the models to choose one of *that* provider's models.
+        // Loading only the roster was the bug — the provider picker and the model picker were then
+        // empty, so a hire appeared impossible even though the engine could serve it.
+        .task {
+            await controller.loadRoster()
+            await controller.loadProviders()
+            await controller.loadModels()
+        }
         .alert("Retire this agent?", isPresented: Binding(
             get: { confirmRetire != nil },
             set: { if !$0 { confirmRetire = nil } })) {
@@ -443,15 +451,30 @@ struct PeoplePanel: View {
                 .frame(maxWidth: 240)
                 .accessibilityLabel("Provider for this agent")
 
-                Picker("Model", selection: $draft.model) {
-                    Text("Choose a model…").tag("")
-                    ForEach(modelsForProvider, id: \.self) { model in
-                        Text(model).tag(model)
+                // A picker **or** a text field, decided by what the provider actually reported.
+                //
+                // The picker is better when models are known: it cannot be mistyped, and it shows only
+                // models that provider serves. But a provider whose listing failed — bad key, unreachable
+                // host, an endpoint that reports nothing — would leave the picker empty and make hiring
+                // *impossible*, which is the wrong answer for "the model exists, we just could not ask
+                // about it". So a typed name is always reachable, and the field says which case it is in.
+                if modelsForProvider.isEmpty {
+                    TextField(modelPlaceholder, text: $draft.model)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 320)
+                        .accessibilityLabel("Model for this agent, typed")
+                } else {
+                    Picker("Model", selection: $draft.model) {
+                        Text("Choose a model…").tag("")
+                        ForEach(modelsForProvider, id: \.self) { model in
+                            Text(model).tag(model)
+                        }
                     }
+                    .frame(maxWidth: 320)
+                    .accessibilityLabel("Model for this agent")
                 }
-                .frame(maxWidth: 320)
-                .accessibilityLabel("Model for this agent")
             }
+            modelHint
 
             HStack(spacing: 8) {
                 TextField("Team (optional)", text: $draft.team)
@@ -492,6 +515,36 @@ struct PeoplePanel: View {
             $0["provider_id"]?.stringValue == draft.provider
         }
         return models.compactMap { $0["model_id"]?.stringValue }.sorted()
+    }
+
+    /// What the model field says when there is nothing to pick from.
+    private var modelPlaceholder: String {
+        if draft.provider.isEmpty { return "choose a provider first" }
+        return "type a model name, e.g. llama3.1:8b"
+    }
+
+    /// Why the model list is empty, said plainly.
+    ///
+    /// The failure this prevents is a silent one: an empty picker looks like the app is broken, when
+    /// the truth may be that the provider is unreachable and the model is perfectly usable. Naming the
+    /// reason turns "it doesn't work" into either "fix the endpoint" or "type the name anyway".
+    @ViewBuilder
+    private var modelHint: some View {
+        if !draft.provider.isEmpty && modelsForProvider.isEmpty {
+            let row = controller.providers.first { $0["id"]?.stringValue == draft.provider }
+            let status = row?["status"]?.stringValue ?? "unknown"
+            let error = row?["error"]?.stringValue ?? ""
+            Label(
+                "No models listed for \(draft.provider) (status: \(status)). "
+                + (error.isEmpty ? "Type the model name, or test the provider in the Providers tab."
+                                 : "Test the provider in the Providers tab — \(error)"),
+                systemImage: "info.circle")
+                .font(.caption2).foregroundStyle(.secondary).lineLimit(3)
+        } else if draft.provider.isEmpty {
+            Text("Pick a provider, then choose one of the models it reported. Any OpenAI-compatible "
+                 + "endpoint works — the list comes from the provider itself.")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
     }
 
     /// How many agents the Owner actually hired, and how many are the built-in company.
