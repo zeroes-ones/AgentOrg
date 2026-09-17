@@ -1,0 +1,145 @@
+{
+  "failed": 0,
+  "frozen_at": "2026-09-15T22:45:33Z",
+  "pass_rate": 1.0,
+  "passed": 17,
+  "results": {
+    "autonomy-floor": {
+      "check": "policy",
+      "detail": "floor refused R-ESCALATE/R-CONFLICT below confirm; routine class loosened; opt-in honoured",
+      "duration_ms": 0.1,
+      "error": "",
+      "name": "autonomy-floor",
+      "passed": true
+    },
+    "constraint-survival": {
+      "check": "context",
+      "detail": "survived compaction, carried non-negotiable through a capacity rotation, re-pinned to primacy",
+      "duration_ms": 0.78,
+      "error": "",
+      "name": "constraint-survival",
+      "passed": true
+    },
+    "context-thresholds": {
+      "check": "context",
+      "detail": "healthy none; warning prepared; critical evicted; overflow emergency",
+      "duration_ms": 0.2,
+      "error": "",
+      "name": "context-thresholds",
+      "passed": true
+    },
+    "delegation-safety": {
+      "check": "delegation",
+      "detail": "unjustified rejected; S1-S5 refused; S4 least privilege and S6 lineage held",
+      "duration_ms": 0.38,
+      "error": "",
+      "name": "delegation-safety",
+      "passed": true
+    },
+    "diagnostics-refuses-secrets": {
+      "check": "security",
+      "detail": "log redacted on write; bundle assembled; a leaked source refused and left no file",
+      "duration_ms": 16.98,
+      "error": "",
+      "name": "diagnostics-refuses-secrets",
+      "passed": true
+    },
+    "gate-integrity": {
+      "check": "gates",
+      "detail": "incomplete payload and unrecorded irreversible decision both refused",
+      "duration_ms": 0.16,
+      "error": "",
+      "name": "gate-integrity",
+      "passed": true
+    },
+    "health-evidence-over-noise": {
+      "check": "health",
+      "detail": "min-sample held; hard trigger quarantined; probe restored to degraded",
+      "duration_ms": 0.77,
+      "error": "",
+      "name": "health-evidence-over-noise",
+      "passed": true
+    },
+    "idempotent-effects": {
+      "check": "idempotency",
+      "detail": "same-attempt retry replayed; new attempt applied; effect ran exactly twice",
+      "duration_ms": 3.22,
+      "error": "",
+      "name": "idempotent-effects",
+      "passed": true
+    },
+    "ledger-override-is-explicit": {
+      "check": "gates",
+      "detail": "irreversible re-make refused; unmarked override refused; superseded entry marked",
+      "duration_ms": 0.08,
+      "error": "",
+      "name": "ledger-override-is-explicit",
+      "passed": true
+    },
+    "loop-termination": {
+      "check": "graph",
+      "detail": "8 nodes, loop bounded at 3, gate human-gate",
+      "duration_ms": 148.14,
+      "error": "",
+      "name": "loop-termination",
+      "passed": true
+    },
+    "memory-poisoning-guard": {
+      "check": "memory",
+      "detail": "recall labelled context-only in the store and in the prompt; unmeasured cost preserved",
+      "duration_ms": 2.72,
+      "error": "",
+      "name": "memory-poisoning-guard",
+      "passed": true
+    },
+    "plan-validates-on-disk": {
+      "check": "graph",
+      "detail": "emitted as Safe YAML and accepted by the library's validator on disk",
+      "duration_ms": 230.09,
+      "error": "",
+      "name": "plan-validates-on-disk",
+      "passed": true
+    },
+    "planner-reports-gaps": {
+      "check": "graph",
+      "detail": "7 bound, 1 gap(s) reported: ['security-engineer']",
+      "duration_ms": 86.86,
+      "error": "",
+      "name": "planner-reports-gaps",
+      "passed": true
+    },
+    "reviewer-independence": {
+      "check": "independence",
+      "detail": "self-review refused; Sana differs by ['context_lineage', 'model', 'provider']",
+      "duration_ms": 78.98,
+      "error": "",
+      "name": "reviewer-independence",
+      "passed": true
+    },
+    "rotation-refuses-when-impossible": {
+      "check": "context",
+      "detail": "refused with the fix named (irreducible 88%)",
+      "duration_ms": 0.11,
+      "error": "",
+      "name": "rotation-refuses-when-impossible",
+      "passed": true
+    },
+    "router-asks-when-unsure": {
+      "check": "routing",
+      "detail": "routine acted; gated proposed 1 candidate(s); producer filtered",
+      "duration_ms": 0.3,
+      "error": "",
+      "name": "router-asks-when-unsure",
+      "passed": true
+    },
+    "skill-enforceability": {
+      "check": "skills",
+      "detail": "327 skills all gated; code-reviewer yields CR1-CR14 and 8 research steps",
+      "duration_ms": 919.09,
+      "error": "",
+      "name": "skill-enforceability",
+      "passed": true
+    }
+  },
+  "scenarios": 17
+}

@@ -1,0 +1,36 @@
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# Real credentials never enter the repository. credentials.example.json is the
+# committed template; credentials.json holds live keys and stays local.
+credentials.json
+
+# ── Runtimes ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# ── Swift / SwiftPM ──────────────────────────────────────────────────────────
+macos/.build/
+macos/.swiftpm/
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+
+# ── Generated run state ──────────────────────────────────────────────────────
+# projects/ holds user workspaces: artifacts, trace.jsonl, run_state.json,
+# session transcripts, telemetry spans and the effect journal.
+projects/
+
+# ── Telemetry and memory stores (may contain run content) ────────────────────
+.agent_state/
+.agent-run/
+telemetry/
+
+# ── Your own agents and skills ───────────────────────────────────────────────
+# `.agentorg/` holds the roster you hired and any skills you authored. It is
+# personal working state, not part of the project's source, so it stays local.
+.agentorg/
+
+# ── OS noise ─────────────────────────────────────────────────────────────────
+.DS_Store

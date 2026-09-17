@@ -1,0 +1,34 @@
+# Agent — workspace config for Reasonix.
+#
+# Skill discovery is intentionally scoped to this workspace. A project-level
+# [skills] table REPLACES the global one (verified with `reasonix doctor
+# capabilities`), so the library roots are repeated here for parity with
+# ~/.reasonix/config.toml. The flat layer is the one-level <name>/SKILL.md
+# discovery view; the nested skills/ root is kept for its extra roots.
+
+[permissions]
+allow = ["Bash(sed -n:*)"]
+
+[skills]
+paths = [
+  "/Users/sp.vm/Documents/Projects/Skills",
+  "/Users/sp.vm/Documents/Projects/Skills/skills",
+]
+
+# Write roots for the one-time global skill repoint
+# (scripts/global-repoint-skills.sh). The agent home dirs are added so this
+# workspace can convert ~/.<agent>/skills from stale symlinks into per-skill
+# symlink dirs. Remove this block after the repoint is done.
+[sandbox]
+allow_write = [
+  "/Users/sp.vm/.agents",
+  "/Users/sp.vm/.claude",
+  "/Users/sp.vm/.copilot",
+  "/Users/sp.vm/.cursor",
+  "/Users/sp.vm/.codex",
+  "/Users/sp.vm/.gemini",
+  "/Users/sp.vm/.github",
+  "/Users/sp.vm/.windsurf",
+  "/Users/sp.vm/.cline",
+  "/Users/sp.vm/.opencode",
+]

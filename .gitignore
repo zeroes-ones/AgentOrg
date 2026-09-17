@@ -1,0 +1,69 @@
+# Agent — repository ignore rules
+#
+# This is a *workspace* repository: it holds the AgentOrg engine, the native console, and the skill
+# discovery links. The rules below separate what is source (reviewed, diffable, committed) from what is
+# generated, personal, or secret.
+#
+# AgentOrg/ has its own .gitignore for its own concerns. This file covers the workspace root, where the
+# extra directories live.
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# Live keys never enter the repository. `credentials.example.json` is the committed template; the real
+# `credentials.json` stays local, which is why a key pasted into the console is not committed with it.
+credentials.json
+*.env
+*.key
+*.pem
+
+# ── Agent runtime state — not project source ─────────────────────────────────
+# `.reasonix/` holds this agent's own session state: per-task snapshots, event logs, locks, and
+# clipboard attachments from a session. It is working state that happens to live in the tree, not
+# something a reviewer would ever want in a diff — and it changes on every run, so committing it would
+# mean a commit per session that says nothing.
+.reasonix/
+
+# The engine's own run state, when a project workspace is rooted at the repo.
+.agent_state/
+.agent-run/
+telemetry/
+projects/
+
+# A roster and authored skills are personal working state, not shared source.
+.agentorg/
+
+# ── Build output ─────────────────────────────────────────────────────────────
+# SwiftPM's artifact directory. `AgentOrg/macos/.build/` is ignored by AgentOrg's own rules; this
+# catches a stray one at the package root, which is where SwiftPM puts it when invoked from there.
+.build/
+macos/.build/
+macos/.swiftpm/
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+
+# ── Language runtimes ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# ── Skill discovery links ────────────────────────────────────────────────────
+# `scripts/init-project.sh` creates these as symlinks into the Skills library. They are absolute paths
+# on one machine, so committing them would hand every other checkout a broken link — the links are
+# derived, and the script that makes them is committed instead.
+.agents/skills
+.claude/skills
+.copilot/skills
+.github/skills
+.cursor/skills
+.codex/skills
+.gemini/skills
+.windsurf/skills
+.cline/skills
+.opencode/skills
+
+# ── OS noise ─────────────────────────────────────────────────────────────────
+.DS_Store

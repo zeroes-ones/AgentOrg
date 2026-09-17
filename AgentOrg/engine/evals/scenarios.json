@@ -1,0 +1,108 @@
+{
+  "_comment": "The behavioural suite. Each scenario names an INVARIANT the system promises, not a feature it has. A scenario that fails means a safety or correctness property no longer holds, which is why the gate blocks on a regression. Add a scenario whenever a real failure is found: an incident becomes a case.",
+  "version": "1.0.0",
+  "scenarios": {
+    "loop-termination": {
+      "invariant": "every generated loop terminates at a reachable human gate",
+      "why": "An unbounded loop is a run that never finishes; an unreachable gate is a run that cannot stop.",
+      "category": "graph",
+      "severity": "critical"
+    },
+    "constraint-survival": {
+      "invariant": "a NEVER/MUST NOT rule survives compaction, rotation and re-pinning into the primacy zone",
+      "why": "This is how 'NEVER store passwords in plaintext' silently becomes 'use secure auth', after which the model picks MD5.",
+      "category": "context",
+      "severity": "critical"
+    },
+    "rotation-refuses-when-impossible": {
+      "invariant": "an irreducible overflow is refused with the fix named, not looped on",
+      "why": "A fresh session would overflow identically, so rotating would spin forever while appearing to make progress.",
+      "category": "context",
+      "severity": "high"
+    },
+    "reviewer-independence": {
+      "invariant": "a reviewer is never the producer of the artifact it judges",
+      "why": "A verifier that is the producer inherits its own blind spots and agrees for the same wrong reason.",
+      "category": "independence",
+      "severity": "critical"
+    },
+    "gate-integrity": {
+      "invariant": "no node advances on an unevidenced done or an unrecorded irreversible decision",
+      "why": "Premature completion is the single most expensive failure in agent workflows.",
+      "category": "gates",
+      "severity": "critical"
+    },
+    "delegation-safety": {
+      "invariant": "the delegation invariants S1-S5 refuse their violations and S4/S6 hold",
+      "why": "Delegation without these compounds error 15-20% per hop and can spend without bound.",
+      "category": "delegation",
+      "severity": "critical"
+    },
+    "autonomy-floor": {
+      "invariant": "no single setting can silently disable every human gate",
+      "why": "The floor is what stops the loop guards and escalation design from becoming decoration.",
+      "category": "policy",
+      "severity": "critical"
+    },
+    "router-asks-when-unsure": {
+      "invariant": "a gated or low-confidence route proposes ranked candidates rather than acting",
+      "why": "The router being confident is exactly when an unchecked choice is least justified.",
+      "category": "routing",
+      "severity": "high"
+    },
+    "health-evidence-over-noise": {
+      "invariant": "a new hire is not judged on one task, and a hard trigger overrides a healthy average",
+      "why": "Noise-driven quarantine punishes a hire for being new; an average hides a security trip.",
+      "category": "health",
+      "severity": "high"
+    },
+    "ledger-override-is-explicit": {
+      "invariant": "an override carries a SUPERSEDED marker, and an irreversible decision is not re-made",
+      "why": "Two contradictory decisions with no marker means a later agent may re-adopt the wrong one.",
+      "category": "gates",
+      "severity": "high"
+    },
+    "context-thresholds": {
+      "invariant": "the compaction ladder acts differently in each band and evicts only when warranted",
+      "why": "Reacting at 95% means the agent already spent fifteen turns with diluted attention.",
+      "category": "context",
+      "severity": "medium"
+    },
+    "planner-reports-gaps": {
+      "invariant": "a plan needing an unstaffed capability reports the gap before a run",
+      "why": "Otherwise a graph runs three nodes and stops, far from the cause.",
+      "category": "graph",
+      "severity": "medium"
+    },
+    "skill-enforceability": {
+      "invariant": "every library skill yields completion criteria, so no node can be ungated",
+      "why": "A skill that parses as empty looks like coverage and is not.",
+      "category": "skills",
+      "severity": "critical"
+    },
+    "memory-poisoning-guard": {
+      "invariant": "recalled memory is labelled context-only and never presented as a directive",
+      "why": "One bad run obeyed as an instruction becomes an invisible standing directive.",
+      "category": "memory",
+      "severity": "high"
+    },
+    "diagnostics-refuses-secrets": {
+      "invariant": "a diagnostics bundle refuses to carry a credential",
+      "why": "A bundle is meant to be shared, so it must be safe by construction rather than by review.",
+      "category": "security",
+      "severity": "critical"
+    },
+    "idempotent-effects": {
+      "invariant": "a retried effect is not applied twice, while a deliberate rework is",
+      "why": "Retries are guaranteed, so without this a crash-resume double-spends and duplicates work.",
+      "category": "idempotency",
+      "severity": "high"
+    },
+    "plan-validates-on-disk": {
+      "invariant": "a plan that validates in memory is readable by the library's own validator",
+      "why": "The runner reads the manifest from disk, so an in-memory-only valid plan is unusable.",
+      "category": "graph",
+      "severity": "high"
+    }
+  }
+}
