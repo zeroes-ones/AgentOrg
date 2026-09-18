@@ -6,10 +6,10 @@ from the [`zeroes-ones/Skills`](https://github.com/zeroes-ones/Skills) library,
 and points them at a project. Agents work together through typed handoffs,
 loops, graphs and gates until the work is done.
 
-Ten focused amendments cover subsystems in depth. The first seven are the original
-build; the last three are **implemented** and make AgentOrg run as a coding agent
-you leave running on a real repository — attach your own folder, keep going until
-the goal is done, and fan out over isolated, resumable subagents.
+This master document is the whole design; the focused amendments below cover
+subsystems in depth. The original seven are the first build, and the rest —
+implemented and tested — make AgentOrg run as a coding agent you leave running
+on a real repository.
 
 | Document | Covers |
 |---|---|
@@ -37,6 +37,38 @@ stops for the Owner. It never applies anything.
 | Amendment | Status |
 |---|---|
 | [`DESIGN-IMPROVER.md`](DESIGN-IMPROVER.md) | The `trace → draft → promote` loop. Detection, drafting, validation and the console panel are **built**; autonomy options 2 and 3 are **documented, not built**, with the reasons. |
+
+One further amendment is **implemented and tested**: the activity timeline and the
+goal-driven org. Together they make an autonomous org legible — *what is it doing, why did it stop,
+and is the org it ran the one the goal asked for?*
+
+| Amendment | Status |
+|---|---|
+| [`DESIGN-ACTIVITY.md`](DESIGN-ACTIVITY.md) | Domain-aware planning, roster-aware staffing gaps, `--project` resolution, `stop_reason`, and `engine/activity.py`. **Built** and surfaced in both the CLI and the app. |
+
+A fifth amendment is **implemented and tested**: the mission layer, the library's own dependency graph
+made usable, derived verifier roles, and bounded-reroute agent gates. Together they make the org's
+*intent* durable and its *decisions* autonomous where that is safe.
+
+| Amendment | Status |
+|---|---|
+| [`DESIGN-AUTONOMY.md`](DESIGN-AUTONOMY.md) | Mission → objective → goal → run, the `chain:` graph in planning, verifier roles derived from skills, and `kind: agent` gates. **Built.** See also [`AUTONOMY-MAP.md`](AUTONOMY-MAP.md) for the end-to-end picture. |
+
+A sixth amendment is **implemented and tested**: the portfolio, which lets one principal run several
+orgs at once — each with its own agents, missions, goals and budget — through a fleet bounded by a
+global concurrency ceiling and a per-org budget.
+
+| Amendment | Status |
+|---|---|
+| [`DESIGN-PORTFOLIO.md`](DESIGN-PORTFOLIO.md) | The Principal and the orgs they run, org identity, the concurrent `Fleet`, and the CLI/app surfaces. **Built.** |
+
+A seventh amendment is **implemented and tested**: one resolved default provider/model that everyone
+inherits, goal autonomy where a human is involved only when chosen, auto-staffing a missing skill on
+the default model, and the flow board that shows who is working on what.
+
+| Amendment | Status |
+|---|---|
+| [`DESIGN-DEFAULTS-AUTONOMY.md`](DESIGN-DEFAULTS-AUTONOMY.md) | The default pair resolved once, `GoalPolicy` and gate auto-approval, auto-staffing a gap, and `engine/flow.py`. **Built** and surfaced in both the CLI and the app. See also [`AUTONOMY-MAP.md`](AUTONOMY-MAP.md). |
 
 ---
 
@@ -321,7 +353,23 @@ be built and tested independently.
 | Context | `session.open` · `session.saturation` · `session.compact` · `session.rotate.requested` · `session.sealed` · `session.handoff.verified` · `session.closed` · `context.irreducible_overflow` · `attention.decay` |
 | Health | `agent.health.changed` · `agent.slo.breach` · `agent.quarantined` · `agent.recovered` · `agent.sprawl.suspected` |
 | Control | `human.gate` · `human.decision` · `policy.changed` · `human.takeover` · `human.released` |
-| Ops | `backpressure.on` · `backpressure.off` · `cost.ceiling` · `cost.reconciled` · `budget.burn` · `watchdog.restart` · `delegation.rejected` · `schema.migrated` · `schema.refused` · `effect.applied` · `effect.replayed` · `leak.detected` · `span.exported` · `diagnostics.exported` · `error` |
+| Ops | `backpressure.on` · `backpressure.off` · `cost.ceiling` · `cost.reconciled` · `budget.burn` · `watchdog.restart` · `delegation.rejected` · `schema.migrated` · `schema.refused` · `effect.applied` · `effect.replayed` · `leak.detected` · `span.exported` · `diagnostics.exported` · `error` · `engine.ready` |
+
+### The readiness handshake (added after a real failure)
+
+A process that has **spawned** is not an engine that **works**. The console originally published
+`running` the instant `Process.run()` returned, so a bootstrap failure — a refused config, a missing
+library — showed a green "Engine running" with a pid and a dead UI. Three rules now hold:
+
+1. **`engine.ready` is the readiness proof.** The server emits it as its *first* frame, only after the
+   workspace, config and providers have all resolved. The app stays `launching` until it arrives.
+2. **A fatal bootstrap failure is a typed `error` frame on stdout** (`fatal: true`,
+   `phase: "bootstrap"`), carrying the real reason — not a bare exit code on stderr the app never reads.
+3. **The app drains the pipes before it fails**, so a frame written in the same instant as the exit is
+   decoded rather than discarded by the termination handler.
+
+The `engine` group therefore has one entry that is not a run event: `engine.ready`. It exists because
+"did it start" is a question the protocol has to answer for the console to be honest.
 
 Commands: `start` · `pause` · `resume` · `approve` · `reject` · `instruct` ·
 `assign` · `spawn_agent` · `rename_agent` · `reassign` · `takeover` · `release` ·

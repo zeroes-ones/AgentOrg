@@ -156,7 +156,14 @@ def _org():
 
 
 def check_loop_termination() -> str:
-    """Every generated plan must contain a bounded loop and a reachable terminal gate."""
+    """Every generated plan must contain a bounded loop and a reachable terminal gate.
+
+    The terminal authority is still a *human* gate, but exhaustion may now pass through a
+    **bounded, agent-made reroute** first (`kind: agent`, capped by `max_reroutes`). So the invariant
+    is stated as it now holds: the loop's escalation reaches a human gate in at most one bounded hop.
+    An agent gate that did not eventually reach a human gate would be unbounded autonomy, which is
+    exactly what this check exists to forbid.
+    """
     plan = Planner(_source()).plan("Build a booking API with auth", slug="eval-loop")
     assert plan.validation.valid, f"plan did not validate: {plan.validation.errors}"
     loops = plan.loops
@@ -164,10 +171,23 @@ def check_loop_termination() -> str:
     loop = loops[0]
     assert loop["exit_when"], "an unbounded loop would never terminate"
     assert loop["max_iterations"] >= 1
-    gates = {g["id"] for g in plan.gates if g.get("kind") == "human"}
-    assert gates, "a plan must end at a human gate"
-    assert loop["escalate_to"] in gates, "loop exhaustion must reach the human gate"
-    return f"{len(plan.nodes)} nodes, loop bounded at {loop['max_iterations']}, gate {loop.get('escalate_to')}"
+    by_id = {g["id"]: g for g in plan.gates}
+    human = {gid for gid, g in by_id.items() if g.get("kind") == "human"}
+    assert human, "a plan must end at a human gate"
+
+    target = loop["escalate_to"]
+    assert target in by_id, f"loop escalates to unknown gate {target!r}"
+    hops = 0
+    while by_id.get(target, {}).get("kind") == "agent":
+        # A bounded reroute may stand between the loop and the human — once.
+        assert hops < 1, "more than one agent gate between the loop and a human is unbounded"
+        assert by_id[target].get("max_reroutes", 0) >= 1, "an agent gate must bound its reroutes"
+        target = by_id[target].get("escalate_to")
+        assert target in by_id, "an agent gate must escalate onward to a declared gate"
+        hops += 1
+    assert target in human, "loop exhaustion must ultimately reach the human gate"
+    return (f"{len(plan.nodes)} nodes, loop bounded at {loop['max_iterations']}, "
+            f"escalates to {loop['escalate_to']} → {target}")
 
 
 def check_constraint_survival() -> str:

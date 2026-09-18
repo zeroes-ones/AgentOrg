@@ -498,6 +498,19 @@ class PromptBuilder:
             f"One entry per id: {', '.join(bundle.checklist_ids())}"
             if bundle.checklist else "No checklist for this node; report criteria only."
         )
+        # The criteria get the same per-item mandate the checklist has.
+        #
+        # This asymmetry was a defect behind a real failure. The checklist rule read "Include an entry
+        # in `checklist` for **every** id: PM1, PM2, …" and named all twelve, so the model reported all
+        # twelve. `criteria_satisfied` had no matching rule — only a one-item example object in the
+        # schema — so a model reported *one* criterion, the node failed its own contract on c1/c2, and a
+        # whole run parked on its first node.
+        #
+        # The rule points at the completion criteria block rather than repeating them: that block
+        # (`## COMPLETION CRITERIA`) already enumerates every criterion in the body, and duplicating the
+        # text here would grow the recency zone — which is measured, and whose growth dilutes the
+        # cacheable prefix (see `test_the_prompt_prefix_is_stable_across_different_tasks`). One stated
+        # rule, no duplication.
         return (
             "## OUTPUT CONTRACT — your reply MUST end with this block\n"
             "Write your work first, then finish with exactly one fenced block tagged "
@@ -505,16 +518,20 @@ class PromptBuilder:
             f"```{TRAILER_FENCE}\n{json.dumps(schema, indent=2)}\n```\n\n"
             "Rules:\n"
             "- Valid JSON only inside the fence. No comments, no trailing commas.\n"
+            "- Include an entry in `criteria_satisfied` for **every** criterion listed under "
+            "`## COMPLETION CRITERIA` above — all of them, each with its `criterion` copied verbatim. "
+            "One entry is not coverage.\n"
             f"- Include an entry in `checklist` for **every** id. {checklist_hint}\n"
-            "- `evidence` must be concrete: a path, a hash, or command output.\n"
+            "- `evidence` must be concrete: a path, a hash, or command output. A `PASS` with no "
+            "evidence is not a pass — mark it `FAIL` or `N/A` instead.\n"
             "- In `artifacts`, every file you create or change MUST include its full `content`. The "
             "engine writes the file from that field, so an artifact with only a path produces no "
             "file and starves every downstream node. Do not write `\"sha256\": \"UNKNOWN\"`.\n"
             "- If you could not satisfy a criterion, set `status` to `needs_review` or "
             "`blocked` and name the blocker in `open_questions`. Do not claim a pass you "
             "cannot evidence.\n"
-            "- An empty `criteria_satisfied` array means nothing was verified, which is a "
-            "blocked result, not a done one."
+            "- A missing entry and an empty `criteria_satisfied` both mean nothing was verified, "
+            "which is a blocked result, not a done one."
             # The identity block sits *after* the contract, and its wording has to reinforce the
             # contract rather than appear to relax it. An earlier phrasing — "nothing above changes
             # because of your name" — read as if the preceding instructions were informational, which
@@ -615,17 +632,18 @@ def extract_trailer(text: str, *, require: bool = True) -> dict[str, Any] | None
             raise TrailerError("reply is empty, so it carries no trailer")
         return None
 
-    for pattern in (_TRAILER_RE, _JSON_FENCE_RE):
-        match = pattern.search(text)
-        if not match:
-            continue
-        payload = _parse_json_object(match.group(1))
-        if payload is not None:
+    # A fenced block is extracted by *balanced braces*, not by "up to the next ```". A trailer's
+    # `artifacts[].content` is a whole file that routinely embeds fences of its own, and the
+    # non-greedy form stopped inside the JSON — which is how a complete, valid 53KB trailer was
+    # reported as "no parsable JSON trailer".
+    for fence in (TRAILER_FENCE, "json"):
+        payload = _parse_fenced(text, fence)
+        if _looks_like_a_trailer(payload):
             return payload
 
     # Last resort: the final balanced object in the text, for a model that omitted the fence.
     payload = _trailing_object(text)
-    if payload is not None:
+    if _looks_like_a_trailer(payload):
         return payload
 
     if require:
@@ -633,6 +651,80 @@ def extract_trailer(text: str, *, require: bool = True) -> dict[str, Any] | None
             "reply contains no parsable JSON trailer. Looked for a ```"
             f"{TRAILER_FENCE} fence, a ```json fence, and a trailing object."
         )
+    return None
+
+
+#: The keys a trailer must carry at least one of to be a trailer at all.
+#:
+#: A real failure made this necessary. A model answered a `pm` node with a JSON object shaped like its
+#: own *intake* block (`{"task": …, "received": …, "owed": …, "assumptions": …, "open_questions": …}`)
+#: and nothing else. `extract_trailer` accepted it — it was a dict, so it "parsed" — and the node then
+#: reported zero criteria coverage and failed its own contract, while the log said the trailer had
+#: parsed. An object with none of the result-bearing keys is not a trailer, and saying so is what turns
+#: "the contract was violated" into "the model did not answer in the required shape".
+_TRAILER_RESULT_KEYS = ("status", "verdict", "findings", "criteria_satisfied", "checklist",
+                        "artifacts", "summary", "decisions")
+
+
+def _looks_like_a_trailer(payload: dict[str, Any] | None) -> bool:
+    """Whether a parsed object is actually the result trailer, not an incidental JSON blob."""
+    if not isinstance(payload, dict):
+        return False
+    return any(key in payload for key in _TRAILER_RESULT_KEYS)
+
+
+def _parse_fenced(text: str, fence: str) -> dict[str, Any] | None:
+    """Parse the JSON object inside a ```fence block, tolerating nested fences in its values.
+
+    The trailer's `artifacts[].content` is an **entire file**, and a markdown artifact routinely
+    contains ``` fences of its own (a Gherkin block, an example, a nested code sample). A
+    non-greedy `(.*?)` up to the next ``` therefore stops inside the JSON and the parse fails — a real
+    run produced a complete, valid 53KB trailer containing a Gherkin block, and the engine reported
+    "no parsable JSON trailer" and failed the node's contract.
+
+    So the body is delimited by the model's own braces rather than by the next fence: find the opening
+    `fence\n`, then take the balanced `{…}` that follows and parse that. The closing fence is not
+    needed at all — JSON's own structure says where the object ends.
+    """
+    opener = f"```{fence}"
+    start = text.find(opener)
+    while start != -1:
+        brace = text.find("{", start + len(opener))
+        if brace != -1:
+            payload = _balanced_object(text, brace)
+            if _looks_like_a_trailer(payload):
+                return payload
+        start = text.find(opener, start + 1)
+    return None
+
+
+def _balanced_object(text: str, start: int) -> dict[str, Any] | None:
+    """The balanced `{…}` beginning at `start`, parsed. Brace counting respects strings and escapes.
+
+    Counting must honour string literals: a `}` inside a JSON string — which the file `content` of a
+    markdown artifact contains constantly — would otherwise close the object early.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return _parse_json_object(text[start:index + 1])
     return None
 
 

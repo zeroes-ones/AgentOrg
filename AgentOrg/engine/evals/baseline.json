@@ -1,13 +1,13 @@
 {
   "failed": 0,
-  "frozen_at": "2026-09-15T22:45:33Z",
+  "frozen_at": "2026-09-17T09:41:39Z",
   "pass_rate": 1.0,
   "passed": 17,
   "results": {
     "autonomy-floor": {
       "check": "policy",
       "detail": "floor refused R-ESCALATE/R-CONFLICT below confirm; routine class loosened; opt-in honoured",
-      "duration_ms": 0.1,
+      "duration_ms": 0.07,
       "error": "",
       "name": "autonomy-floor",
       "passed": true
@@ -15,7 +15,7 @@
     "constraint-survival": {
       "check": "context",
       "detail": "survived compaction, carried non-negotiable through a capacity rotation, re-pinned to primacy",
-      "duration_ms": 0.78,
+      "duration_ms": 0.44,
       "error": "",
       "name": "constraint-survival",
       "passed": true
@@ -23,7 +23,7 @@
     "context-thresholds": {
       "check": "context",
       "detail": "healthy none; warning prepared; critical evicted; overflow emergency",
-      "duration_ms": 0.2,
+      "duration_ms": 0.14,
       "error": "",
       "name": "context-thresholds",
       "passed": true
@@ -31,7 +31,7 @@
     "delegation-safety": {
       "check": "delegation",
       "detail": "unjustified rejected; S1-S5 refused; S4 least privilege and S6 lineage held",
-      "duration_ms": 0.38,
+      "duration_ms": 0.29,
       "error": "",
       "name": "delegation-safety",
       "passed": true
@@ -39,7 +39,7 @@
     "diagnostics-refuses-secrets": {
       "check": "security",
       "detail": "log redacted on write; bundle assembled; a leaked source refused and left no file",
-      "duration_ms": 16.98,
+      "duration_ms": 13.89,
       "error": "",
       "name": "diagnostics-refuses-secrets",
       "passed": true
@@ -47,7 +47,7 @@
     "gate-integrity": {
       "check": "gates",
       "detail": "incomplete payload and unrecorded irreversible decision both refused",
-      "duration_ms": 0.16,
+      "duration_ms": 0.09,
       "error": "",
       "name": "gate-integrity",
       "passed": true
@@ -55,7 +55,7 @@
     "health-evidence-over-noise": {
       "check": "health",
       "detail": "min-sample held; hard trigger quarantined; probe restored to degraded",
-      "duration_ms": 0.77,
+      "duration_ms": 0.73,
       "error": "",
       "name": "health-evidence-over-noise",
       "passed": true
@@ -63,7 +63,7 @@
     "idempotent-effects": {
       "check": "idempotency",
       "detail": "same-attempt retry replayed; new attempt applied; effect ran exactly twice",
-      "duration_ms": 3.22,
+      "duration_ms": 1.85,
       "error": "",
       "name": "idempotent-effects",
       "passed": true
@@ -71,15 +71,15 @@
     "ledger-override-is-explicit": {
       "check": "gates",
       "detail": "irreversible re-make refused; unmarked override refused; superseded entry marked",
-      "duration_ms": 0.08,
+      "duration_ms": 0.04,
       "error": "",
       "name": "ledger-override-is-explicit",
       "passed": true
     },
     "loop-termination": {
       "check": "graph",
-      "detail": "8 nodes, loop bounded at 3, gate human-gate",
-      "duration_ms": 148.14,
+      "detail": "8 nodes, loop bounded at 3, escalates to reroute-gate \u2192 human-gate",
+      "duration_ms": 151.51,
       "error": "",
       "name": "loop-termination",
       "passed": true
@@ -87,7 +87,7 @@
     "memory-poisoning-guard": {
       "check": "memory",
       "detail": "recall labelled context-only in the store and in the prompt; unmeasured cost preserved",
-      "duration_ms": 2.72,
+      "duration_ms": 2.0,
       "error": "",
       "name": "memory-poisoning-guard",
       "passed": true
@@ -95,7 +95,7 @@
     "plan-validates-on-disk": {
       "check": "graph",
       "detail": "emitted as Safe YAML and accepted by the library's validator on disk",
-      "duration_ms": 230.09,
+      "duration_ms": 167.99,
       "error": "",
       "name": "plan-validates-on-disk",
       "passed": true
@@ -103,7 +103,7 @@
     "planner-reports-gaps": {
       "check": "graph",
       "detail": "7 bound, 1 gap(s) reported: ['security-engineer']",
-      "duration_ms": 86.86,
+      "duration_ms": 82.12,
       "error": "",
       "name": "planner-reports-gaps",
       "passed": true
@@ -111,7 +111,7 @@
     "reviewer-independence": {
       "check": "independence",
       "detail": "self-review refused; Sana differs by ['context_lineage', 'model', 'provider']",
-      "duration_ms": 78.98,
+      "duration_ms": 83.44,
       "error": "",
       "name": "reviewer-independence",
       "passed": true
@@ -127,7 +127,7 @@
     "router-asks-when-unsure": {
       "check": "routing",
       "detail": "routine acted; gated proposed 1 candidate(s); producer filtered",
-      "duration_ms": 0.3,
+      "duration_ms": 0.29,
       "error": "",
       "name": "router-asks-when-unsure",
       "passed": true
@@ -135,7 +135,7 @@
     "skill-enforceability": {
       "check": "skills",
       "detail": "327 skills all gated; code-reviewer yields CR1-CR14 and 8 research steps",
-      "duration_ms": 919.09,
+      "duration_ms": 799.54,
       "error": "",
       "name": "skill-enforceability",
       "passed": true

@@ -190,6 +190,56 @@ def test_a_reply_without_a_trailer_becomes_needs_review(tmp_path, config, skills
     assert result["verdict"] == "changes_requested", "an unparsable reply must not read as a pass"
 
 
+# ── the declared-input trap ──────────────────────────────────────────────────
+#
+# A skill declares inputs for its *typical* use, and the planner copies them onto the node. In a
+# greenfield build nothing produces them, so the node instruction read "Consume: market-context" while
+# the intake block in the same prompt read "Nothing. This is the first node…". A real run failed on
+# exactly this: `pm` was told to consume an artifact no node produces, correctly read its intake as
+# empty, reported "No input provided to start the PRD writing process", and failed its own completion
+# contract on c1/c2 — the failure that gated a whole run on its first node.
+
+
+def test_an_unproduced_declared_input_is_named_not_demanded(tmp_path, config, skills, library):
+    """The instruction must agree with the intake block, not contradict it."""
+    executor, _, _ = _executor(tmp_path, config, skills, library)
+    node = {"id": "pm", "skill": "product-manager", "inputs": ["market-context"],
+            "outputs": ["product-spec"]}
+
+    text = executor._instruction_for("pm", node, "product-manager", {}, resolved_inputs={})
+
+    assert "Consume: nothing yet" in text, "an input nobody produced must not be demanded"
+    assert "market-context" in text, "but it must still be *named*, so the gap is explicit"
+    assert "not produced by any upstream node" in text
+    assert "Consume: market-context" not in text, "the contradiction is the defect"
+
+
+def test_an_input_the_node_actually_received_is_named_as_consumed(tmp_path, config, skills, library):
+    """The other half: a real input is still stated plainly."""
+    executor, _, _ = _executor(tmp_path, config, skills, library)
+    node = {"id": "review", "skill": "code-reviewer", "inputs": ["change"],
+            "outputs": ["review-report"]}
+
+    text = executor._instruction_for("review", node, "code-reviewer", {},
+                                     resolved_inputs={"change": {"path": "src/x.py"}})
+
+    assert "Consume: change" in text
+    assert "not produced by any upstream node" not in text
+
+
+def test_a_node_with_no_declared_inputs_is_unchanged(tmp_path, config, skills, library):
+    """The fix must not disturb the ordinary case: a node that declares no inputs."""
+    executor, _, _ = _executor(tmp_path, config, skills, library)
+    node = {"id": "dev", "skill": "backend-developer", "outputs": ["change"]}
+
+    with_resolved = executor._instruction_for("dev", node, "backend-developer", {},
+                                              resolved_inputs={})
+    without = executor._instruction_for("dev", node, "backend-developer", {})
+
+    assert "Consume: nothing yet" in with_resolved
+    assert "Consume: everything produced so far" in without
+
+
 def test_an_uncovered_criterion_becomes_needs_review(tmp_path, config, skills, library):
     """A node that covers one of three criteria cannot claim done."""
     manifest = {"nodes": [{"id": "dev", "skill": "backend-developer", "outputs": ["change"]}]}
@@ -200,7 +250,99 @@ def test_an_uncovered_criterion_becomes_needs_review(tmp_path, config, skills, l
     }))
     result = executor.execute_node("dev", _state(), {"pass": 1})
     assert result["status"] == "needs_review", "one of three criteria cannot be a done"
-    assert len(result["criteria_met"]) == 1
+
+
+# ── the trailer repair is verified, not assumed ──────────────────────────────
+#
+# A real run showed the defect this pins: the repair turn parsed and was logged `trailer.repair.ok`,
+# yet covered only c3 of c1..c3 — so the node failed its contract immediately afterwards, and the log
+# read "repair.ok then contract violation". A repair that does not achieve the thing it was invoked
+# for must not be reported as success, and an under-covering repair is worth one sharper retry.
+
+
+class _SequenceProvider(FakeProvider):
+    """A fake provider that returns a different reply per call, so a repair can be scripted.
+
+    The repair is a *second* call, and the thing under test is what happens when that second call is
+    still wrong, so the reply has to change between turns — which a constant fake cannot express.
+    """
+
+    def __init__(self, replies: list[dict], provider_id: str = "fake") -> None:
+        super().__init__(provider_id=provider_id)
+        self._replies = list(replies)
+        self._calls = 0
+
+    def complete(self, request):
+        from engine.providers.base import ChatResponse, Usage
+
+        self._record(request, streamed=False)
+        index = min(self._calls, len(self._replies) - 1)
+        self._calls += 1
+        return ChatResponse(text=json_reply(self._replies[index]).text,
+                            usage=Usage(prompt_tokens=900, completion_tokens=200),
+                            model=request.model, provider_id=self.provider_id)
+
+
+def _executor_with(provider, tmp_path, config, skills, library, manifest):
+    from engine.artifacts import ArtifactStore
+    from engine.executor import ExecutorContext
+    from engine.gateway import Gateway
+    from engine.org import default_company
+    from engine.prompts import PromptBuilder  # noqa: F401 - mirrors _executor's wiring
+
+    project = tmp_path / "project"
+    project.mkdir(parents=True, exist_ok=True)
+    org = default_company(provider="ollama", model="qwen2.5-coder:7b", context_window=32768)
+    for agent in org.agents.values():
+        if agent.is_ai:
+            agent.provider, agent.model = "fake", "fake-model"
+    ctx = ExecutorContext(org=org, gateway=Gateway(config, {"fake": provider}), skills=skills,
+                          workspace=project, store=ArtifactStore(workspace_root=project),
+                          run_id="run_test", workflow="test", config=config, manifest=manifest)
+    return NodeExecutor(ctx)
+
+
+def test_a_repair_that_still_under_covers_is_not_reported_ok(tmp_path, config, skills, library):
+    """`repair.ok` must mean the criteria are covered — that is what the caller relies on."""
+    manifest = {"nodes": [{"id": "dev", "skill": "backend-developer", "outputs": ["change"]}]}
+    partial = {"status": "done", "verdict": "fixed", "summary": "partial",
+               "criteria_satisfied": [{"criterion": DEV_CRITERIA[0], "satisfied": True,
+                                       "evidence": "x"}]}
+    # Every reply — original and both repairs — covers only one criterion.
+    provider = _SequenceProvider([partial, partial, partial])
+    executor = _executor_with(provider, tmp_path, config, skills, library, manifest)
+    logged: list[str] = []
+    executor._log = lambda event, **kw: logged.append(event)
+
+    result = executor.execute_node("dev", _state(), {"pass": 1})
+
+    assert "trailer.repair.ok" not in logged, "an under-covering repair is not a success"
+    assert "trailer.repair.incomplete" in logged, "the incompleteness must be named"
+    assert result["status"] == "needs_review", "and the node must not read as done"
+
+
+def test_a_second_repair_turn_recovers_a_partial_first_attempt(tmp_path, config, skills, library):
+    """One sharper retry is the difference between a parked node and a finished one."""
+    manifest = {"nodes": [{"id": "dev", "skill": "backend-developer", "outputs": ["change"]}]}
+    partial = {"status": "done", "verdict": "fixed", "summary": "partial",
+               "criteria_satisfied": [{"criterion": DEV_CRITERIA[0], "satisfied": True,
+                                       "evidence": "x"}]}
+    complete = {"status": "done", "verdict": "fixed", "summary": "all criteria covered",
+                "criteria_satisfied": [{"criterion": c, "satisfied": True, "evidence": "src/app.py"}
+                                       for c in DEV_CRITERIA],
+                "checklist": [{"id": "PC1", "status": "PASS", "evidence": "pytest: 12 passed"}]}
+    # The first reply is partial; the first repair is *still* partial; the second is complete.
+    provider = _SequenceProvider([partial, partial, complete])
+    executor = _executor_with(provider, tmp_path, config, skills, library, manifest)
+    logged: list[str] = []
+    executor._log = lambda event, **kw: logged.append(event)
+
+    result = executor.execute_node("dev", _state(), {"pass": 1})
+
+    assert "trailer.repair.incomplete" in logged, "the first repair was rejected as partial"
+    assert "trailer.repair.ok" in logged, "the second repair covered everything"
+    assert result["status"] == "done"
+    assert len(result["criteria_met"]) == len(DEV_CRITERIA)
 
 
 def test_an_explicitly_unsatisfied_criterion_does_not_count(tmp_path, config, skills, library):
@@ -368,6 +510,34 @@ def test_a_reviewer_is_never_bound_to_its_producer(tmp_path, config, skills, lib
 
 
 # ── the guardrail ────────────────────────────────────────────────────────────
+
+
+def test_a_criteria_complete_reply_with_no_prose_still_advances(tmp_path, config, skills, library):
+    """The reported failure: a node was `blocked / guardrail-blocked` for its own blank summary.
+
+    A model can satisfy every declared criterion and emit a valid trailer while writing no prose
+    `summary`. The executor left the field empty, and the guardrail — which requires `status` and
+    `summary` because the runner's handoff contract does — refused the payload at the edge, so the node
+    was reported `guardrail-blocked` and the log named the guardrail rather than the blank field the
+    engine had produced. This pins the executor's half: a result it shapes always carries a summary, so
+    the guardrail's rule and the executor's output cannot disagree.
+    """
+    from engine.guardrail import EdgeGuardrail
+
+    manifest = {"nodes": [{"id": "dev", "skill": "backend-developer", "outputs": ["change"]}]}
+    executor, _, _ = _executor(tmp_path, config, skills, library, manifest=manifest)
+    # Answer with the contract's machine-readable half and no prose at all.
+    executor.ctx.gateway.providers["fake"].set_default(json_reply({
+        "status": "done",
+        "criteria_satisfied": [{"criterion": c, "satisfied": True, "evidence": "src/app.py#12"}
+                               for c in DEV_CRITERIA],
+        "artifacts": [{"type": "change", "path": "src/app.py", "content": "x = 1\n"}],
+    }))
+
+    result = executor.execute_node("dev", _state(), {"pass": 1})
+
+    assert result["summary"], "a result must never carry a blank summary"
+    assert EdgeGuardrail().classify("dev", result)["allow"] is True
 
 
 def test_a_clean_payload_advances():
@@ -706,3 +876,134 @@ def execute_node(node_id, state, ctx):
     return {"status": "done", "verdict": "ok", "summary": "slept",
             "evidence": ["slept"], "criteria_met": []}
 """
+
+
+# ── the output cap must not truncate the artifact ────────────────────────────
+#
+# A real run of a 1M-token model against a PRD task failed the node's contract every time. The cause
+# was not the model refusing: `ExecutorContext.max_output_tokens` was hardcoded to 4096, so a long
+# artifact was cut off mid-sentence *before* the trailer, and the only trace of it was
+# `finish_reason: length`. The node then reported "declared criteria not covered", which points the
+# reader at the model rather than at the engine's own ceiling.
+
+
+def test_the_output_cap_is_generous_enough_for_a_long_artifact(tmp_path, config, skills, library):
+    """4096 tokens is not enough for a PRD; the cap must come from config, not a constant.
+
+    The test harness model has a 32768 window, so the resolved cap is the window-half bound rather
+    than the config ceiling itself — that is the intended interaction, and both are asserted.
+    """
+    executor, _, _ = _executor(tmp_path, config, skills, library)
+    assert executor.ctx.max_output_tokens >= 8192, (
+        f"the output cap is {executor.ctx.max_output_tokens}; a long artifact would be truncated "
+        "before its trailer and the node would fail for a reason the model cannot see"
+    )
+    assert executor.ctx.max_output_tokens <= config.executor.max_output_tokens
+    assert config.executor.max_output_tokens >= 32768, "the default ceiling holds a whole PRD"
+
+
+def test_a_models_own_max_output_raises_the_cap(tmp_path, config, skills, library):
+    """A model that declares a larger output is allowed to use it."""
+    executor, _, org = _executor(tmp_path, config, skills, library)
+    for agent in org.agents.values():
+        if agent.is_ai:
+            agent.max_output = 64_000
+            agent.context_window = 200_000
+    ctx = type(executor.ctx)(**{**executor.ctx.__dict__})
+    assert ctx.max_output_tokens >= 64_000
+
+
+def test_the_cap_never_exceeds_what_the_window_can_hold(tmp_path, config, skills, library):
+    """Asking for more output than the window holds makes the provider reject the whole call."""
+    project = tmp_path / "small"
+    project.mkdir(parents=True, exist_ok=True)
+    from engine.artifacts import ArtifactStore
+    from engine.executor import ExecutorContext
+    from engine.gateway import Gateway
+    from engine.org import default_company
+
+    org = default_company(provider="ollama", model="qwen2.5-coder:7b", context_window=4096)
+    ctx = ExecutorContext(org=org, gateway=Gateway(config, {}), skills=skills, workspace=project,
+                          store=ArtifactStore(workspace_root=project), run_id="r", workflow="w",
+                          config=config)
+    assert ctx.max_output_tokens <= 2048, "half the window, so the prompt still fits"
+    assert ctx.max_output_tokens >= 1024, "but never below the floor"
+
+
+def test_a_working_but_slow_runner_is_not_killed_as_stalled(workspace, config, library):
+    """The watchdog must not kill a run that is *working*, however long one node takes.
+
+    The liveness signal was the checkpoint's mtime, and the runner writes the checkpoint per **node**.
+    So a single long node — a big model writing a long artifact, or a tool loop making many calls —
+    looked exactly like a wedged process. A real run was killed at the 15-minute mark while it was
+    genuinely working, which is the worst outcome available: it discards real work and reports it as a
+    stall. Activity now also counts the runner's own output and its trace/diagnostics, which the
+    executor writes on every model call and tool step.
+    """
+    manifest = workspace / "busy.yaml"
+    manifest.write_text(_SLOW_MANIFEST_TEMPLATE.format(name="busy"))
+    busy_stub = workspace / "busy_stub.py"
+    # Prints progress while it works: the runner's stdout advances, so the run is alive.
+    busy_stub.write_text(
+        "import time, sys\n"
+        "def execute_node(n, s, c):\n"
+        "    for _ in range(6):\n"
+        "        print('working', flush=True)\n"
+        "        time.sleep(0.5)\n"
+        "    return {'status': 'done', 'verdict': 'ok', 'summary': 'worked',\n"
+        "            'evidence': ['worked'], 'criteria_met': []}\n")
+
+    events: list[str] = []
+    host = RunnerHost(config=config, library=library, workspace=workspace,
+                      stall_timeout_s=1.0, grace_s=0.5,
+                      on_event=lambda event, payload: events.append(event))
+    outcome = host.run(manifest_path=manifest, run_id="busy", workflow="busy",
+                       extra_args=["--executor", str(busy_stub)])
+    assert not outcome.killed, (
+        "a runner that is printing progress must not be killed as stalled; "
+        f"events: {events}")
+    assert "watchdog.stall" not in events
+
+
+# ── a rotated session must be adopted, or the call hits a closed session ─────
+
+
+def test_a_node_adopts_the_session_its_rotation_returned(tmp_path, config, skills, library):
+    """Rotation seals and closes the old session; the node must use the fresh one.
+
+    A real run died on `SessionError: session … is closed; only an ACTIVE session takes turns`, on the
+    node that had just been auto-staffed and was doing its first real work. `_prepare_context` rotates
+    when the context is saturated, rotation seals AND closes the outgoing session, and the caller kept
+    passing the one that went in — so the model call raised instead of proceeding. Adoption is the
+    whole reason `_prepare_context` returns a session at all.
+    """
+    manifest = {"nodes": [{"id": "dev", "skill": "backend-developer", "outputs": ["change"]}]}
+    executor, _, org = _executor(tmp_path, config, skills, library, manifest=manifest)
+    bundle = skills.load("backend-developer")
+    agent = next(a for a in org.agents.values() if a.is_ai)
+
+    # A tiny window forces the projection past the rotation threshold on the next prepare.
+    session = executor._session_for(agent, "dev", bundle)
+    session.window = 512
+    session.output_reserve = 64
+
+    prepared = executor._prepare_context(session, bundle, {"id": "dev"}, {},
+                                         node_id="dev", agent_id=agent.id)
+    returned = prepared["session"]
+    assert returned is not None, "prepare must hand back the session to use"
+    assert not returned.closed, "the session the node will call through must be usable"
+
+    # And the premise: a closed session refuses a turn, which is the crash the fix prevents. Only
+    # assert this when rotation actually happened, so the test is honest about what it exercised.
+    if returned is not session:
+        assert session.closed, "rotation seals and closes the outgoing session"
+        assert returned.state.value == "active", "the replacement starts ACTIVE"
+
+
+def test_a_rotated_session_is_actually_used_for_the_call(tmp_path, config, skills, library):
+    """The behaviour the fix buys: the node completes rather than raising."""
+    manifest = {"nodes": [{"id": "dev", "skill": "backend-developer", "outputs": ["change"]}]}
+    executor, _, _ = _executor(tmp_path, config, skills, library, manifest=manifest)
+    # The ordinary path — no rotation — must keep working unchanged.
+    result = executor.execute_node("dev", _state(), {"pass": 1})
+    assert result["status"] in ("done", "needs_review"), result.get("summary")

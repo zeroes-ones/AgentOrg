@@ -129,6 +129,9 @@ class RunHandle:
     restarts: int = 0
     state: RunnerState = RunnerState.RUNNING
     last_state_mtime: float = 0.0
+    #: The last moment the runner showed *any* sign of work — a checkpoint write, a line of its own
+    #: output, or a new trace entry. See `last_activity_s`.
+    last_activity: float = 0.0
     killed: bool = False
     stderr_lines: list[str] = field(default_factory=list)
     stdout_lines: list[str] = field(default_factory=list)
@@ -150,6 +153,35 @@ class RunHandle:
         is exactly the wedge the watchdog exists to catch.
         """
         return time.time() - (self.last_state_mtime or self.started_at)
+
+    def last_activity_s(self) -> float:
+        """Seconds since the runner showed *any* sign of work.
+
+        The checkpoint is written per **node**, so a single node that takes a long time — a big model
+        writing a long artifact, or a tool loop making many calls — looks exactly like a wedged process
+        to `state_age_s`. A real run was killed by the watchdog at the 15-minute mark while it was
+        genuinely working, which is the worst possible outcome: it discards real work and reports it as
+        a stall.
+
+        So every observable sign of activity counts: the checkpoint mtime, a line the runner printed,
+        and the run's own trace file — which the executor writes on each model call and tool step.
+        """
+        newest = max(self.last_state_mtime or 0.0, self.last_activity or 0.0, self.started_at)
+        for extra in self._activity_paths():
+            try:
+                newest = max(newest, extra.stat().st_mtime)
+            except OSError:
+                continue
+        return time.time() - newest
+
+    def _activity_paths(self) -> list[Path]:
+        """Files the child appends to while working, so its progress is observable.
+
+        The state directory is shared with the workspace, so the trace and the diagnostics log advance
+        on every model call even when no node has completed yet.
+        """
+        state_dir = self.state_path.parent
+        return [state_dir / "trace.jsonl", state_dir / "diagnostics.jsonl"]
 
     def refresh(self) -> None:
         """Re-read the state file's mtime, which advances as the runner checkpoints per node."""
@@ -377,7 +409,13 @@ def classify(node_id, result, state):
         manifest_path = Path(manifest_path).resolve()
         plugins = self.plugin_paths(manifest_path=manifest_path, run_id=run_id, workflow=workflow,
                                     project=project, goal_active=goal_active)
-        state_path = Path(self.workspace) / ".agent_state" / "run_state.json"
+        # The runner's OWN checkpoint, distinct from the orchestrator's `run_state.json`. Pointing both
+        # at one file meant the orchestrator's post-run write destroyed the runner's `{workflow,
+        # manifest_sha, nodes}` shape, so `load_state` returned None and every continuation restarted
+        # the graph — re-running the node that had just failed, for ever.
+        runner_state = getattr(self.workspace, "runner_state_path", None)
+        state_path = (Path(runner_state) if runner_state is not None
+                      else Path(self.workspace) / ".agent_state" / "runner_state.json")
         state_path = state_path.resolve()
         state_path.parent.mkdir(parents=True, exist_ok=True)
         runner = Path(self.library.files.runner)
@@ -455,10 +493,14 @@ def classify(node_id, result, state):
                 handle.state = RunnerState.RUNNING
                 self._emit("run.resumed", {"run_id": handle.run_id})
 
-            if handle.state_age_s() > self.stall_timeout_s:
-                # A long silence from a live process is the wedge the watchdog exists to catch.
+            if handle.last_activity_s() > self.stall_timeout_s:
+                # A long silence from a live process *with no sign of work at all* is the wedge the
+                # watchdog exists to catch. The checkpoint alone is not that signal — it is written per
+                # node, so one long node looks identical to a hang, and killing a working run is the
+                # worst outcome available: it discards real work and calls it a stall.
                 self._emit("watchdog.stall", {"run_id": handle.run_id, "pid": handle.pid,
-                                              "silence_s": round(handle.state_age_s(), 1)})
+                                              "silence_s": round(handle.last_activity_s(), 1),
+                                              "checkpoint_age_s": round(handle.state_age_s(), 1)})
                 self._terminate(handle, force=True)
                 break
 
@@ -503,6 +545,9 @@ def classify(node_id, result, state):
             if not line:
                 continue
             handle.stderr_lines.append(line)
+            # A line of output is a sign of life. Without this, a runner that is printing progress
+            # while a single long node runs is indistinguishable from a wedged one.
+            handle.last_activity = time.time()
             # Bound the buffer: a chatty runner must not grow the host's memory.
             if len(handle.stderr_lines) > 500:
                 handle.stderr_lines = handle.stderr_lines[-500:]
@@ -529,6 +574,7 @@ def classify(node_id, result, state):
             if not line:
                 continue
             handle.stdout_lines.append(line)
+            handle.last_activity = time.time()
             if len(handle.stdout_lines) > 500:
                 handle.stdout_lines = handle.stdout_lines[-500:]
 
@@ -635,12 +681,13 @@ def classify(node_id, result, state):
             handle = self._handle
         if handle is None:
             return None
-        state = "alive" if handle.state_age_s() <= self.heartbeat_s else (
-            "slow" if handle.state_age_s() <= self.heartbeat_s * 2 else
-            "warned" if handle.state_age_s() <= self.stall_timeout_s else "wedged")
+        state = "alive" if handle.last_activity_s() <= self.heartbeat_s else (
+            "slow" if handle.last_activity_s() <= self.heartbeat_s * 2 else
+            "warned" if handle.last_activity_s() <= self.stall_timeout_s else "wedged")
         return {
             "run_id": handle.run_id, "pid": handle.pid, "alive": handle.alive,
-            "state": state, "silence_s": round(handle.state_age_s(), 1),
+            "state": state, "silence_s": round(handle.last_activity_s(), 1),
+            "checkpoint_age_s": round(handle.state_age_s(), 1),
             "restarts": handle.restarts,
         }
 

@@ -183,6 +183,9 @@ class EventType(str, Enum):
     DIAGNOSTICS_EXPORTED = "diagnostics.exported"
     ERROR = "error"
     COMMAND_ACK = "command.ack"
+    # server lifecycle — the readiness handshake, so the console can tell a live engine from a
+    # spawned-but-dead one. Emitted on stdout as the *first* frame once the loop is listening.
+    ENGINE_READY = "engine.ready"
 
 
 class CommandType(str, Enum):
@@ -214,14 +217,39 @@ class CommandType(str, Enum):
     GOAL_PAUSE = "goal_pause"
     GOAL_RESUME = "goal_resume"
     GOAL_CLEAR = "goal_clear"
+    # mission — the standing purpose above the goal
+    MISSION = "mission"
+    MISSION_SET = "mission_set"
+    MISSION_ADD = "mission_add"
+    MISSION_REMOVE = "mission_remove"
+    MISSION_START = "mission_start"
+    MISSION_ADVANCE = "mission_advance"
+    MISSION_MARK = "mission_mark"
+    MISSION_ARM = "mission_arm"
+    MISSION_PAUSE = "mission_pause"
+    MISSION_CLEAR = "mission_clear"
+    # portfolio — the principal and the several orgs they run
+    PORTFOLIO = "portfolio"
+    PORTFOLIO_LIVE = "portfolio_live"
+    PORTFOLIO_ADD = "portfolio_add"
+    PORTFOLIO_REMOVE = "portfolio_remove"
+    PORTFOLIO_RUN = "portfolio_run"
+    PORTFOLIO_STOP = "portfolio_stop"
+    PORTFOLIO_SELECT = "portfolio_select"
     # subagents — the isolated children a run dispatched
     SUBAGENTS = "subagents"
     SUBAGENT_RESULT = "subagent_result"
+    # flow — the org board: who is working on what, and what crossed between them
+    FLOW = "flow"
     # providers — the endpoints and keys the console can configure
     PROVIDERS = "providers"
     PROVIDER_TEST = "provider_test"
     PROVIDER_ADD = "provider_add"
     PROVIDER_REMOVE = "provider_remove"
+    # defaults — the provider and model everyone uses, and how autonomous a goal is by default
+    DEFAULTS = "defaults"
+    DEFAULTS_SET = "defaults_set"
+    AUTONOMY_SET = "autonomy_set"
     # agents — the roster the console can grow and edit
     AGENTS = "agents"
     AGENT_UPDATE = "agent_update"

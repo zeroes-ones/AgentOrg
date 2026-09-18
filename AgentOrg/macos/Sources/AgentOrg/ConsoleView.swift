@@ -33,6 +33,49 @@ func openProjectPicker(controller: OrgController) {
     Task { await controller.setProject(url) }
 }
 
+/// The banner shown when the engine died during startup.
+///
+/// This is the fix for a person seeing a healthy-looking app doing nothing: the engine's *reason* is
+/// promoted to the top of the window, in full, with the one command that diagnoses it. A transient
+/// `notice` was not enough — it faded, and the status bar said "Engine idle", which reads as "fine".
+///
+/// It is deliberately not dismissible: a fatal engine failure is a real broken state, and a button that
+/// hides it would let the app look normal while nothing works. It clears itself when a launch succeeds
+/// (the `engine.ready` frame resets the controller's failure).
+struct EngineFailureBanner: View {
+    @ObservedObject var controller: OrgController
+    let message: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("The engine could not start", systemImage: "exclamationmark.triangle.fill")
+                .font(.headline)
+                .foregroundStyle(.red)
+            Text(message)
+                .font(.callout)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                Button("Try again") { controller.launch() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!controller.canLaunch)
+                    .accessibilityLabel("Retry launching the engine")
+                Text("engine.cli doctor")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                Text("checks every precondition and names the one that failed")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.red.opacity(0.12))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("The engine could not start. \(message)")
+    }
+}
+
 struct ConsoleView: View {
     @ObservedObject var controller: OrgController
     @ObservedObject private var terminal = TerminalVisibility.shared
@@ -131,6 +174,30 @@ struct ConsoleView: View {
     private func badge(for tab: ConsoleTab) -> Int {
         switch tab {
         case .progress: return controller.pendingGate != nil ? 1 : 0
+        // The Portfolio panel badges when *any* org has work waiting on you — a gate or a block — so
+        // a person scanning the sidebar sees that one of their companies needs them without opening
+        // each one.
+        case .portfolio:
+            let waiting = controller.portfolioRows.filter {
+                ($0["waiting_host"]?.boolValue == true) || (($0["blocked"]?.intValue ?? 0) > 0)
+            }.count
+            return waiting
+        // The Activity panel badges when work is waiting on you — a gate or a block — because that is
+        // exactly what "go here and look" means, and it is the one thing the app cannot resolve alone.
+        case .activity:
+            let waiting = controller.pendingGate != nil
+            let blocked = controller.activity["counts"]?.objectValue?["blocked"]?.intValue ?? 0
+            return waiting ? 1 : (blocked > 0 ? 1 : 0)
+        // The Flow panel badges on stuck work and breached handoffs: either is a row a person should
+        // look at, and neither is something the app can resolve alone — the same test the others use.
+        case .flow:
+            let stuck = controller.flow["counts"]?.objectValue?["stuck"]?.intValue ?? 0
+            let breaches = controller.flowHandoffs.filter {
+                let state = $0["state"]?.stringValue ?? ""
+                return state == "breached" || state == "rejected"
+            }.count
+            let total = stuck + breaches
+            return total
         // A proposal is work waiting on a decision the app cannot make for you, which is exactly what
         // a badge means. So is a gate, and for the same reason.
         case .improve: return controller.proposals.count
@@ -140,6 +207,10 @@ struct ConsoleView: View {
 
     private var detail: some View {
         VStack(spacing: 0) {
+            if let failure = controller.engineFailure {
+                EngineFailureBanner(controller: controller, message: failure)
+                Divider()
+            }
             RunControls(controller: controller, note: $note,
                         instruction: $instruction, asConstraint: $asConstraint)
             Divider()
@@ -185,10 +256,13 @@ struct ConsoleView: View {
     @ViewBuilder
     private var panel: some View {
         switch tab {
+        case .portfolio: PortfolioPanel(controller: controller)
         case .org: OrgPanel(controller: controller)
         case .people: PeoplePanel(controller: controller)
         case .providers: ProvidersPanel(controller: controller)
         case .improve: ImprovePanel(controller: controller)
+        case .activity: ActivityPanel(controller: controller)
+        case .flow: FlowPanel(controller: controller)
         case .progress: ProgressPanel(controller: controller)
         case .economics: EconomicsPanel(controller: controller)
         case .context: ContextPanel(controller: controller)
@@ -198,6 +272,7 @@ struct ConsoleView: View {
 
     /// The engine state as a word, so it is never conveyed by colour alone.
     private var stateWord: String {
+        if controller.engineFailure != nil { return "Engine failed" }
         if controller.goal["live"]?.boolValue == true { return "Working on a goal" }
         switch controller.engineState {
         case .running: return "Engine running"
@@ -208,6 +283,7 @@ struct ConsoleView: View {
     }
 
     private var stateColour: Color {
+        if controller.engineFailure != nil { return .red }
         switch controller.engineState {
         case .running: return .green
         case .failed: return .red
@@ -222,6 +298,7 @@ struct StatusBar: View {
     @ObservedObject var controller: OrgController
 
     private var stateColor: Color {
+        if controller.engineFailure != nil { return .red }
         switch controller.engineState {
         case .running: return .green
         case .failed: return .red

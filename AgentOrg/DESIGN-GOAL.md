@@ -105,11 +105,14 @@ Three things this states plainly:
 - **It re-enters execution, it does not re-plan by default.** A Goal advances the
   work; it does not silently rewrite the approved graph on every iteration. A
   re-plan is a scope change and is treated as one (see §7).
-- **Gates still hold.** A Goal respects a human gate and policy `confirm` as a
-  *blocker*. It continues past a *model final* and past *ordinary node completion*
-  — not past a decision you asked to make. This is the reconciliation between
-  "Reasonix has no host quality gate" and AgentOrg's first-class gate: a gate is a
-  genuine user blocker, so the Goal parks at it rather than deciding for you.
+- **Gates still hold — by policy.** A Goal respects a *terminal* gate (`kind: human`: release, close,
+  spend) and an agent gate with no untried route as *blockers*, always. It passes the gates the *org*
+  can decide (the bounded-reroute agent gate, a policy route class the config already answered) when
+  the goal's policy authorises it — which is the default. A goal that chose `--human-gate` parks at
+  every gate. This is the reconciliation between "Reasonix has no host quality gate" and AgentOrg's
+  first-class gate: a gate is a genuine user decision, and the question is only *whether this objective
+  was given the authority to make the decidable ones*. See
+  [`DESIGN-DEFAULTS-AUTONOMY.md`](DESIGN-DEFAULTS-AUTONOMY.md).
 - **There is no per-turn "continue" report.** Continuing is the norm; only the
   transitions above are emitted. A loop that announces every iteration is noise,
   and the trace already has the node events.
@@ -247,9 +250,13 @@ paused goal is exactly that.
 
 The open questions above were **decided and implemented**:
 
-1. **A Goal parks at a gate.** Arming an objective authorises *continuing past work finishing*, not
-   *deciding a question you asked to decide*. `executor.auto_pass_auto_gates` exists as the opposite
-   switch and defaults to `false`.
+1. **A Goal parks at a gate — unless it was given the authority not to.** Arming an objective is
+   standing authorisation to pass the gates the *org* can decide (the agent gate, a policy route class
+   the config already answered) and to staff its own gaps. A **terminal** gate (`kind: human`:
+   release, close, spend) is never passed, and a goal that chose `--human-gate` parks at every gate.
+   The polarity is autonomous-by-default because the product is a tool you leave running; see
+   [`DESIGN-DEFAULTS-AUTONOMY.md`](DESIGN-DEFAULTS-AUTONOMY.md) for the reasoning and the safety
+   argument. `goal.auto_pass_auto_gates` (config) and `GoalPolicy` (per goal) are the two switches.
 2. **A Goal never re-plans silently.** Advancing within the approved graph is the default; a widened
    scope is a new manifest and a gate.
 3. **Reminder thresholds are configurable** — `goal.repeat_call_reminders`, default `(3, 5, 8)`.

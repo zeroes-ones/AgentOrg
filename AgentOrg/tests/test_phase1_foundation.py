@@ -93,7 +93,11 @@ def _write_cfg(tmp: pathlib.Path, mutate=None) -> pathlib.Path:
 
 
 def test_config_loads_example():
-    cfg = cfgmod.load()
+    # Explicit example path, not a bare `load()`: `load()` prefers `./credentials.json`, which is a
+    # *local* file a developer may have pointed at only their own providers — so asserting on the
+    # example's contents through it made the test pass or fail on whoever ran it. This test is about
+    # the shipped example, so it loads the shipped example.
+    cfg = cfgmod.load(EXAMPLE)
     assert cfg.providers
     assert cfg.provider("ollama").kind == "ollama"
     assert cfg.provider("anthropic").kind == "anthropic"
@@ -101,20 +105,20 @@ def test_config_loads_example():
 
 
 def test_config_unknown_model_has_no_invented_window():
-    cfg = cfgmod.load()
+    cfg = cfgmod.load(EXAMPLE)
     spec = cfg.model_spec("no-such-model")
     assert spec.context_window is None
     assert spec.source == "assumed"
 
 
 def test_config_alias_expansion():
-    cfg = cfgmod.load()
+    cfg = cfgmod.load(EXAMPLE)
     assert cfg.alias("anthropic", "claude-sonnet") == "claude-sonnet-4-20250514"
 
 
 def test_config_env_first_key_resolution(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-from-env-000000000000")
-    cfg = cfgmod.load()
+    cfg = cfgmod.load(EXAMPLE)
     assert cfg.provider("openai").resolve_key() == "sk-test-from-env-000000000000"
 
 
@@ -133,8 +137,6 @@ def test_config_repr_does_not_leak_key():
         (lambda d: d["delegation"].__setitem__("max_depth", 0), "max_depth"),
         (lambda d: d["policy"]["default_autonomy"].__setitem__("R-BOGUS", "auto"), "unknown route class"),
         (lambda d: d["policy"]["default_autonomy"].__setitem__("R-ESCALATE", "auto"), "safety floor"),
-        (lambda d: d["concurrency"]["per_provider_limits"].__setitem__("ghost", 1), "unknown providers"),
-        (lambda d: d["defaults"].__setitem__("provider", "ghost"), "not a configured provider"),
         (lambda d: d["budget"].__setitem__("run_max_usd", -1), "must be > 0"),
         (lambda d: d["policy"]["router"].__setitem__("threshold", 1.5), "must be in"),
         (lambda d: d["policy"]["router"].__setitem__("margin", -1), "must be in"),
@@ -144,6 +146,28 @@ def test_config_rejects_unsafe_values(tmp_path, mutate, match):
     path = _write_cfg(tmp_path, mutate)
     with pytest.raises(cfgmod.ConfigError, match=match):
         cfgmod.load(path, warn=False)
+
+
+@pytest.mark.parametrize(
+    "mutate, warning_match",
+    [
+        # A stale pointer, not a typo: these are *left behind* by removing a provider from the
+        # console, and refusing to load bricked every command — including `doctor`, which exists to
+        # diagnose it. They degrade with a warning instead, which is the whole fix.
+        (lambda d: d["concurrency"]["per_provider_limits"].__setitem__("ghost", 1),
+         "were pruned"),
+        (lambda d: d["defaults"].__setitem__("provider", "ghost"),
+         "not a configured provider"),
+    ],
+)
+def test_a_stale_provider_reference_is_recovered_not_fatal(tmp_path, mutate, warning_match):
+    """The engine must stay startable when the config carries a dangling provider reference."""
+    path = _write_cfg(tmp_path, mutate)
+    cfg = cfgmod.load(path, warn=False)  # must NOT raise
+    assert any(warning_match in w for w in cfg.raw.get("_warnings") or []), cfg.raw.get("_warnings")
+    # And the resulting config is usable: a real provider remains, and the stale entry is gone.
+    assert cfg.providers
+    assert "ghost" not in cfg.concurrency.per_provider_limits
 
 
 def test_config_safety_floor_allows_explicit_opt_in(tmp_path):
@@ -322,6 +346,25 @@ def test_bus_orders_numbers_and_writes_trace(tmp_path):
     assert bus.last_seq == 5
     assert len(load_trace(trace)) == 5
     assert trace_summary(trace)["events"] == 5
+    bus.close()
+
+
+def test_bus_degrades_when_the_trace_is_not_writable(tmp_path):
+    """A read-only command must not crash because the trace cannot be opened.
+
+    A `goal status` (or `flow`, or `activity`) in a workspace whose `.agent_state/` is not writable
+    used to die with a raw `PermissionError` out of the *bus constructor* — the opposite of "it just
+    works", and it made the CLI unusable on a read-only checkout. Losing the trace is a smaller
+    failure than losing the command, so the bus records the reason and holds events in memory.
+    """
+    # A path whose parent is a *file*, so the mkdir/open cannot succeed on any platform.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    bus = EventBus(run_id="run_1", trace_path=blocker / "trace.jsonl")
+    assert bus.trace_error, "the reason must be recorded, not swallowed"
+    event = bus.emit(proto.EventType.NODE_ENTER, payload={"i": 0})
+    assert event is not None, "emitting still works; only persistence is lost"
+    assert bus.last_seq == 1
     bus.close()
 
 
@@ -750,3 +793,32 @@ def test_workspace_lists_projects(tmp_path):
     statemod.Workspace.for_project("alpha", root=root).ensure()
     statemod.Workspace.for_project("beta", root=root).ensure()
     assert statemod.Workspace.list_projects(root=root) == ["alpha", "beta"]
+
+
+def test_removing_a_provider_prunes_its_references(tmp_path):
+    """Removing a provider must leave a config that loads with *no* repair needed.
+
+    The bug this prevents: the console's Remove-provider path deleted the provider but left
+    `concurrency.per_provider_limits[pid]` and a possible `defaults.provider` pointing at it, and the
+    loader then refused the whole config — so removing a provider bricked the engine. The writer now
+    prunes both, so the invalid state is never created.
+    """
+    path = _write_cfg(tmp_path)  # from the example, which configures anthropic + its limit
+    cfgmod.write_provider(path, {}, provider_id="anthropic", remove=True)
+    after = json.loads(path.read_text())
+    assert "anthropic" not in after["providers"]
+    assert "anthropic" not in after["concurrency"]["per_provider_limits"]
+    # The config loads and needs no repair: no warning about a stale reference.
+    cfg = cfgmod.load(path, warn=False)
+    assert not cfg.raw.get("_warnings"), cfg.raw.get("_warnings")
+
+
+def test_removing_the_default_provider_drops_the_default(tmp_path):
+    """A default naming the removed provider is pruned too, rather than left for the loader to fix."""
+    path = _write_cfg(tmp_path)
+    cfgmod.write_provider(path, {}, provider_id="ollama", remove=True)  # the example's default
+    after = json.loads(path.read_text())
+    assert after["defaults"].get("provider") in (None, "")
+    cfg = cfgmod.load(path, warn=False)
+    assert not cfg.raw.get("_warnings"), cfg.raw.get("_warnings")
+    assert cfg.providers

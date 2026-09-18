@@ -213,10 +213,60 @@ final class AgentProcessServiceTests: XCTestCase {
         let service = try launchService("sleep 30")
         defer { service.terminate() }
         let info = service.describe()
-        XCTAssertEqual(info["state"], "running")
+        // A process that has not sent `engine.ready` is `launching`, not `running`: readiness is the
+        // handshake, not the spawn. `sleep 30` never sends it, so this is the honest state.
+        XCTAssertEqual(info["state"], "launching")
+        XCTAssertEqual(info["ready"], "no")
         XCTAssertNotNil(info["python"])
         XCTAssertNotNil(info["project"])
         XCTAssertNotNil(info["pid"])
+    }
+
+    // MARK: - Readiness
+
+    func testRunningIsGatedOnTheReadinessFrame() throws {
+        // The bug: the app reported "engine running" the instant the process spawned, so an engine that
+        // died during bootstrap looked healthy. Readiness is the `engine.ready` frame, not the spawn.
+        let ready = expectation(description: "ready")
+        let service = try launchService("sleep 30")
+        defer { service.terminate() }
+        // No readiness frame yet: not running.
+        XCTAssertEqual(service.state, .launching)
+        XCTAssertFalse(service.isReady)
+        service.onStateChange = { state in if state == .running { ready.fulfill() } }
+        // Now send the handshake, as the engine does once its config and providers resolve.
+        // (A second service, because the frame must arrive on the live pipe.)
+        let service2 = try launchService(
+            "echo '{\"v\":1,\"seq\":1,\"type\":\"engine.ready\",\"payload\":{\"providers\":[]}}'; sleep 30")
+        defer { service2.terminate() }
+        service2.onStateChange = { state in if state == .running { ready.fulfill() } }
+        wait(for: [ready], timeout: 5)
+        XCTAssertTrue(service2.isReady)
+        XCTAssertEqual(service2.state, .running)
+    }
+
+    func testAFatalErrorFrameIsReportedAsTheFailureReason() throws {
+        // The engine writes its fatal reason to stdout as a typed frame precisely so the app can read
+        // it before the exit — otherwise all the app knew was "exited with status 1".
+        let failed = expectation(description: "failed")
+        let service = try launchService(
+            "echo '{\"v\":1,\"seq\":0,\"type\":\"error\",\"payload\":{\"message\":\"the engine could not start: bad config\",\"fatal\":true}}'; exit 1")
+        service.onStateChange = { state in if state == .failed { failed.fulfill() } }
+        wait(for: [failed], timeout: 10)
+        XCTAssertEqual(service.state, .failed)
+        XCTAssertEqual(service.lastError?.message, "the engine could not start: bad config")
+    }
+
+    func testAnExitBeforeReadinessSaysItNeverStarted() throws {
+        // A non-zero exit with no reason and no readiness: say it never started, rather than implying a
+        // run had been under way.
+        let failed = expectation(description: "failed")
+        let service = try launchService("exit 7")
+        service.onStateChange = { state in if state == .failed { failed.fulfill() } }
+        wait(for: [failed], timeout: 10)
+        XCTAssertEqual(service.lastError?.kind, .launchFailed)
+        XCTAssertTrue(service.lastError?.message.contains("before it finished starting") ?? false,
+                      service.lastError?.message ?? "nil")
     }
 
     // MARK: - Helpers

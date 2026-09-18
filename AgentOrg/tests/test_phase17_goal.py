@@ -173,11 +173,17 @@ def test_goal_spend_add_accumulates():
 # ── config ───────────────────────────────────────────────────────────────────
 
 
-def test_goal_config_defaults_are_off():
+def test_goal_config_defaults_are_autonomous():
+    # The autonomy *default* is on: arming a goal is standing authority to pass the gates the org can
+    # decide and to staff its own gaps. The safety floor is unchanged — a terminal (human) gate is
+    # never passed — and a per-goal `human_gate` restores the pause. This test pins the polarity the
+    # product chose ("a human is involved only if I chose one"), so flipping it is a deliberate act.
     cfg = GoalConfig()
     assert cfg.token_budget == 0
     assert cfg.repeat_call_reminders == (3, 5, 8)
-    assert cfg.auto_pass_auto_gates is False
+    assert cfg.auto_pass_auto_gates is True
+    assert cfg.auto_hire_missing is True
+    assert cfg.persist_auto_hires is False
 
 
 def test_goal_config_rejects_a_negative_budget():
@@ -325,3 +331,36 @@ def test_the_run_context_carries_the_goal(tmp_path):
     round_tripped = RunContext.from_dict(context.as_dict())
     assert round_tripped.goal_active is True
     assert round_tripped.goal_objective == "Add pagination"
+
+
+# ── an explicit run may adopt an armed goal (the CLI could otherwise never drive one) ──
+
+
+def test_an_armed_goal_can_be_adopted_by_an_explicit_run(project):
+    """`goal set` then `run` must work, and every CLI command is a *new* process.
+
+    `Goal.load` disarms — the safety property that stops a process restarting from spending on its own
+    — but that also meant the goal a `goal set` armed was disarmed by the very next `run`, so the CLI
+    could never drive a loop. Only the long-lived `serve` process could, because it held the
+    orchestrator across commands. `adopt()` is the narrow counterpart for an explicit execution.
+    """
+    goal = Goal.new("ship it")
+    goal.arm(by="cli")
+    goal.save(project)
+    loaded = Goal.load(project)
+    assert loaded.state is GoalState.PAUSED, "reading is not resuming"
+    loaded.adopt()
+    assert loaded.state is GoalState.ARMED
+    assert loaded.pause_reason == ""
+    assert loaded.state.is_live
+
+
+def test_adopt_does_not_revive_a_manually_paused_goal(project):
+    """Only a `restored` pause is adopted. A human pause must stay a pause."""
+    goal = Goal.new("ship it")
+    goal.arm(by="cli")
+    goal.pause(reason="manual")
+    goal.save(project)
+    loaded = Goal.load(project)
+    loaded.adopt()
+    assert loaded.state is GoalState.PAUSED, "an explicit pause is not overridden by running"

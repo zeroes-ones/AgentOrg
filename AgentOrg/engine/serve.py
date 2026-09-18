@@ -91,6 +91,12 @@ class Server:
     #: Set by `start`/`resume`: the orchestrator the run commands act on.
     orchestrator: Any = None
     slug: str = "console"
+    #: The portfolio the console is showing, when there is one. Loaded lazily so a single-org setup
+    #: pays nothing for the multi-org layer.
+    _portfolio: Any = None
+    _portfolio_loaded: bool = False
+    #: The fleet, built on first use, so several orgs can run at once from one server.
+    _fleet: Any = None
 
     def __post_init__(self) -> None:
         self.stdin = self.stdin if self.stdin is not None else sys.stdin
@@ -147,6 +153,15 @@ class Server:
     def serve_forever(self) -> int:
         """Read commands until EOF, executing each off the read loop. Returns an exit code."""
         _log(f"agentorg serve: project={self.workspace.path} pid={_pid()}")
+        # The readiness handshake, first on the wire. The console cannot otherwise tell a live engine
+        # from a spawned-but-doomed one: a bootstrap failure is a process that exists for a moment and
+        # exits, and the app used to call that "running". This frame is emitted *after* the workspace,
+        # config and providers are all resolved, so receiving it means the engine really is usable —
+        # and anything that stops it before here is reported by the app as a failure, not a success.
+        self.emit(Event(seq=0, type=EventType.ENGINE_READY,
+                        payload={"pid": _pid(), "project": str(self.workspace.path),
+                                 "slug": self.slug,
+                                 "providers": sorted(getattr(self.config, "providers", {}) or {})}))
         self.emit(Event(seq=0, type=EventType.AGENT_LOG,
                         payload={"text": "engine ready", "stream": "stderr"}))
         self._worker = threading.Thread(target=self._work, name="agentorg-serve", daemon=True)
@@ -338,8 +353,13 @@ class Server:
                     "cache": self._cmd_cache({}), "swarm": self._cmd_swarm({}),
                     "workspace": self._workspace_info(),
                     "goal": self._cmd_goal_status({})["goal"],
+                    "mission": self._cmd_mission({})["mission"],
                     "subagents": self._cmd_subagents({}),
-                    "proposals": self._cmd_proposals({})}
+                    "proposals": self._cmd_proposals({}),
+                    "activity": self._cmd_activity({}),
+                    "flow": self._cmd_flow({}),
+                    "defaults": self._cmd_defaults({}),
+                    "portfolio": self._cmd_portfolio({})}
         status = self.orchestrator.status()
         # The roster is what the Org panel renders, so it travels with every snapshot rather than
         # needing its own command the UI would have to remember to send.
@@ -357,13 +377,71 @@ class Server:
         # The goal travels with status so the Work panel can show whether the loop will continue
         # without a second round trip that might never be added.
         status.setdefault("goal", self._cmd_goal_status({})["goal"])
+        # The mission travels the same way, so the console shows the standing purpose and the active
+        # step from the poll it already makes.
+        status.setdefault("mission", self._cmd_mission({})["mission"])
         # The subagent tree travels the same way, so the panel shows isolated children from the poll
         # it already makes.
         status.setdefault("subagents", self._cmd_subagents({}))
         # Proposals travel with status too, so a promoted fix is visible without the console having to
         # remember a second command — and so the count can badge the sidebar.
         status.setdefault("proposals", self._cmd_proposals({}))
+        # The activity timeline travels the same way, so the console's "what is happening" panel is
+        # populated from the poll it already makes rather than a second round trip.
+        status.setdefault("activity", self._cmd_activity({}))
+        # The org board travels the same way, so the Flow panel shows who is on what from the poll it
+        # already makes. It is derived from the same artifacts as `activity`, so the two cannot
+        # disagree about what is happening.
+        status.setdefault("flow", self._cmd_flow({}))
+        # The default the org runs on travels too, so the Providers panel's Defaults editor shows the
+        # effective pair from the poll it already makes rather than a second round trip.
+        status.setdefault("defaults", self._cmd_defaults({}))
+        # The portfolio travels too, so the console can show every org the principal runs — the
+        # register, not the live picture (that is `portfolio_live`, sent when the panel is open).
+        status.setdefault("portfolio", self._cmd_portfolio({}))
         return status
+
+    def _cmd_activity(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """The activity timeline: what the org is doing, why it stopped, and what is next.
+
+        Reads the same artifacts the panels already do, folded into one ordered story. Bounded like
+        the terminal buffer, so a long run yields a summary rather than a file dump.
+        """
+        from .activity import build_activity
+
+        org = getattr(self.orchestrator, "org", None)
+        goal_status = self._cmd_goal_status({}).get("goal")
+        run_status = self.orchestrator.status() if self.orchestrator is not None else {}
+        try:
+            return build_activity(
+                self.workspace, run_status=run_status, goal_status=goal_status, org=org,
+                staffing=list(run_status.get("staffing_gaps") or []),
+                limit=int(payload.get("limit") or 120))
+        except Exception as exc:  # noqa: BLE001 - a snapshot must never break the poll
+            _log(f"serve: activity snapshot failed: {exc}")
+            return {"headline": "activity unavailable", "timeline": [], "counts": {}}
+
+    def _cmd_flow(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """The org board: which agent has which work, what crossed between them, and what came back.
+
+        Derived from the same artifacts the other panels read, so the CLI's `flow` and the console's
+        Flow panel cannot disagree. Bounded by the trace tail, like the activity report, so a long run
+        yields a board rather than a file dump.
+        """
+        from .flow import build_flow
+
+        org = getattr(self.orchestrator, "org", None)
+        run_status = self.orchestrator.status() if self.orchestrator is not None else {}
+        try:
+            return build_flow(
+                self.workspace, run_status=run_status, org=org,
+                limit=int(payload.get("limit") or 800),
+                org_id=str(getattr(org, "id", "") or ""),
+                org_name=str(getattr(org, "name", "") or ""))
+        except Exception as exc:  # noqa: BLE001 - a snapshot must never break the poll
+            _log(f"serve: flow snapshot failed: {exc}")
+            return {"flow_version": "1.0.0", "headline": "flow unavailable",
+                    "rows": [], "handoffs": [], "counts": {}, "agents": []}
 
     def _workspace_info(self) -> dict[str, Any]:
         """Where this run is working: the attached folder, or the managed project."""
@@ -658,6 +736,129 @@ class Server:
         # must be rebuilt — otherwise the TTL would keep a stale provider list for 15 minutes.
         self._discovery = None
 
+    def _default_window(self, provider: str, model: str) -> tuple[int | None, int | None, str]:
+        """The window (and max output) the system will bind the default model with, and its source.
+
+        Resolved as a hire resolves it: an explicit `defaults.context_window` wins, then the live
+        catalog's probed value, then the declared table. The console and the CLI must report the same
+        number — they did not, because this handler read only the declared table.
+        """
+        spec = self.config.default_model_spec()
+        if spec.context_window and spec.model_id == model:
+            return int(spec.context_window), spec.max_output, spec.source
+        try:
+            from .catalog import ModelCatalog
+
+            entry = self._catalog().resolve(provider, model)
+            if entry is not None and entry.window_known:
+                return int(entry.context_window), entry.max_output, entry.source
+        except Exception:  # noqa: BLE001 - a probe failure degrades to "unknown"
+            pass
+        return None, None, ""
+
+    def _cmd_defaults(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """The default provider/model everyone uses, and how autonomous a goal is by default.
+
+        Reports the **effective** pair, not just the file: a declared default that a removed provider
+        invalidated resolves to a usable one, and the reason travels so the panel can say why. No key
+        is ever returned.
+        """
+        config = self.config
+        provider, model, reason = config.default_pair()
+        # The window the system will *actually* bind with — catalog first, declared table second —
+        # exactly as the CLI reports it and as `hire` resolves it. Reading only the declared table told
+        # the console `window: None` for `Olla/deepseek-v4.1-flash` (a probed model the config never
+        # declares) while the same run bound 1048576, so the panel and the behaviour disagreed.
+        window, max_output, window_source = self._default_window(provider, model)
+        return {
+            "provider": provider,
+            "model": model,
+            "reason": reason,
+            "context_window": window,
+            "window_source": window_source,
+            "max_output": max_output,
+            "temperature": config.default.temperature,
+            "declared": config.default.as_dict(),
+            "reviewer": {"provider": config.default.reviewer_provider,
+                         "model": config.default.reviewer_model},
+            "autonomy": {
+                "auto_pass_auto_gates": config.goal.auto_pass_auto_gates,
+                "auto_hire_missing": config.goal.auto_hire_missing,
+                "persist_auto_hires": config.goal.persist_auto_hires,
+                "auto_hire_max_tier": config.goal.auto_hire_max_tier,
+                "token_budget": config.goal.token_budget,
+            },
+            "usable": config._usable_providers(),
+            "providers": sorted(config.providers),
+            "config_path": str(config.path) if config.path else "",
+        }
+
+    def _cmd_defaults_set(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Set the default provider and/or model in `credentials.json`, atomically.
+
+        Validated against what is actually configured *before* the write: a default naming a provider
+        that does not exist would resolve to a fallback and silently not be what the person chose, so
+        it is refused with the list of real providers.
+        """
+        from .config import ConfigError, set_defaults
+
+        if not self.config.path:
+            raise ServerError("this engine was started without a credentials file")
+        provider = str(payload.get("provider") or "").strip()
+        model = str(payload.get("model") or "").strip()
+        if provider and provider not in self.config.providers:
+            raise ServerError(
+                f"unknown provider {provider!r}; configured: "
+                f"{', '.join(sorted(self.config.providers)) or '(none)'}")
+        window = payload.get("context_window")
+        try:
+            set_defaults(
+                self.config.path,
+                provider=provider,
+                model=model,
+                reviewer_provider=str(payload.get("reviewer_provider") or "").strip(),
+                reviewer_model=str(payload.get("reviewer_model") or "").strip(),
+                context_window=int(window) if window not in (None, "") else None,
+            )
+        except (ConfigError, ValueError) as exc:
+            raise ServerError(str(exc)) from exc
+        self._reload_config()
+        self.emit(Event(seq=0, type=EventType.MODEL_CATALOG_REFRESHED,
+                        payload={"reason": "defaults set", "provider": provider,
+                                 "model": model}))
+        return self._cmd_defaults({})
+
+    def _cmd_autonomy_set(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Set how autonomous a goal is by default, in `credentials.json`, atomically.
+
+        Kept separate from the model default on purpose: changing which model the org runs on must not
+        silently change whether a run needs a person. A boolean passed as `None` is left untouched, so
+        a panel can send only the switch that changed.
+        """
+        from .config import ConfigError, set_autonomy
+
+        if not self.config.path:
+            raise ServerError("this engine was started without a credentials file")
+        goal: dict[str, Any] = {}
+        for key, payload_key in (("auto_pass_auto_gates", "auto_pass_auto_gates"),
+                                 ("auto_hire_missing", "auto_hire_missing"),
+                                 ("persist_auto_hires", "persist_auto_hires")):
+            value = payload.get(payload_key)
+            if value is not None:
+                goal[key] = bool(value)
+        if payload.get("auto_hire_max_tier") is not None:
+            goal["auto_hire_max_tier"] = int(payload["auto_hire_max_tier"])
+        if not goal:
+            raise ServerError("autonomy_set needs at least one setting")
+        try:
+            set_autonomy(self.config.path, goal=goal)
+        except ConfigError as exc:
+            raise ServerError(str(exc)) from exc
+        self._reload_config()
+        self.emit(Event(seq=0, type=EventType.POLICY_CHANGED,
+                        payload={"reason": "autonomy set", **goal}))
+        return self._cmd_defaults({})
+
     def _cmd_cache(self, payload: dict[str, Any]) -> dict[str, Any]:
         """The cache picture for this run: hit rate, tokens, and what it has saved.
 
@@ -729,8 +930,14 @@ class Server:
         slug = str(payload.get("slug") or self.slug)
         self.slug = slug
         orch = self._orchestrator(slug)
+        # `auto_staff` is left to the goal's policy (and then the config default), so the console does
+        # not have to send a second flag — arming a goal *is* the authorisation. An explicit
+        # `auto_staff` in the payload overrides, which is what a "report the gap, do not fill it"
+        # button would send.
+        auto_staff = payload.get("auto_staff")
         run = orch.prepare(goal, slug=slug,
-                           max_iterations=int(payload.get("max_iterations") or 3))
+                           max_iterations=int(payload.get("max_iterations") or 3),
+                           auto_staff=None if auto_staff is None else bool(auto_staff))
         self._forward_bus(orch)
         self.emit(Event(seq=0, type=EventType.MANIFEST_PROPOSED,
                         payload={"run_id": run.run_id, "slug": run.slug, "goal": goal,
@@ -1024,13 +1231,30 @@ class Server:
         return orch
 
     def _cmd_goal_set(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Set the objective and arm the loop, from the console."""
+        """Set the objective and arm the loop, from the console.
+
+        Accepts the per-goal autonomy flags, so the console's "human gate on/off" switch is one call:
+        an unchanged objective with a changed policy replaces the policy and keeps the history, rather
+        than forcing a clear-and-restart.
+        """
+        from .goal import GoalPolicy
+
         objective = str(payload.get("objective") or payload.get("goal") or "").strip()
         if not objective:
             raise ServerError("goal_set needs an objective")
         orch = self._goal_orchestrator()
         armed = not bool(payload.get("no_arm"))
-        orch.goal_set(objective, armed=armed, by="app")
+        base = orch._default_goal_policy()
+        policy = GoalPolicy(
+            auto_approve=(base.auto_approve if payload.get("auto_approve") is None
+                          else bool(payload.get("auto_approve"))),
+            auto_hire=(base.auto_hire if payload.get("auto_hire") is None
+                       else bool(payload.get("auto_hire"))),
+            persist_hires=(base.persist_hires if payload.get("persist_hires") is None
+                           else bool(payload.get("persist_hires"))),
+            human_gate=bool(payload.get("human_gate", False)),
+        )
+        orch.goal_set(objective, armed=armed, by="app", policy=policy)
         return self._goal_detail(orch)
 
     def _cmd_proposals(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1182,6 +1406,230 @@ class Server:
     def _goal_detail(self, orch: Any) -> dict[str, Any]:
         """The command acknowledgement shape, so the app can update its row without re-polling."""
         return {"goal": orch.goal_status()}
+
+    # ── mission ─────────────────────────────────────────────────────────────
+
+    def _cmd_mission(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """The mission snapshot: the standing purpose, its objectives and progress.
+
+        A snapshot command rather than only events, for the same reason the goal is one: a UI that
+        only listens can miss a transition and show a stale mission forever.
+        """
+        orch = self.orchestrator
+        goal = orch.mission_status() if orch is not None else None
+        if goal is None:
+            return {"mission": {"statement": "", "state": "empty", "objectives": [],
+                                "progress": {"done": 0, "total": 0, "next": ""}}}
+        return {"mission": goal}
+
+    def _cmd_mission_set(self, payload: dict[str, Any]) -> dict[str, Any]:
+        orch = self._goal_orchestrator()
+        statement = str(payload.get("statement") or payload.get("mission") or "").strip()
+        if not statement:
+            raise ServerError("mission_set needs a statement")
+        objectives = [str(o) for o in (payload.get("objectives") or []) if str(o).strip()]
+        orch.mission_set(statement, objectives=objectives, armed=bool(payload.get("arm")))
+        return self._mission_detail(orch)
+
+    def _cmd_mission_add(self, payload: dict[str, Any]) -> dict[str, Any]:
+        orch = self._goal_orchestrator()
+        text = str(payload.get("objective") or "").strip()
+        if not text:
+            raise ServerError("mission_add needs an objective")
+        at = payload.get("at")
+        orch.mission_add(text, at=int(at) if at is not None else None)
+        return self._mission_detail(orch)
+
+    def _cmd_mission_remove(self, payload: dict[str, Any]) -> dict[str, Any]:
+        orch = self._goal_orchestrator()
+        orch.mission_remove(int(payload.get("index") or 0))
+        return self._mission_detail(orch)
+
+    def _cmd_mission_start(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Hand an objective to a goal — the one place the mission decides what gets worked."""
+        orch = self._goal_orchestrator()
+        index = payload.get("index")
+        detail = orch.mission_start(index=int(index) if index is not None else None,
+                                    armed=not bool(payload.get("no_arm")), by="app")
+        return detail
+
+    def _cmd_mission_advance(self, payload: dict[str, Any]) -> dict[str, Any]:
+        orch = self._goal_orchestrator()
+        orch.mission_advance(summary=str(payload.get("summary") or ""))
+        return self._mission_detail(orch)
+
+    def _cmd_mission_mark(self, payload: dict[str, Any]) -> dict[str, Any]:
+        orch = self._goal_orchestrator()
+        orch.mission_mark(int(payload.get("index") or 0), str(payload.get("state") or "done"),
+                          summary=str(payload.get("summary") or ""))
+        return self._mission_detail(orch)
+
+    def _cmd_mission_arm(self, payload: dict[str, Any]) -> dict[str, Any]:
+        orch = self._goal_orchestrator()
+        orch.mission_arm(by="app")
+        return self._mission_detail(orch)
+
+    def _cmd_mission_pause(self, payload: dict[str, Any]) -> dict[str, Any]:
+        orch = self._goal_orchestrator()
+        orch.mission_pause()
+        return self._mission_detail(orch)
+
+    def _cmd_mission_clear(self, payload: dict[str, Any]) -> dict[str, Any]:
+        orch = self._goal_orchestrator()
+        orch.mission_clear()
+        return self._mission_detail(orch)
+
+    def _mission_detail(self, orch: Any) -> dict[str, Any]:
+        return {"mission": orch.mission_status(), "goal": orch.goal_status()}
+
+    # ── portfolio: one principal, several orgs ──────────────────────────────
+
+    def _load_portfolio(self) -> Any:
+        """The portfolio, loaded once. None when there is none (a single-org setup)."""
+        if self._portfolio_loaded:
+            return self._portfolio
+        self._portfolio_loaded = True
+        from .portfolio import Portfolio, PortfolioError
+
+        try:
+            self._portfolio = Portfolio.load()
+        except PortfolioError as exc:  # noqa: BLE001 - a broken register must not kill the server
+            _log(f"serve: cannot read the portfolio: {exc}")
+            self._portfolio = None
+        return self._portfolio
+
+    def _fleet_for(self, portfolio: Any) -> Any:
+        """The fleet for this server, built once so its org runtimes persist across commands.
+
+        Built once rather than per command because the fleet *is* the concurrency: an org left running
+        on its thread must survive the next command, so the object that holds it must too.
+        """
+        from .fleet import Fleet
+
+        if self._fleet is None:
+            self._fleet = Fleet(config=self.config, library=self.library, portfolio=portfolio,
+                                on_event=self._fleet_event)
+        return self._fleet
+
+    def _fleet_event(self, kind: str, payload: dict[str, Any]) -> None:
+        """Forward a fleet event to the console, so org starts and finishes are visible live."""
+        try:
+            self.emit({"type": kind, **payload})
+        except Exception:  # noqa: BLE001 - an emit failure must not break the fleet
+            pass
+
+    def _cmd_portfolio(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """The portfolio snapshot: the principal and every org, loaded or not.
+
+        A snapshot command rather than only events, so the console shows the whole portfolio from the
+        poll it already makes. It does **not** load every org — that is `_cmd_portfolio_live` — because
+        reading ten rosters on every 2s poll would be wasteful; the register is enough to list them.
+        """
+        portfolio = self._load_portfolio()
+        if portfolio is None:
+            return {"portfolio": None, "principal": None, "active_org_id": "", "orgs": [],
+                    "counts": {"orgs": 0, "enabled": 0, "missing": 0}}
+        return {
+            "portfolio": {"principal": portfolio.principal.as_dict(),
+                          "active_org_id": portfolio.active_org_id,
+                          "counts": portfolio.inspect()["counts"]},
+            "principal": portfolio.principal.as_dict(),
+            "active_org_id": portfolio.active_org_id,
+            "orgs": portfolio.inspect()["orgs"],
+        }
+
+    def _cmd_portfolio_live(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """The live cross-org view: load every org and gather its mission, spend and blockers.
+
+        Expensive by nature — it builds an orchestrator per org — so it is a deliberate command the
+        Portfolio panel sends when open, not part of the status poll.
+        """
+        portfolio = self._load_portfolio()
+        if portfolio is None:
+            return {"rollup": None, "fleet": None}
+        fleet = self._fleet_for(portfolio)
+        for entry in portfolio.orgs:
+            try:
+                fleet._runtime_for(entry.id)
+            except Exception as exc:  # noqa: BLE001 - one bad org must not blank the view
+                _log(f"serve: org {entry.slug} failed to load: {exc}")
+        return {"rollup": fleet.rollup(), "fleet": fleet.status()}
+
+    def _cmd_portfolio_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Run one org from the console, in parallel with any other org already running."""
+        portfolio = self._load_portfolio()
+        if portfolio is None:
+            raise ServerError("no portfolio; add an org from the CLI first")
+        ref = str(payload.get("org") or "").strip()
+        if not ref:
+            raise ServerError("portfolio_run needs an org")
+        fleet = self._fleet_for(portfolio)
+        try:
+            handle = fleet.run_org(ref, goal=str(payload.get("goal") or ""),
+                                   manifest=str(payload.get("manifest") or ""),
+                                   background=bool(payload.get("background", True)))
+        except Exception as exc:  # noqa: BLE001 - a refusal is a result, said plainly
+            raise ServerError(str(exc)) from exc
+        return {"handle": handle.as_dict(), "fleet": fleet.status()}
+
+    def _cmd_portfolio_stop(self, payload: dict[str, Any]) -> dict[str, Any]:
+        portfolio = self._load_portfolio()
+        if portfolio is None:
+            raise ServerError("no portfolio")
+        ref = str(payload.get("org") or "").strip()
+        fleet = self._fleet_for(portfolio)
+        try:
+            detail = fleet.stop_org(ref)
+        except Exception as exc:  # noqa: BLE001
+            raise ServerError(str(exc)) from exc
+        return {"stopped": detail, "fleet": fleet.status()}
+
+    def _cmd_portfolio_select(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Select the active org — the one bare console commands act on."""
+        portfolio = self._load_portfolio()
+        if portfolio is None:
+            raise ServerError("no portfolio")
+        ref = str(payload.get("org") or "").strip()
+        try:
+            entry = portfolio.set_active(ref)
+            portfolio.save()
+        except Exception as exc:  # noqa: BLE001
+            raise ServerError(str(exc)) from exc
+        return {"active_org_id": entry.id, "active_org": entry.as_dict()}
+
+    def _cmd_portfolio_add(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Register an org from the console."""
+        from .portfolio import Portfolio
+
+        portfolio = self._load_portfolio()
+        if portfolio is None:
+            portfolio = Portfolio.new()
+            self._portfolio = portfolio
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise ServerError("portfolio_add needs a name")
+        try:
+            entry = portfolio.add_org(
+                name=name, slug=str(payload.get("slug") or ""),
+                path=str(payload.get("path") or ""), charter=str(payload.get("charter") or ""),
+                daily_budget_usd=float(payload.get("daily_budget_usd") or 0.0),
+                make_active=bool(payload.get("active")))
+            portfolio.save()
+        except Exception as exc:  # noqa: BLE001
+            raise ServerError(str(exc)) from exc
+        return {"org": entry.as_dict(), "portfolio": self._cmd_portfolio({})["portfolio"]}
+
+    def _cmd_portfolio_remove(self, payload: dict[str, Any]) -> dict[str, Any]:
+        portfolio = self._load_portfolio()
+        if portfolio is None:
+            raise ServerError("no portfolio")
+        ref = str(payload.get("org") or "").strip()
+        try:
+            entry = portfolio.remove_org(ref)
+            portfolio.save()
+        except Exception as exc:  # noqa: BLE001
+            raise ServerError(str(exc)) from exc
+        return {"removed": entry.as_dict(), "portfolio": self._cmd_portfolio({})["portfolio"]}
 
     def _cmd_fanout(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Start a fan-out from the console: a template, some items, and go.

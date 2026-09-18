@@ -51,6 +51,50 @@ choose.
 
 **Fix:** `cp credentials.example.json credentials.json`.
 
+### `concurrency.per_provider_limits names unknown providers: …`
+
+A per-provider limit names a provider that is not configured. This happens when a provider is
+*removed* but its limit is left behind — the `anthropic` case below is exactly a provider the example
+ships and a user deletes because they have no key for it:
+
+```
+configuration error: concurrency.per_provider_limits names unknown providers: anthropic
+```
+
+**This no longer stops the engine.** The loader prunes the dangling entry and records a warning, so the
+engine starts and `doctor` says:
+
+```
+OK   configuration   …/credentials.json with 5 providers
+     warning: concurrency.per_provider_limits named providers that are not configured
+     (anthropic); those entries were pruned. This is left behind when a provider is removed.
+```
+
+The same applies to `defaults.provider` naming a removed provider: it is dropped with a warning and a
+configured provider is used instead. And removing a provider from the console now prunes both
+references in the same write, so the state is no longer created in the first place.
+
+If you want the warning gone (it is harmless): remove the stale key from `credentials.json`, or just
+add the provider back in the **Providers** tab.
+
+### The app says the engine is running, but nothing works
+
+**Fixed.** The console used to set its state to *running* the moment the engine process *spawned*, so a
+bootstrap failure — a refused config, a missing library — showed a green "Engine running" with a pid and
+an idle UI.
+
+Now the engine sends an `engine.ready` frame as the first thing on the wire, and the app only reports
+running once it has received it. If the engine dies during startup it writes a typed `error` frame with
+the reason, which the app shows as a red banner:
+
+```
+The engine could not start
+the engine could not start: provider 'ollama' has unsupported kind 'weird'; supported: openai, anthropic, ollama
+```
+
+Press **Try again** after fixing the cause, or run `engine.cli doctor` — it checks every precondition
+and names the one that failed.
+
 ### `doctor` reports `FAIL skills library`
 
 ```

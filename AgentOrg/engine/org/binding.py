@@ -40,6 +40,10 @@ from typing import Any, Iterable
 from .agent import AgentError, AgentKind, AgentSpec, AgentState
 from .roster import Org
 
+# Imported from the skills package, not duplicated here: one answer to "does this node judge or
+# produce?" keeps the binder from disagreeing with the planner about who a reviewer is.
+from ..skills.roles import is_verifier
+
 __all__ = ["BindingError", "BindingPolicy", "Binder", "NodeBinding", "declared_policy"]
 
 
@@ -355,8 +359,6 @@ class Binder:
         pins = pins or {}
         bindings: dict[str, NodeBinding] = {}
         produced_by: str | None = None
-        reviewer_skills = {"code-reviewer", "security-reviewer", "qa-engineer",
-                           "accessibility-auditor", "performance-engineer", "contract-completeness-review"}
 
         for node in manifest.get("nodes") or []:
             if not isinstance(node, dict):
@@ -365,7 +367,10 @@ class Binder:
             if not skill:
                 continue
             node_id = str(node.get("id") or skill)
-            is_reviewer = skill in reviewer_skills or node.get("phase") == "REVIEW"
+            # One shared answer to "does this node judge or produce?" (`skills/roles.py`), rather than
+            # a second hardcoded set here that can drift from the planner's. A node in the REVIEW
+            # phase is a verifier regardless, because the plan said so.
+            is_reviewer = node.get("phase") == "REVIEW" or is_verifier(skill)
             exclude: set[str] = set()
             prefer_model: str | None = None
             if is_reviewer and produced_by:

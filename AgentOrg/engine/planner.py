@@ -58,18 +58,155 @@ class PlanError(RuntimeError):
 # This is a *composition template*, not a hardcoded pipeline: the planner verifies each
 # skill's declared contract before including it, and a skill whose contract is missing is
 # dropped with a reason rather than producing an edge that cannot type-check.
+#
+# It is the **software** shape. A goal about strategy, market research or go-to-market gets a
+# different build chain (see `_DOMAIN_SHAPES`) because the software pipeline is simply the wrong
+# org for that work — a CEO-and-market-researcher goal run through product-manager/architect/
+# backend-developer does not "improve the project", it produces a spurious API spec.
 _DEFAULT_SHAPE: tuple[tuple[str, str, str], ...] = (
     ("pm", "product-manager", "DISCOVER"),
     ("architect", "system-architect", "DESIGN"),
     ("api", "api-designer", "DESIGN"),
     ("developer", "backend-developer", "BUILD"),
+)
+
+# The software domain's verifiers, kept separate from the build chain for the same reason every other
+# domain keeps them separate: the rework loop hands findings back to the chain's *producer*, and a
+# build chain that also contained the reviewers made that resolve to a reviewer (the last entry),
+# which is not a node that can fix anything.
+_SOFTWARE_VERIFIERS: tuple[tuple[str, str, str], ...] = (
     ("reviewer", "code-reviewer", "REVIEW"),
     ("qa", "qa-engineer", "VERIFY"),
     ("security", "security-reviewer", "VERIFY"),
 )
 
-# Goal keywords that select specialist skills in addition to the default company. Each entry
+# Goals that are *not* primarily a software build. Each domain selects a build chain and a
+# verification set appropriate to the work, because the same seven software roles are the wrong
+# answer for a business or research goal.
+#
+# Intent domains, tested before `software`. A *stated intent* ("strategy", "go-to-market",
+# "research") is a stronger signal than a technical noun, so these run first; `software` is only
+# reached when no intent matched. Order matters: research before gtm, because "market research"
+# names a research activity while "market" alone could suggest either.
+_DOMAIN_INTENT_ORDER: tuple[str, ...] = ("strategy", "research", "gtm", "data")
+
+# Each domain: a build chain (node id, skill, phase) and a verifier set (node id, skill, phase).
+# The verifiers are the ones whose declared contract can consume what the chain produces, so a
+# research deliverable is checked by a research verifier rather than by `code-reviewer`.
+_DOMAIN_SHAPES: dict[str, dict[str, tuple[tuple[str, str, str], ...]]] = {
+    "software": {
+        "build": _DEFAULT_SHAPE,
+        "verify": _SOFTWARE_VERIFIERS,
+    },
+    "strategy": {
+        # Company/business strategy: frame the decision, ground it in market evidence, model the
+        # numbers, then have it independently challenged. `ceo-strategist` frames; `business-strategist`
+        # produces the go-to-market and unit economics; `fp-and-a-analyst` models the financing.
+        "build": (
+            ("ceo", "ceo-strategist", "DISCOVER"),
+            ("bizstrat", "business-strategist", "DESIGN"),
+            ("fpa", "fp-and-a-analyst", "DESIGN"),
+        ),
+        "verify": (
+            ("bizdev", "bizdev-manager", "REVIEW"),
+            ("critic", "critical-thinker", "REVIEW"),
+        ),
+    },
+    "gtm": {
+        # Go-to-market: position the product, engineer growth, and produce the collateral.
+        "build": (
+            ("pm", "product-manager", "DISCOVER"),
+            ("pmm", "marketing-manager", "DESIGN"),
+            ("growth", "growth-engineer", "BUILD"),
+            ("content", "content-strategist", "BUILD"),
+        ),
+        "verify": (
+            ("analyst", "product-analyst", "REVIEW"),
+            ("critic", "critical-thinker", "VERIFY"),
+        ),
+    },
+    "research": {
+        # Discovery research: scope the questions, research users, synthesise, and write it up.
+        "build": (
+            ("pm", "product-manager", "DISCOVER"),
+            ("uxr", "ux-researcher", "DISCOVER"),
+            ("bi", "business-intelligence-engineer", "DESIGN"),
+        ),
+        "verify": (
+            ("analyst", "product-analyst", "REVIEW"),
+            ("critic", "critical-thinker", "VERIFY"),
+        ),
+    },
+    "data": {
+        # Data/analytics work: an engineering chain, but verified by analytics rather than QA.
+        "build": (
+            ("pm", "product-manager", "DISCOVER"),
+            ("architect", "system-architect", "DESIGN"),
+            ("engineer", "data-engineer", "BUILD"),
+        ),
+        "verify": (
+            ("analyst", "product-analyst", "REVIEW"),
+            ("critic", "critical-thinker", "VERIFY"),
+        ),
+    },
+}
+
+# How a goal is classified into a *non-software* domain. Each domain lists patterns that state
+# intent — a domain word like "strategy", "go-to-market" or "research". There is deliberately no
+# `software` entry: `software` is the fallback when no intent matches, so a pattern for it would be
+# unreachable. That is also the correct behaviour — a technical noun alone ("api", "database") should
+# not decide the org, and a goal with no stated intent is most often an engineering build.
+_DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "strategy": (
+        r"\b(ceo|founder|board|investor|fundrais\w*|cap table|dilution)\b",
+        r"\b(strategy|strategic|business model|business plan|unit economics|"
+        r"pricing strategy|valuation|market entry|expansion)\b",
+        r"\b(raise|raising)\b.*\b(capital|funding|round|seed|series [a-c])\b",
+        r"\b(competitiv\w+ (analysis|positioning)|porters?\b)",
+    ),
+    "gtm": (
+        r"\b(go[- ]to[- ]market|gtm|launch plan|positioning|messaging|"
+        r"battle card|sales enablement|demand gen\w*|lead gen\w*)\b",
+        r"\b(marketing|promotion|brand|campaign|content plan|seo|funnel|"
+        r"conversion|acquisition|retention)\b",
+        r"\b(capture|grow|expand|acquire)\b.*\b(market|users?|customers?|demand)\b",
+    ),
+    "research": (
+        r"\b(research|user research|market research|survey|interview|persona|"
+        r"journey map|usability|discovery|competitive analysis|landscape|"
+        r"feasibility|due diligence)\b",
+        r"\b(who are|understand)\b.*\b(users?|customers?|market)\b",
+    ),
+    "data": (
+        r"\b(analytics|dashboard|metric|kpi|reporting|data warehouse|etl|elt|"
+        r"data pipeline|data model|bi\b|business intelligence|telemetry|instrumentation)\b",
+    ),
+}
+
+# A domain that the goal names outright ("use the CEO skill", "do market research") wins over the
+# keyword vote, because naming a capability is an instruction rather than a hint.
+_DOMAIN_NAMES: dict[str, str] = {
+    "ceo": "strategy",
+    "ceo-strategist": "strategy",
+    "business-strategist": "strategy",
+    "business strategy": "strategy",
+    "market researcher": "research",
+    "market research": "research",
+    "ux researcher": "research",
+    "user research": "research",
+    "go-to-market": "gtm",
+    "gtm": "gtm",
+    "marketing": "gtm",
+    "growth": "gtm",
+    "data engineering": "data",
+    "analytics": "data",
+}
+
+# Goal keywords that select specialist skills in addition to a chosen shape. Each entry
 # is (pattern, skill name). Ordered so the first match wins per skill.
+#
+# These are technical specialists, so they only extend a chain — they never replace the domain's
+# own roles. A strategy goal that also says "dashboard" still gets its strategists.
 _GOAL_HINTS: tuple[tuple[str, str], ...] = (
     (r"\b(api|rest|graphql|grpc|endpoint|openapi)\b", "api-designer"),
     (r"\b(ui|frontend|react|swift|screen|dashboard|interface)\b", "frontend-developer"),
@@ -77,9 +214,42 @@ _GOAL_HINTS: tuple[tuple[str, str], ...] = (
     (r"\b(kubernetes|docker|deploy|infra|terraform|pipeline|ci/?cd)\b", "devops-engineer"),
     (r"\b(auth|login|password|oauth|permission|rbac|token)\b", "security-engineer"),
     (r"\b(database|schema|migration|sql|postgres|sqlite)\b", "database-designer"),
-    (r"\b(data|analytics|etl|warehouse|pipeline)\b", "data-engineer"),
+    (r"\b(etl|elt|warehouse|lakehouse|medallion)\b", "data-engineer"),
     (r"\b(mobile|android|flutter|react native)\b", "mobile-developer"),
     (r"\b(payment|billing|subscription|stripe|pricing)\b", "fintech-app-developer"),
+    (r"\b(docs|documentation|readme|runbook|api reference|adr)\b", "technical-writer"),
+    (r"\b(budget|financial model|projection|forecast|arr|nrr|ltv|cac)\b", "fp-and-a-analyst"),
+    (r"\b(partner|partnership|channel|reseller|alliance)\b", "bizdev-manager"),
+    (r"\b(fundrais\w*|raise capital|pitch deck|data room|cap table|dilution)\b",
+     "investor-relations"),
+)
+
+# Roles a goal may *name outright* ("bring a market researcher"). A named person is an instruction,
+# so it is added as a specialist even when the domain's own chain would not have included them —
+# which is what makes "use the CEO skill and bring a market researcher" produce both, rather than
+# silently picking one. Ordered so the first phrase match wins per skill.
+_ROLE_HINTS: tuple[tuple[str, str], ...] = (
+    (r"\b(market researcher|market research|user research|ux researcher|personas?|"
+     r"journey maps?|user interviews?|usability)\b", "ux-researcher"),
+    (r"\b(ceo|chief executive)\b", "ceo-strategist"),
+    (r"\b(business strategist|go[- ]to[- ]market|business model|unit economics)\b",
+     "business-strategist"),
+    (r"\b(product strategist|product-market fit|roadmap)\b", "product-strategist"),
+    (r"\b(product marketing|positioning|battle cards?|sales enablement)\b",
+     "product-marketing-manager"),
+    (r"\b(marketing manager|campaigns?|brand)\b", "marketing-manager"),
+    (r"\b(growth engineer|funnel|a/b test\w*|conversion rate|referral|activation)\b",
+     "growth-engineer"),
+    (r"\b(content strategist|editorial|content plan|seo)\b", "content-strategist"),
+    (r"\b(financial analyst|financial model|p&l|board financials|saas metrics)\b",
+     "fp-and-a-analyst"),
+    (r"\b(business intelligence|bi engineer|semantic layer|dashboards?)\b",
+     "business-intelligence-engineer"),
+    (r"\b(product analyst|product metrics|kpis?|cohort|retention analysis)\b",
+     "product-analyst"),
+    (r"\b(project manager|project plan|raid log|wbs|gantt|milestones)\b", "project-manager"),
+    (r"\b(bizdev|business development|strategic partners?)\b", "bizdev-manager"),
+    (r"\b(technical writer|api reference|runbook|adrs?)\b", "technical-writer"),
 )
 
 # The handoff payload every edge carries. Matches the library's registry name.
@@ -115,6 +285,17 @@ class Plan:
     skills_used: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
     dropped: tuple[str, ...] = ()
+    #: Which composition shape the goal selected — `software`, `strategy`, `research`, `gtm`.
+    #: Surfaced because "why this org?" is the first question an Owner asks of a plan, and the
+    #: answer must not be something they have to infer from the node list.
+    shape: str = "software"
+    #: Skills the plan needs that the roster does not staff, when a roster was supplied.
+    #: Each entry names the skill, why it is a gap, and the exact hire that closes it.
+    staffing: tuple[dict[str, Any], ...] = ()
+    #: The library's own view of this plan: how well its skills hang together and what several of
+    #: them declare they need that the plan left out (`SkillGraph.plan_review`). Populated when a
+    #: skill graph is available; empty when it is not, so a plan still renders without the library.
+    graph_review: dict[str, Any] = field(default_factory=dict)
 
     @property
     def nodes(self) -> list[dict[str, Any]]:
@@ -145,6 +326,9 @@ class Plan:
             f"Goal: {self.goal}",
             f"Workflow: {self.manifest.get('name')}  (validated: "
             f"{'yes' if self.validation.valid else 'NO'})",
+            f"Shape: {self.shape}"
+            + ("  (the goal selected a non-engineering org)"
+               if self.shape != "software" else ""),
             "",
             "Sequence:",
         ]
@@ -175,6 +359,26 @@ class Plan:
             lines.append("Omitted (with reason):")
             for entry in self.dropped:
                 lines.append(f"  - {entry}")
+        if self.staffing:
+            lines.append("")
+            lines.append("Staffing gaps — nobody in the roster holds these capabilities:")
+            for gap in self.staffing:
+                lines.append(f"  {gap['node_id']:16s} {gap['skill']:28s} {gap['reason']}")
+                if gap.get("hire"):
+                    lines.append(f"  {'':16s} close it: {gap['hire']}")
+        review = self.graph_review or {}
+        isolated = review.get("isolated") or []
+        consensus = review.get("consensus_missing") or []
+        if isolated:
+            lines.append("")
+            lines.append("Unrelated skills — the library's graph says these belong in another run:")
+            for name in isolated:
+                lines.append(f"  - {name}")
+        if consensus:
+            lines.append("")
+            lines.append("Consensus prerequisites — several of these skills declare they need:")
+            for entry in consensus[:8]:
+                lines.append(f"  - {entry['skill']:32s} demanded by {entry['demanded_by']} skills")
         if self.notes:
             lines.append("")
             lines.append("Notes:")
@@ -192,6 +396,9 @@ class Plan:
             "skills_used": list(self.skills_used),
             "notes": list(self.notes),
             "dropped": list(self.dropped),
+            "shape": self.shape,
+            "staffing": [dict(gap) for gap in self.staffing],
+            "graph_review": dict(self.graph_review or {}),
         }
 
 
@@ -208,13 +415,23 @@ class Planner:
         the planner's fallback logic is tested without the library present.
     config:
         Supplies budget defaults and the manifest naming rules.
+    org:
+        The effective roster, when known. Optional: a planner with no roster still composes a
+        runnable graph, but one *with* a roster can report which needed skills nobody holds and the
+        exact hire that closes each gap.
     """
 
-    def __init__(self, source: Any, *, validator: Any = None, config: Config | None = None) -> None:
+    def __init__(self, source: Any, *, validator: Any = None, config: Config | None = None,
+                 org: Any = None) -> None:
         self.source = source
         self.config = config
         self._validator = validator
         self._library_validator = None
+        #: The effective roster, when one is available. Optional on purpose: the planner must
+        #: compose a runnable graph even with no roster (a fresh machine), but when a roster *is*
+        #: known it can say which needed capabilities nobody holds — the gap the Owner most needs
+        #: to see before approving a run.
+        self.org = org
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -235,13 +452,17 @@ class Planner:
         if not goal or not goal.strip():
             raise PlanError("a goal is required; an empty goal cannot produce a plan")
         project = slug or _slugify(goal)
-        selected = self._select_skills(goal)
+        # Classify first: the domain decides the *org*, not just which extra skills to bolt onto a
+        # software pipeline. This is the fix for "a CEO-and-market goal ran as product-manager →
+        # architect → backend-developer".
+        domain = self._classify_domain(goal)
+        selected = self._select_skills(goal, domain)
 
         candidates = [
-            ("full", self._compose(project, goal, selected, max_iterations, max_steps,
-                                   include_parallel=True, include_security=True)),
-            ("lean", self._compose(project, goal, selected, max_iterations, max_steps,
-                                   include_parallel=False, include_security=False)),
+            ("full", self._compose(project, goal, selected, domain, max_iterations, max_steps,
+                                   include_parallel=True, include_all_verifiers=True)),
+            ("lean", self._compose(project, goal, selected, domain, max_iterations, max_steps,
+                                   include_parallel=False, include_all_verifiers=False)),
             ("minimal", self._minimal(project, goal, max_iterations)),
         ]
 
@@ -252,6 +473,8 @@ class Planner:
                 notes = [] if label == "full" else [
                     f"used the {label} shape because the richer shape did not validate"
                 ]
+                if domain != "software":
+                    notes = [*notes, f"classified the goal as a {domain} goal, not a software build"]
                 return Plan(
                     goal=goal,
                     slug=project,
@@ -263,6 +486,9 @@ class Planner:
                     ),
                     notes=tuple(notes),
                     dropped=tuple(dropped),
+                    shape=domain,
+                    staffing=self._staffing_gaps(manifest),
+                    graph_review=self._graph_review(manifest),
                 )
             dropped.append(f"{label} shape rejected: " + "; ".join(validation.errors[:3]))
 
@@ -270,6 +496,130 @@ class Planner:
             "no candidate manifest validated, which indicates a defect in the planner "
             "rather than an unusual goal:\n  " + "\n  ".join(dropped)
         )
+
+    # ── domain classification ───────────────────────────────────────────────
+
+    def _classify_domain(self, goal: str) -> str:
+        """Which composition shape a goal calls for.
+
+        Two signals, in order of authority:
+
+        1. **A named capability.** "use the CEO skill", "do market research" is an *instruction*,
+           so a name match wins outright over any keyword.
+        2. **Stated intent.** A domain word ("strategy", "go-to-market", "research") is a stronger
+           signal than a mere technical noun, so intent domains are tested before `software`. A goal
+           with a technical word but no domain intent ("build a booking SaaS") stays software.
+
+        Falls back to `software`, which is the shape that always validates and the one an
+        unqualified "build me X" most often means.
+        """
+        lowered = goal.lower()
+        for name, domain in _DOMAIN_NAMES.items():
+            if name in lowered:
+                return domain
+        for domain in _DOMAIN_INTENT_ORDER:
+            for pattern in _DOMAIN_KEYWORDS.get(domain, ()):
+                if re.search(pattern, lowered):
+                    return domain
+        return "software"
+
+    def _select_skills(self, goal: str, domain: str) -> list[tuple[str, str, str]]:
+        """Choose the company for a goal: the domain's chain, its verifiers, and goal-matched extras.
+
+        A skill that is not in the library, or whose contract cannot be loaded, is skipped —
+        the planner must never emit an edge to a node whose contract it could not read.
+        """
+        shape = _DOMAIN_SHAPES.get(domain) or _DOMAIN_SHAPES["software"]
+        selected: list[tuple[str, str, str]] = list(shape["build"])
+        already = {skill for _id, skill, _phase in selected}
+        lowered = goal.lower()
+        # Technical/functional specialists extend the build chain. They never *replace* the domain's
+        # own roles: a strategy goal that also mentions "dashboard" still gets its strategists.
+        for pattern, skill in _GOAL_HINTS:
+            if skill in already:
+                continue
+            if re.search(pattern, lowered) and self._load(skill) is not None:
+                selected.append((_node_id_for(skill), skill, _phase_for(skill)))
+                already.add(skill)
+        # A role the goal names outright is an instruction, so it joins the chain even when the
+        # domain would not have chosen it — "use the CEO skill *and* bring a market researcher" must
+        # produce both, not whichever the keyword vote happened to prefer.
+        for pattern, skill in _ROLE_HINTS:
+            if skill in already:
+                continue
+            if re.search(pattern, lowered) and self._load(skill) is not None:
+                selected.append((_node_id_for(skill), skill, _phase_for(skill)))
+                already.add(skill)
+        # Verifiers go last so the chain's final node is the producing node, which is what the
+        # rework loop hands back to.
+        for node_id, skill, phase in shape["verify"]:
+            if skill in already:
+                continue
+            if self._load(skill) is not None:
+                selected.append((node_id, skill, phase))
+                already.add(skill)
+        return selected
+
+    def _staffing_gaps(self, manifest: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+        """Skills the plan needs that the roster does not staff, with the hire that closes each.
+
+        The binder reports gaps too, but by the time a *run* exists the plan is already approved —
+        and a gap is cheapest to fix before approval, when the Owner is looking at the graph. This is
+        the planner's own copy of that check, phrased as "hire this to fix it".
+        """
+        if self.org is None:
+            return ()
+        gaps: list[dict[str, Any]] = []
+        for node in manifest.get("nodes") or []:
+            if not isinstance(node, dict):
+                continue
+            skill = str(node.get("skill") or "")
+            if not skill:
+                continue
+            # A human gate lists no skill; a skill with no holder is a gap unless the Owner's own
+            # wildcard covers it (the Owner holds `*`, so nothing is a gap when they may act).
+            holders = self._holders_of(skill)
+            if holders:
+                continue
+            gaps.append({
+                "node_id": str(node.get("id") or skill),
+                "skill": skill,
+                "reason": "no agent in the roster holds this skill",
+                "hire": (f"engine.cli hire <name> --skill {skill} "
+                         f"(or `org hire` in the app)"),
+            })
+        return tuple(gaps)
+
+    def _holders_of(self, skill: str) -> list[Any]:
+        """Roster agents that hold a skill, tolerating a roster that is not an `Org`."""
+        try:
+            holders = self.org.agents_for_skill(skill)
+        except Exception:  # noqa: BLE001 - a roster we cannot read is not a plan failure
+            return []
+        return [a for a in holders if getattr(a, "kind", None) != "human"]
+
+    def _graph_review(self, manifest: dict[str, Any]) -> dict[str, Any]:
+        """Ask the library's own chain graph how this plan hangs together.
+
+        A read-only diagnosis, not a composer: it reports which plan skills the corpus says are
+        unrelated to the rest, and which prerequisites several of them declare that the plan omits.
+        It never changes the manifest — the graph is dense and mutual, so it informs a person rather
+        than dictating an order. Empty when no graph can be built, so the plan still renders.
+
+        The consensus threshold scales with the plan: demanding a fixed 2 of 3 nodes would flood a
+        small plan with noise from the graph's density, while a large plan needs a higher bar to be
+        meaningful.
+        """
+        try:
+            from .skills.graph import SkillGraph
+
+            skills = [str(n.get("skill")) for n in manifest.get("nodes") or [] if n.get("skill")]
+            if not skills:
+                return {}
+            threshold = max(2, len(skills) // 2)
+            return SkillGraph(self.source).plan_review(skills, min_consensus=threshold)
+        except Exception:  # noqa: BLE001 - the graph is a diagnosis, never a blocker
+            return {}
 
     def validate(self, manifest: dict[str, Any]) -> PlanValidation:
         """Validate a manifest with the library's own validator.
@@ -384,24 +734,6 @@ class Planner:
 
     # ── composition ─────────────────────────────────────────────────────────
 
-    def _select_skills(self, goal: str) -> list[tuple[str, str, str]]:
-        """Choose the company for a goal: the default shape plus goal-matched specialists.
-
-        A skill that is not in the library, or whose contract cannot be loaded, is skipped —
-        the planner must never emit an edge to a node whose contract it could not read.
-        """
-        selected: list[tuple[str, str, str]] = list(_DEFAULT_SHAPE)
-        already = {skill for _id, skill, _phase in selected}
-        lowered = goal.lower()
-        for pattern, skill in _GOAL_HINTS:
-            if skill in already:
-                continue
-            if re.search(pattern, lowered):
-                if self._load(skill) is not None:
-                    selected.append((_node_id_for(skill), skill, _phase_for(skill)))
-                    already.add(skill)
-        return selected
-
     def _handoff_compatible(self, producer: dict[str, Any], consumer: dict[str, Any]) -> bool:
         """Whether a producer's declared outputs can satisfy a consumer's declared inputs.
 
@@ -425,15 +757,23 @@ class Planner:
         except (SkillError, Exception):  # noqa: BLE001 - a bad skill is skipped, not fatal
             return None
 
-    def _compose(self, slug: str, goal: str, selected: list[tuple[str, str, str]],
+    def _compose(self, slug: str, goal: str, selected: list[tuple[str, str, str]], domain: str,
                  max_iterations: int, max_steps: int | None, *,
-                 include_parallel: bool, include_security: bool) -> dict[str, Any]:
+                 include_parallel: bool, include_all_verifiers: bool) -> dict[str, Any]:
         """Build a manifest from the selected skills.
 
-        The graph is: sequential phases, then a parallel review fan-out, then a bounded
-        review/rework loop whose exhaustion reaches a terminal human gate. That shape is what
-        makes "work until done" terminate rather than spin.
+        The graph is: sequential phases, then a parallel verification fan-out, then a bounded
+        rework loop whose exhaustion reaches a terminal human gate. That shape is what makes
+        "work until done" terminate rather than spin, and it is the same shape for every domain —
+        only the *people* differ, because the invariants (terminate, gate, bounded loop) are
+        properties of the graph rather than of the work.
+
+        `domain` selects the verifier set and the description; the software domain keeps the exact
+        behavior it always had, so existing plans are unchanged.
         """
+        shape = _DOMAIN_SHAPES.get(domain) or _DOMAIN_SHAPES["software"]
+        verifier_skills = {skill for _id, skill, _phase in shape["verify"]}
+
         nodes: list[dict[str, Any]] = []
         edges: list[dict[str, Any]] = []
         used_skills: list[str] = []
@@ -441,13 +781,14 @@ class Planner:
         # Type mismatches that were allowed rather than fatal, surfaced for the Owner.
         type_notes: list[str] = []
 
-        # Separate the build chain from the review/verify specialists.
-        reviewers = {"code-reviewer", "security-reviewer", "qa-engineer"}
+        # Separate the build chain from the verification specialists.
+        first_verifier = _first_verifier(selected, verifier_skills)
         primary: list[tuple[str, str, str]] = []
         review: list[tuple[str, str, str]] = []
         for entry in selected:
-            if entry[1] in reviewers:
-                if entry[1] == "security-reviewer" and not include_security:
+            if entry[1] in verifier_skills:
+                # A lean shape keeps the first verifier only: enough to gate on, cheap to run.
+                if not include_all_verifiers and entry != first_verifier:
                     dropped.append(f"{entry[1]} omitted from the lean shape")
                     continue
                 review.append(entry)
@@ -465,12 +806,12 @@ class Planner:
                 "phase": phase,
                 "max_iterations": 1,
             }
-            # A node in a *producing* phase works on the code, so it gets the tools to read and
+            # A node in a *producing* phase works on the artefact, so it gets the tools to read and
             # change it. Without this the planner emitted no `tools` key at all, so a normal
             # `run --goal` never used the tool loop — the feature would have existed and been
             # unreachable, which is the failure mode this codebase keeps producing.
             #
-            # Reviewers are deliberately excluded: they judge an artifact, and a verifier that can
+            # Verifiers are deliberately excluded: they judge an artifact, and a verifier that can
             # edit what it judges is not a verifier. Their capability set already denies writes, and
             # not advertising the tools keeps the prompt honest about what they may do.
             if phase in ("BUILD", "IMPLEMENT", "FIX", "DESIGN", "DISCOVER"):
@@ -541,19 +882,43 @@ class Planner:
         if not review_nodes:
             raise PlanError(f"no reviewer skills available for goal {goal!r}")
 
-        # The rework loop: reviewers -> developer -> reviewers, bounded and with an exit.
-        developer = next((n["id"] for n in nodes if n["skill"] == "backend-developer"), last_primary)
+        # The rework loop: verifiers -> the chain's producer -> verifiers, bounded and with an exit.
+        #
+        # The producer handed back the findings is the last node of the *domain's own chain*, which
+        # for software is `backend-developer` and for a strategy goal is the business analyst. Using
+        # the chain's producer rather than a hardcoded `backend-developer` is what lets a
+        # non-software goal iterate at all — and preferring the chain over an incidental specialist
+        # keeps the rework aimed at the work rather than at whoever happened to be added last.
+        chain_skills = {skill for _id, skill, _phase in shape["build"]}
+        developer = next((n["id"] for n in reversed(nodes) if n["skill"] in chain_skills),
+                         last_primary)
         verdict_node = review_nodes[0]
         gate_id = "human-gate"
+        agent_gate_id = "reroute-gate"
+        # A bounded-reroute **agent gate** sits between the loop and the human. When automation
+        # exhausts its iterations, the runner hands the gate the untried channels and asks which one
+        # should lead a *fresh* pass — a decision the org can make itself, bounded by `max_reroutes`,
+        # before bothering the Owner. The runner and the executor have always supported this
+        # (`kind: agent`, `mode: identify`); nothing emitted one, so every exhaustion went straight to
+        # a person. The gate's pool is the loop's own members, so a reroute stays inside the rework.
+        nodes.append({
+            "id": agent_gate_id,
+            "type": "gate",
+            "kind": "agent",
+            "pool": [*review_nodes, developer],
+            "max_reroutes": 2,
+            "escalate_to": gate_id,
+            "description": (
+                "Bounded reroute: on exhaustion, identify the channel best placed to fix the "
+                "shortfall and grant one fresh pass (at most twice) before escalating to the Owner."
+            ),
+        })
         nodes.append({
             "id": gate_id,
             "type": "gate",
             "kind": "human",
             "requires": [f"{nid}.summary" for nid in review_nodes][:3],
-            "description": (
-                "Owner approval: the change is released once the review loop converges, or the "
-                "escalation report is reviewed when automation exhausted its budget."
-            ),
+            "description": _gate_description(domain),
         })
 
         for node_id in review_nodes:
@@ -573,7 +938,9 @@ class Planner:
                 "nodes": [*review_nodes, developer],
                 "exit_when": f"{verdict_node}.verdict == pass",
                 "max_iterations": max(1, int(max_iterations)),
-                "escalate_to": gate_id,
+                # Escalate to the *agent* gate, which decides a bounded reroute and only then
+                # escalates onward to the human gate.
+                "escalate_to": agent_gate_id,
                 "convergence": {"window": 2, "require_delta": True},
             }],
             "end": [gate_id],
@@ -595,7 +962,6 @@ class Planner:
         # so they travel with the plan rather than being logged and forgotten.
         self._last_dropped = [*dropped, *type_notes]
         return manifest
-
     def _minimal(self, slug: str, goal: str, max_iterations: int) -> dict[str, Any]:
         """The smallest runnable graph: one worker, one reviewer, one bounded loop, one gate.
 
@@ -771,15 +1137,48 @@ def _node_id_for(skill: str) -> str:
     return _slugify(skill, limit=32)
 
 
+def _first_verifier(selected: list[tuple[str, str, str]],
+                    verifier_skills: set[str]) -> tuple[str, str, str] | None:
+    """The verifier kept in the lean shape — the first one the domain declares.
+
+    The lean shape drops *extra* verifiers to run cheaply, but it must keep at least one so the
+    plan still has something to gate on. Naming the first (not "the security reviewer", which a
+    strategy plan has never heard of) is what makes the same rule work in every domain.
+    """
+    for entry in selected:
+        if entry[1] in verifier_skills:
+            return entry
+    return None
+
+
+def _gate_description(domain: str) -> str:
+    """The human gate's description, worded for the work the domain produces."""
+    if domain == "software":
+        return ("Owner approval: the change is released once the review loop converges, or the "
+                "escalation report is reviewed when automation exhausted its budget.")
+    return ("Owner decision: the deliverable is accepted once the verification loop converges, or "
+            "the escalation report is reviewed when automation exhausted its budget. Nothing "
+            "downstream (a build, a launch, a spend) proceeds without this.")
+
+
 def _phase_for(skill: str) -> str:
-    """The lifecycle phase a specialist belongs to."""
-    if skill in ("product-manager", "product-strategist", "ux-researcher"):
+    """The lifecycle phase a specialist belongs to.
+
+    A verifier is detected by the *skill itself* (`skills/roles.py`), so a judging procedure the
+    library adds is given `VERIFY` without editing this table — which is the whole point of deriving
+    the role rather than listing it. The explicit tables below then place the producers.
+    """
+    from .skills.roles import is_verifier
+
+    if is_verifier(skill):
+        return "VERIFY"
+    if skill in ("product-manager", "product-strategist", "ux-researcher", "ceo-strategist",
+                 "business-strategist", "project-manager", "bizdev-manager",
+                 "investor-relations"):
         return "DISCOVER"
-    if skill in ("system-architect", "api-designer", "database-designer", "cloud-architect"):
+    if skill in ("system-architect", "api-designer", "database-designer", "cloud-architect",
+                 "business-intelligence-engineer", "fp-and-a-analyst", "security-engineer"):
         return "DESIGN"
     if skill in ("devops-engineer", "platform-engineer", "site-reliability-engineer"):
         return "OPERATE"
-    if skill in ("qa-engineer", "security-reviewer", "security-engineer",
-                 "performance-engineer", "accessibility-auditor"):
-        return "VERIFY"
     return "BUILD"

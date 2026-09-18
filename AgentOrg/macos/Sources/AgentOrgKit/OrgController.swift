@@ -21,10 +21,15 @@ import SwiftUI
 public enum ConsoleTab: String, CaseIterable, Identifiable, Sendable {
     // Seven views, each answering exactly one question. `observability-engineer` is explicit that a
     // dashboard without a single question is sprawl, so the tabs are the questions.
+    // The tabs are the questions. `portfolio` is first because it is the *whole* picture — the
+    // several orgs one person runs — and every other tab is a view *within* one of them.
+    case portfolio = "Portfolio"
     case org = "Org"
     case people = "People"
     case providers = "Providers"
     case improve = "Improve"
+    case activity = "Activity"
+    case flow = "Flow"
     case progress = "Work"
     case economics = "Cost"
     case context = "Context"
@@ -35,10 +40,13 @@ public enum ConsoleTab: String, CaseIterable, Identifiable, Sendable {
     /// The question this panel answers, shown as its subtitle.
     public var question: String {
         switch self {
+        case .portfolio: return "Which orgs am I running, and what is each doing?"
         case .org: return "Who do I have, and is the org healthy?"
         case .people: return "Who can I hire, and what are they on?"
         case .providers: return "Which models can I reach, and with what?"
         case .improve: return "What does the system think is wrong with itself?"
+        case .activity: return "What is happening, why, and what do I do next?"
+        case .flow: return "Who is working on what, and what crossed between them?"
         case .progress: return "Where is work stuck?"
         case .economics: return "What is this costing?"
         case .context: return "How full are the agents' contexts?"
@@ -53,10 +61,13 @@ public enum ConsoleTab: String, CaseIterable, Identifiable, Sendable {
     /// one, because an ellipsis in the *middle* of a question is worse than a shorter question.
     public var shortQuestion: String {
         switch self {
+        case .portfolio: return "orgs · missions"
         case .org: return "the roster"
         case .people: return "hiring · models"
         case .providers: return "endpoints · keys"
         case .improve: return "proposals · gate"
+        case .activity: return "timeline · next step"
+        case .flow: return "who · handoffs · back"
         case .progress: return "run · gates · swarm"
         case .economics: return "spend · cache"
         case .context: return "window fullness"
@@ -67,10 +78,13 @@ public enum ConsoleTab: String, CaseIterable, Identifiable, Sendable {
     /// The sidebar glyph. SF Symbols, so it matches the rest of the system and needs no assets.
     public var symbol: String {
         switch self {
+        case .portfolio: return "building.2"
         case .org: return "person.3"
         case .people: return "person.badge.plus"
         case .providers: return "server.rack"
         case .improve: return "wand.and.stars"
+        case .activity: return "list.bullet.rectangle.portrait"
+        case .flow: return "arrow.triangle.branch"
         case .progress: return "point.topleft.down.curvedto.point.bottomright.up"
         case .economics: return "dollarsign.circle"
         case .context: return "gauge.with.dots.needle.bottom.50percent"
@@ -87,6 +101,10 @@ public final class OrgController: ObservableObject {
 
     @Published public private(set) var engineState: EngineState = .idle
     @Published public private(set) var engineError: String?
+    /// A *fatal* engine failure, kept separate from `engineError` so the UI can show a prominent,
+    /// persistent failure rather than a transient message. Set when the engine dies during bootstrap —
+    /// the case that used to look like a healthy idle engine.
+    @Published public private(set) var engineFailure: String?
     @Published public private(set) var projectPath: String = ""
     @Published public private(set) var credentialsPath: String = ""
     @Published public private(set) var libraryPath: String = ""
@@ -119,6 +137,35 @@ public final class OrgController: ObservableObject {
     @Published public private(set) var rosterPath: String = ""
     /// The durable goal: objective, state, whether the loop will continue, and what it has spent.
     @Published public private(set) var goal: [String: JSONValue] = [:]
+    /// The activity report: the one ordered story of what the org is doing, why it stopped, and what
+    /// is next. Read from the engine rather than assembled here, so the CLI and the app agree.
+    @Published public private(set) var activity: [String: JSONValue] = [:]
+    /// The org board: which agent has which work, what crossed between them, and what came back.
+    ///
+    /// Distinct from `activity` on purpose. The activity report is a *story* (what happened, in order);
+    /// this is a *board* (one row per unit of work, with its owner and its information flow). Both come
+    /// from the engine so the CLI and the app cannot disagree about either.
+    @Published public private(set) var flow: [String: JSONValue] = [:]
+    /// The effective default provider/model, and how autonomous a goal is by default.
+    ///
+    /// Read from the engine rather than derived here, because the engine resolves a declared default
+    /// against what is actually configured and reachable — a panel that re-implemented that would show
+    /// a different answer from the one the run uses.
+    @Published public private(set) var defaults: [String: JSONValue] = [:]
+    /// The mission: the standing purpose and the ordered objectives that serve it.
+    ///
+    /// The mission shows the *why* above the goal. It travels with status like the goal, so a panel
+    /// can show the active objective and progress from the poll it already makes.
+    @Published public private(set) var mission: [String: JSONValue] = [:]
+    /// The portfolio: the principal and every org they run.
+    ///
+    /// The register travels with status; the *live* picture (each org's mission, spend, blockers)
+    /// is a separate, more expensive fetch the Portfolio panel asks for when it is open.
+    @Published public private(set) var portfolio: [String: JSONValue] = [:]
+    /// The live cross-org picture, when the Portfolio panel has fetched it: rollup + fleet status.
+    @Published public private(set) var portfolioLive: [String: JSONValue] = [:]
+    /// Whether the live fetch is in flight, so the panel can say so rather than look stale.
+    @Published public private(set) var portfolioLoading: Bool = false
     /// What the self-improvement loop has proposed, and what it refused.
     ///
     /// Both halves are held: a list that showed only promotions would hide the safety boundary working,
@@ -161,7 +208,10 @@ public final class OrgController: ObservableObject {
     private var service: AgentProcessService?
     private var snapshotTimer: Timer?
     /// The App Nap exemption held while polling. See `startSnapshotting` for why it exists.
-    private var activity: (any NSObjectProtocol)?
+    ///
+    /// Named `napExemption` rather than `activity` because `activity` is the published activity
+    /// *report*; two things called the same thing in one type is how a confusing shadow gets added.
+    private var napExemption: (any NSObjectProtocol)?
 
     /// Everything the app needs to know about where things are.
     public struct OrgSettings: Sendable {
@@ -275,6 +325,9 @@ public final class OrgController: ObservableObject {
         // project — two processes writing one checkpoint. That is exactly the race the app's own
         // first-run `.task` creates when the engine is started from the menu at the same moment.
         guard !engineState.isLive else { return }
+        // A fresh launch clears the previous failure, so a fixed config does not leave a stale banner.
+        engineFailure = nil
+        engineError = nil
         logs.append(notice: "launching the engine…")
 
         // Check the paths *before* spawning anything. `Process.run()` fails with a message that names
@@ -299,13 +352,26 @@ public final class OrgController: ObservableObject {
 
         service.onStateChange = { [weak self] state in
             Task { @MainActor [weak self] in
-                self?.engineState = state
-                self?.engineError = service.lastError?.message
-                if state == .running {
-                    self?.logs.append(notice: "engine running (pid \(service.pid ?? 0))")
-                    self?.startSnapshotting()
-                } else if !state.isLive {
-                    self?.stopSnapshotting()
+                guard let self else { return }
+                self.engineState = state
+                self.engineError = service.lastError?.message
+                switch state {
+                case .running:
+                    // Only now is the engine *usable*: `.running` is set from the readiness frame
+                    // (`engine.ready`), not from the spawn. So this notice is a true statement, unlike
+                    // the old one that printed "engine running" for a process that had already died.
+                    self.logs.append(notice: "engine ready (pid \(service.pid ?? 0))")
+                    self.startSnapshotting()
+                case .failed:
+                    // A failure must be impossible to miss. It goes to the terminal *and* to `notice`,
+                    // which the status bar and every panel surface — the whole point, because the old
+                    // behaviour showed a healthy-looking engine that was doing nothing.
+                    let reason = service.lastError?.message ?? "the engine failed to start"
+                    self.logs.append(notice: "engine failed: \(reason)")
+                    self.engineFailure = reason
+                    self.stopSnapshotting()
+                default:
+                    if !state.isLive { self.stopSnapshotting() }
                 }
             }
         }
@@ -472,9 +538,216 @@ public final class OrgController: ObservableObject {
         await refresh()
     }
 
+    /// Turn the human gate on or off for the *current* goal, without changing the objective.
+    ///
+    /// Re-sets the goal with the same objective and the chosen autonomy. `goal_set` on an unchanged
+    /// objective with changed policy replaces the policy and keeps the history, so the escape hatch is
+    /// one click rather than "clear it and start again".
+    public func setGoalHumanGate(_ enabled: Bool) async {
+        let objective = goal["objective"]?.stringValue ?? ""
+        guard !objective.isEmpty else { return }
+        var payload: [String: JSONValue] = ["objective": .string(objective), "no_arm": .bool(true)]
+        if enabled {
+            payload["human_gate"] = .bool(true)
+        } else {
+            payload["auto_approve"] = .bool(true)
+            payload["auto_hire"] = .bool(true)
+        }
+        await send("goal_set", payload: payload)
+        await refresh()
+    }
+
     public func pauseGoal() async { await send("goal_pause"); await refresh() }
     public func resumeGoal() async { await send("goal_resume"); await refresh() }
     public func clearGoal() async { await send("goal_clear"); await refresh() }
+
+    // MARK: - The mission
+
+    /// State the standing purpose, with optional objectives.
+    public func setMission(_ statement: String, objectives: [String] = [], arm: Bool = false) async {
+        var payload: [String: JSONValue] = ["statement": .string(statement)]
+        if !objectives.isEmpty { payload["objectives"] = .array(objectives.map { .string($0) }) }
+        if arm { payload["arm"] = .bool(true) }
+        await send("mission_set", payload: payload)
+        await refresh()
+    }
+
+    public func addObjective(_ text: String) async {
+        await send("mission_add", payload: ["objective": .string(text)])
+        await refresh()
+    }
+
+    public func removeObjective(at index: Int) async {
+        await send("mission_remove", payload: ["index": .int(index)])
+        await refresh()
+    }
+
+    /// Hand the active (or named) objective to a goal, which is what begins real work.
+    public func startObjective(at index: Int? = nil, arm: Bool = true) async {
+        var payload: [String: JSONValue] = [:]
+        if let index { payload["index"] = .int(index) }
+        if !arm { payload["no_arm"] = .bool(true) }
+        await send("mission_start", payload: payload)
+        await refresh()
+    }
+
+    public func markObjective(_ index: Int, state: String, summary: String = "") async {
+        var payload: [String: JSONValue] = ["index": .int(index), "state": .string(state)]
+        if !summary.isEmpty { payload["summary"] = .string(summary) }
+        await send("mission_mark", payload: payload)
+        await refresh()
+    }
+
+    public func advanceMission(summary: String = "") async {
+        var payload: [String: JSONValue] = [:]
+        if !summary.isEmpty { payload["summary"] = .string(summary) }
+        await send("mission_advance", payload: payload)
+        await refresh()
+    }
+
+    public func armMission() async { await send("mission_arm"); await refresh() }
+    public func pauseMission() async { await send("mission_pause"); await refresh() }
+    public func clearMission() async { await send("mission_clear"); await refresh() }
+
+    // MARK: - The portfolio
+
+    /// Load the live cross-org picture: every org's mission, spend and blockers.
+    ///
+    /// A separate, deliberate fetch rather than part of every poll: it builds an orchestrator per org,
+    /// so doing it on the 2s cadence would read every roster continuously. The panel asks when it is
+    /// open, which is exactly when the cost is wanted.
+    public func loadPortfolioLive() async {
+        portfolioLoading = true
+        defer { portfolioLoading = false }
+        await fetch("portfolio_live") { [weak self] payload in
+            self?.portfolioLive = payload
+        }
+    }
+
+    /// Register an org from the console.
+    public func addOrg(name: String, path: String = "", charter: String = "",
+                       dailyBudgetUSD: Double = 0, active: Bool = false) async {
+        var payload: [String: JSONValue] = ["name": .string(name)]
+        if !path.isEmpty { payload["path"] = .string(path) }
+        if !charter.isEmpty { payload["charter"] = .string(charter) }
+        if dailyBudgetUSD > 0 { payload["daily_budget_usd"] = .double(dailyBudgetUSD) }
+        if active { payload["active"] = .bool(true) }
+        await send("portfolio_add", payload: payload)
+        await refresh()
+    }
+
+    public func removeOrg(_ ref: String) async {
+        await send("portfolio_remove", payload: ["org": .string(ref)])
+        await refresh()
+    }
+
+    /// Make one org the default the console acts on.
+    public func selectOrg(_ ref: String) async {
+        await send("portfolio_select", payload: ["org": .string(ref)])
+        await refresh()
+        await loadPortfolioLive()
+    }
+
+    /// Start work in one org, in parallel with any other org already running.
+    ///
+    /// This is the multi-org autonomy: the engine keeps a Fleet, so a run here does not block a run in
+    /// another org. The panel reloads the live picture so the new run appears.
+    public func runOrg(_ ref: String, goal: String = "") async {
+        var payload: [String: JSONValue] = ["org": .string(ref), "background": .bool(true)]
+        if !goal.isEmpty { payload["goal"] = .string(goal) }
+        await send("portfolio_run", payload: payload)
+        await loadPortfolioLive()
+    }
+
+    public func stopOrg(_ ref: String) async {
+        await send("portfolio_stop", payload: ["org": .string(ref)])
+        await loadPortfolioLive()
+    }
+
+    /// The registered orgs, as the console lists them (from the register, not the live picture).
+    public var portfolioOrgs: [[String: JSONValue]] {
+        (portfolio["orgs"]?.arrayValue ?? []).compactMap { $0.objectValue }
+    }
+
+    // MARK: - The org board and the defaults
+
+    /// The board's rows: one per unit of work, with its owner and its information flow.
+    public var flowRows: [[String: JSONValue]] {
+        (flow["rows"]?.arrayValue ?? []).compactMap { $0.objectValue }
+    }
+
+    /// The handoffs the board observed, in order.
+    public var flowHandoffs: [[String: JSONValue]] {
+        (flow["handoffs"]?.arrayValue ?? []).compactMap { $0.objectValue }
+    }
+
+    /// Ask the engine for the board now, rather than waiting for the next poll.
+    ///
+    /// The board travels with status, so this is only needed when a person opens the panel and wants it
+    /// immediately — the poll would populate it a moment later anyway.
+    public func refreshFlow() async {
+        await send("flow")
+        await refresh()
+    }
+
+    /// Set the default provider and/or model everyone uses unless told otherwise.
+    public func setDefaults(provider: String = "", model: String = "",
+                            reviewerModel: String = "", contextWindow: Int? = nil) async {
+        var payload: [String: JSONValue] = [:]
+        if !provider.isEmpty { payload["provider"] = .string(provider) }
+        if !model.isEmpty { payload["model"] = .string(model) }
+        if !reviewerModel.isEmpty { payload["reviewer_model"] = .string(reviewerModel) }
+        if let contextWindow { payload["context_window"] = .int(contextWindow) }
+        await send("defaults_set", payload: payload)
+        await refresh()
+    }
+
+    /// Set how autonomous a goal is by default. A `nil` switch is left untouched.
+    public func setAutonomy(autoPassGates: Bool?, autoHire: Bool?, persistHires: Bool?) async {
+        var payload: [String: JSONValue] = [:]
+        if let autoPassGates { payload["auto_pass_auto_gates"] = .bool(autoPassGates) }
+        if let autoHire { payload["auto_hire_missing"] = .bool(autoHire) }
+        if let persistHires { payload["persist_auto_hires"] = .bool(persistHires) }
+        await send("autonomy_set", payload: payload)
+        await refresh()
+    }
+
+    /// The effective default pair, as one readable string.
+    public var defaultPairLabel: String {
+        let provider = defaults["provider"]?.stringValue ?? ""
+        let model = defaults["model"]?.stringValue ?? ""
+        if provider.isEmpty && model.isEmpty { return "not set" }
+        return "\(provider)/\(model.isEmpty ? "(no model)" : model)"
+    }
+
+    /// The default autonomy, as one readable string.
+    public var defaultAutonomyLabel: String {
+        let autonomy = defaults["autonomy"]?.objectValue
+        let gates = (autonomy?["auto_pass_auto_gates"]?.boolValue ?? true) ? "auto" : "human"
+        let gaps = (autonomy?["auto_hire_missing"]?.boolValue ?? true) ? "auto" : "report"
+        let hires = (autonomy?["persist_auto_hires"]?.boolValue ?? false) ? "persist" : "ephemeral"
+        return "gates=\(gates) · gaps=\(gaps) · hires=\(hires)"
+    }
+
+    /// The live roll-up rows, when the panel has fetched them. Empty before that fetch.
+    public var portfolioRows: [[String: JSONValue]] {
+        let rollup = portfolioLive["rollup"]?.objectValue
+        return (rollup?["orgs"]?.arrayValue ?? []).compactMap { $0.objectValue }
+    }
+
+    /// The one row for an org id, live if fetched, else the register's own row.
+    public func orgRow(_ id: String) -> [String: JSONValue] {
+        if let live = portfolioRows.first(where: { $0["id"]?.stringValue == id }) { return live }
+        return portfolioOrgs.first(where: { $0["id"]?.stringValue == id }) ?? [:]
+    }
+
+    public var portfolioPrincipalName: String {
+        portfolio["principal"]?.objectValue?["name"]?.stringValue ?? ""
+    }
+
+    public var activeOrgId: String { portfolio["active_org_id"]?.stringValue ?? "" }
+
+    public var hasPortfolio: Bool { !portfolioOrgs.isEmpty }
 
     // MARK: - Providers
 
@@ -692,7 +965,20 @@ public final class OrgController: ObservableObject {
             // The goal, the attached workspace and the subagent tree all travel with status, so one
             // poll keeps every panel current rather than needing three commands the UI might forget.
             if let goal = payload["goal"]?.objectValue { self.goal = goal }
+            if let mission = payload["mission"]?.objectValue { self.mission = mission }
+            // The portfolio register travels with status, so the Portfolio panel lists the orgs
+            // without a second command on every poll.
+            if let portfolio = payload["portfolio"]?.objectValue { self.portfolio = portfolio }
             if let workspace = payload["workspace"]?.objectValue { self.workspace = workspace }
+            // The activity report travels with status, so the "what is happening" panel is current
+            // from the same poll every other panel uses.
+            if let activity = payload["activity"]?.objectValue { self.activity = activity }
+            // The org board travels the same way, so the Flow panel shows who is on what from the poll
+            // every other panel already makes.
+            if let flow = payload["flow"]?.objectValue { self.flow = flow }
+            // The effective default pair and the default autonomy travel too, so the Providers panel's
+            // Defaults editor is current without a second command it would have to remember.
+            if let defaults = payload["defaults"]?.objectValue { self.defaults = defaults }
             if let children = payload["subagents"]?.objectValue?["children"]?.arrayValue {
                 self.subagents = children.compactMap { $0.objectValue }
             }
@@ -771,8 +1057,8 @@ public final class OrgController: ObservableObject {
         // says the work matters to the user; `idleSystemSleepDisabled` keeps a run progressing while the
         // machine is idle; `suddenTerminationDisabled` means an automatic-termination pass cannot kill
         // the app mid-run. It is released when polling stops, so the app naps normally when idle.
-        if activity == nil {
-            activity = ProcessInfo.processInfo.beginActivity(
+        if napExemption == nil {
+            napExemption = ProcessInfo.processInfo.beginActivity(
                 options: [.userInitiated, .idleSystemSleepDisabled, .suddenTerminationDisabled],
                 reason: "AgentOrg is supervising a run")
             logs.append(notice: "background polling enabled (App Nap exempt while running)")
@@ -799,9 +1085,9 @@ public final class OrgController: ObservableObject {
         snapshotTimer?.invalidate()
         snapshotTimer = nil
         // Release the assertion, so an idle app is a good citizen and lets the system nap it.
-        if let activity {
-            ProcessInfo.processInfo.endActivity(activity)
-            self.activity = nil
+        if let napExemption {
+            ProcessInfo.processInfo.endActivity(napExemption)
+            self.napExemption = nil
         }
     }
 
@@ -812,6 +1098,22 @@ public final class OrgController: ObservableObject {
         logs.append(event)
 
         switch event.type {
+        case "engine.ready":
+            // The engine confirmed it is usable. Clearing any failure here is what makes a retry after a
+            // fix show as healthy rather than leaving the old banner up.
+            engineFailure = nil
+            engineError = nil
+        case "error":
+            // A fatal startup error is the reason the engine is about to die. Captured now, from the
+            // frame the engine writes to stdout for exactly this purpose — the app otherwise only ever
+            // saw "the engine exited with status 1".
+            if event.payload["fatal"]?.boolValue == true {
+                let reason = event.payload["message"]?.stringValue ?? "the engine reported a fatal error"
+                engineFailure = reason
+                notice = reason
+            } else {
+                notice = event.payload["message"]?.stringValue ?? "the engine reported an error"
+            }
         case "manifest.proposed":
             proposedGraph = event.payload
         case "manifest.approved":
@@ -877,6 +1179,14 @@ public final class OrgController: ObservableObject {
 
     /// Whether a fan-out is in flight right now.
     public var swarmRunning: Bool { swarmSummary["running"]?.boolValue == true }
+
+    /// The activity report's staffing gaps: capabilities the plan needs that nobody holds.
+    ///
+    /// Read from the activity report rather than re-derived, so the CLI and the app name the same
+    /// gaps with the same hire suggestions.
+    public var staffingGaps: [[String: JSONValue]] {
+        (activity["staffing_gaps"]?.arrayValue ?? []).compactMap { $0.objectValue }
+    }
 
     /// One row per fan-out item: its label, whether it finished, and where it went wrong.
     public var swarmItems: [[String: JSONValue]] {

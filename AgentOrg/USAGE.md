@@ -16,7 +16,9 @@ If you have not installed it yet, start with [README.md](README.md). If somethin
 - [Hiring: how an agent is defined](#hiring-how-an-agent-is-defined)
 - [Planning: goal to approved graph](#planning-goal-to-approved-graph)
 - [Executing a run](#executing-a-run)
-- [Reading a run](#reading-a-run)
+- [Attaching your own project](#attaching-your-own-project)
+- [Goals: keeping a run going](#goals-keeping-a-run-going)
+- [Isolated subagents](#isolated-subagents)- [Reading a run](#reading-a-run)
 - [Working with skills](#working-with-skills)
 - [Working with models](#working-with-models)
 - [Approving and intervening](#approving-and-intervening)
@@ -69,8 +71,12 @@ If it cannot find an interpreter it opens anyway and says why, rather than faili
 
 | Tab | What you do there |
 |---|---|
+| **Portfolio** | The orgs you run, side by side; run, stop or switch one |
 | **Org** | See the roster and its health; hire agents (they appear in `engine.cli agents` too) |
-| **Work** | Watch the run, resolve a gate, and see any swarm's per-item progress |
+| **People** | Who you can hire, and what each is bound to |
+| **Providers** | Endpoints and keys, and the **Defaults** editor: the model everyone runs on, and how autonomous a goal is |
+| **Flow** | *Who is working on what* — each unit of work, its owner, what crossed between agents and what came back |
+| **Work** | Watch the run, resolve a gate, see any swarm's per-item progress, and set the goal's autonomy |
 | **Cost** | Spend, cost-per-success, and the prompt-cache hit rate with what it saved |
 | **Context** | How full each agent's window is, and whether a rotation is due |
 | **Resources** | Machine pressure and the concurrency ceiling |
@@ -93,15 +99,23 @@ python3 -m engine.cli --config /path/credentials.json --json doctor
 | `skills show <name>` | *What will an agent bound to this be held to?* The contract, checklist, research gate |
 | `models` | *What can I bind?* Every model with its window and its provenance |
 | `models --refresh` | Re-probe providers, bypassing the cache |
+| `defaults` | *What model does everyone run on?* The effective default pair, why, and the default autonomy |
+| `defaults set --provider P --model M` | Set the default everyone runs on unless given something else |
+| `defaults autonomy --no-auto-gates` | How autonomous a new goal is: gates, gaps, durable hires |
 | `plan --goal "…"` | *What graph would this goal produce?* A validated manifest, shown not written |
 | `plan --goal "…" --out f.yaml` | The same, written as Safe YAML the library's runner can read |
 | `org` | *Who do I have?* The roster, teams, and the effective policy matrix |
 | `org --goal "…"` | *Can I run this?* The plan, the staffing gaps, and the bindings |
 | `delegation` | *What are the hiring rules?* The six invariants and the tier thresholds |
-| `run --goal "…"` | *Execute a goal.* Plans, binds, stops at a gate rather than proceeding past one |
+| `run --goal "…"` | *Execute a goal.* Plans, binds, and stops only at a gate a person must decide |
 | `run --manifest f.yaml` | Execute an existing graph instead of planning a new one |
 | `run --goal "…" --dry-run` | Plan and bind, but execute nothing |
 | `status --slug s` | *Where is it?* Phase, gate, gaps, instructions, cost and per-node outcomes |
+| `activity --project P` | *What is happening, why, and what next?* Headline, timeline, gaps, next step |
+| `flow --project P` | *Who is working on what?* The board: each unit of work, its owner, its handoffs and what came back |
+| `skills graph [--skill N] [--review A B C]` | *What depends on what?* The library's chain graph, and a plan coherence review |
+| `mission set/status/start/advance/mark` | The standing purpose above the goal: objectives worked one at a time |
+| `portfolio init/add/status/run/…` | The person and the several orgs they run; `--org` scopes any command to one org |
 | `decide --slug s --approve` | Resolve a gate: continue past it (`--reject --note "…"` parks instead) |
 | `instruct --slug s "…"` | Push guidance into a run (`--constraint` makes it survive every handoff) |
 | `chat` | *Talk to a model, or to the org.* A conversational loop; `/help` lists the commands |
@@ -239,6 +253,7 @@ python3 -m engine.cli plan --goal "Build a booking API with auth and payments"
 ```
 Goal: Build a booking API with auth and payments
 Workflow: build-a-booking-api-with-auth-and-payments  (validated: yes)
+Shape: software
 
 Sequence:
   pm  (skill: product-manager) -> [product-spec]
@@ -264,8 +279,12 @@ Four things to check in a plan:
    loop is a run that never finishes.
 3. **The gate is reachable** — a run must have somewhere to stop, and only you hold terminal
    authority.
-4. **The sequence matches the goal** — goal keywords add specialists (infra adds a devops engineer, a
-   macOS goal adds a macOS developer).
+4. **The shape matches the goal** — the planner classifies the goal and composes the right org. A
+   software goal keeps the build pipeline above; a strategy goal staffs the CEO, a business strategist
+   and an FP&A analyst; a go-to-market goal staffs marketing and growth; a research goal staffs a UX
+   researcher. A capability you *name* ("use the CEO skill and bring a market researcher") is added
+   outright. `Shape:` on the first line tells you which one was chosen, and any capability the roster
+   does not staff is listed at the bottom with the exact `hire` that closes it.
 
 Write it when you are happy:
 
@@ -318,6 +337,67 @@ python3 -m engine.cli instruct --slug booking --constraint "never log a full car
 text non-negotiable: the AR-04 machinery then preserves it verbatim across every later compaction and
 rotation for the rest of the run.
 
+## Running several orgs (the portfolio)
+
+The engine's unit is an **org**: a roster, a workspace, its own missions, goals and budget. A person
+runs several. That is the portfolio — one principal, many orgs — and it is the top of the hierarchy:
+
+```
+Principal (you)  →  Org (Tesla)   →  Mission → Goal → Run → Node
+                 →  Org (SpaceX)  →  Mission → Goal → Run → Node
+```
+
+```bash
+python3 -m engine.cli portfolio init "Sandeep"
+python3 -m engine.cli portfolio add Tesla --slug tesla --path ~/work/tesla --charter "EV & energy" \
+    --daily-budget-usd 50
+python3 -m engine.cli portfolio add SpaceX --slug spacex --path ~/work/spacex --charter "Launch"
+
+python3 -m engine.cli portfolio status            # the register: every org, and which is active
+python3 -m engine.cli portfolio status --live     # load every org: mission, spend, blockers
+python3 -m engine.cli portfolio use tesla         # the default org for bare commands
+```
+
+**`--org` scopes every existing command to one org.** It resolves the org's folder the same way
+`--project` does, so nothing else changes:
+
+```bash
+python3 -m engine.cli run --goal "add cursor pagination" --org tesla
+python3 -m engine.cli agents --org tesla
+python3 -m engine.cli mission status --org spacex
+python3 -m engine.cli activity --org tesla
+```
+
+**Run several orgs at once.** The engine keeps a *fleet*: one orchestrator per org, each on its own
+thread, bounded by two ceilings that exist because the orgs are now independent:
+
+- a **global concurrency ceiling** — the machine-derived number the scheduler uses, so N orgs cannot
+  collectively over-subscribe the machine;
+- a **per-org daily budget** — so one runaway org cannot consume the whole principal's allowance.
+
+```bash
+python3 -m engine.cli portfolio run spacex "close the launch checklist"   # runs while tesla also runs
+python3 -m engine.cli portfolio stop spacex
+```
+
+From a one-shot CLI the run is in the **foreground** by default — a background thread in a process
+about to exit would be killed with it. Real cross-org concurrency lives in the long-lived `serve`
+daemon the app launches, which holds the fleet and outlives its runs.
+
+**What is shared and what is not.** The *principal* is one identity across every org; the *agents* are
+per-org. Two orgs may both have a "Sana", and they are different people with different budgets,
+mailboxes and health — the shared-principal/independent-agents split. An org's identity (`id`) is
+stable across a rename, so renaming `Tesla` to `Tesla, Inc.` does not orphan its roster, missions or
+spend ledger.
+
+**The portfolio never spends.** It is a register. `portfolio run` starts work a *goal* authorises, and
+the goal is what arms. `portfolio remove` forgets an org from the register and leaves its folder and
+state untouched.
+
+In the app, the **Portfolio** panel (first in the sidebar) lists every org with its mission, spend and
+blockers, and offers **Run**, **Stop** and **Switch** per org. It badges the sidebar when any org has
+work waiting on you.
+
 ## Attaching your own project
 
 By default a run works in a *managed* project the engine owns, under
@@ -329,7 +409,12 @@ python3 -m engine.cli status --project ~/code/my-app
 ```
 
 `--project` is on every command that reaches the filesystem, and it makes `--slug` optional — the
-folder names the project itself. What changes:
+folder names the project itself. It also points *user content* at that folder: `hire`, `agents`,
+`plan`, `org`, `skills new`, `pool` and `fanout` all read and write `<folder>/.agentorg/`, so an
+agent you hired for one repository is used by that repository's runs. (Before this, `--project` was
+ignored for roster discovery — a CEO hired into a project was invisible to the runs in it.)
+
+What changes:
 
 | | Managed | Attached |
 |---|---|---|
@@ -359,6 +444,31 @@ python3 -m engine.cli goal resume --project ~/code/my-app     # grants a fresh b
 python3 -m engine.cli goal clear  --project ~/code/my-app
 ```
 
+### Missions: the *why* above the goal
+
+A goal answers "what is being worked on now". A **mission** answers "what is all this for, which step
+are we on, and what is next" — an ordered set of objectives worked **one at a time**, so a long-running
+org reads as one effort rather than a sequence of unrelated runs.
+
+```bash
+python3 -m engine.cli mission set "ship the MVP" \
+    --objective "get auth green" --objective "pagination" --objective "launch page" --project ~/code/my-app
+python3 -m engine.cli mission status --project ~/code/my-app     # objectives, progress, what is active
+python3 -m engine.cli mission start --index 0 --project ~/code/my-app   # hands objective #0 to a goal
+python3 -m engine.cli mission advance --summary "auth is green" --project ~/code/my-app
+python3 -m engine.cli mission mark 1 blocked --summary "needs a credential" --project ~/code/my-app
+```
+
+The rules that matter:
+
+- **A mission never spends.** Only a goal does, and only when armed. `mission start` sets the goal;
+  add `--no-arm` to record it without spending. Arming a mission (`mission arm`) marks it as being
+  worked but starts nothing.
+- **A mission advances itself.** When a goal's own verdict is `complete` or `blocked`, the objective
+  follows it and the mission moves on — no button required. Nothing else moves an objective.
+- **It is loaded disarmed.** A mission restored from disk is paused with reason `restored`, exactly
+  like a goal.
+
 Three things to know, because they are the whole safety argument:
 
 1. **A goal has no spend ceiling by default.** It continues until completion, a genuine blocker, a
@@ -374,8 +484,48 @@ Three things to know, because they are the whole safety argument:
    loop on its own. `goal resume` is the only thing that continues it.
 
 3. **Completion is the agent's call.** The agent reports it through `update_goal(complete|blocked)`;
-   no percentage or evaluator decides. A gate still parks the run — arming a goal authorises
-   *continuing past work finishing*, not *deciding a question you asked to decide*.
+   no percentage or evaluator decides.
+
+### Autonomy: a human is involved only if you choose one
+
+By default a goal is **autonomous**. Arming it is standing authorisation to:
+
+- **pass the gates the org can decide** — the bounded-reroute *agent* gate, and a policy route class
+  the config already answered. A **terminal** gate is *never* passed: a release, a close, or a spend
+  is always yours, whatever the setting says.
+- **create a person when a skill is missing.** A plan that needs a capability nobody holds gets a
+  helper on the default model, so it does not park three nodes in on a roster accident.
+
+You narrow it per goal, and the config sets the default a new goal inherits:
+
+```bash
+# A goal that decides its own gates and staffs its own gaps (the default):
+python3 -m engine.cli goal set "Harden the auth flow" --project ~/code/my-app
+
+# A goal that stops at *every* gate — you decide, the org does not:
+python3 -m engine.cli goal set "Ship the release" --human-gate --project ~/code/my-app
+
+# Narrow just one thing:
+python3 -m engine.cli goal set "…" --no-auto-hire --project ~/code/my-app
+
+# The config default, for every goal that does not say otherwise:
+python3 -m engine.cli defaults autonomy --no-auto-gates
+python3 -m engine.cli defaults autonomy --persist-hires
+```
+
+`goal status` reports what the active goal chose, so "why did it pass that gate" always has an answer:
+
+```
+  autonomy  : gates=auto  gaps=auto  hires=ephemeral
+```
+
+In the app, the **Work** panel shows the same line under the goal, with a one-click **Human gate on**
+switch — the escape hatch when you want to be involved from here on.
+
+**An auto-created person is ephemeral by default.** It does the work and leaves no roster entry to
+clean up. With `--persist-hires` (or `defaults autonomy --persist-hires`) it is written to the roster
+root, so it appears in `agents` and the Org panel like any other hire and is reused next run. Every
+helper is created on the **default provider and model** — see `defaults` below.
 
 ## Isolated subagents
 
@@ -464,30 +614,48 @@ stale snapshot.
 
 ## Reading a run
 
-A run writes everything under `projects/<slug>/.agent_state/`:
+A run writes everything under `.agent_state/` — in `projects/<slug>/` for a managed project, or in
+the folder you attached with `--project` for your own repository (so the state travels with the code
+it describes):
 
 ```
-projects/booking/
+projects/booking/            (or your attached folder)
 ├── docs/           prd.md · api_spec.md
 ├── src/            app.py
 └── .agent_state/
     ├── org.json                 the roster: names, skills, models, reporting lines
-    ├── run_state.json           the checkpoint a resume reads
+    ├── run_state.json           the checkpoint a resume reads (incl. why it stopped)
     ├── trace.jsonl              every event, in order
+    ├── goal.json                the durable objective, and whether the loop will continue
     ├── review_feedback.json     the latest rejection dossier
     ├── effects.jsonl            the idempotency journal (no side effect applied twice)
     ├── agents/<id>/mailbox.jsonl
+    ├── children/<run>/…         isolated subagent transcripts
     ├── sessions/…               archived session transcripts
     └── telemetry/spans.jsonl    OTel-shaped spans
 ```
+
+The fastest way to read the whole thing is one command:
+
+```bash
+python3 -m engine.cli activity --project ~/code/my-app
+```
+
+It prints the **headline** (what it is doing now, or why it stopped), the node counts and unstaffed
+capabilities, the **timeline** of what happened, and the single **next action** — the same report the
+app's **Activity** tab renders. `--json` gives the whole thing to a script, and `--limit N` bounds the
+timeline.
 
 **The three files to look at when something seems wrong:**
 
 | File | Tells you |
 |---|---|
 | `trace.jsonl` | What happened, in order — every event with its sequence number |
-| `run_state.json` | Where the run is: current node, iteration, budget spent, open questions |
+| `run_state.json` | Where the run is: current node, iteration, budget spent, open questions, and `stop_reason` — one plain line saying *why* it is where it is |
 | `review_feedback.json` | Why a review was rejected, with severities and file:line |
+
+A run that has stopped also says so in `run` and `status` output, which print `stopped :` and the
+per-node reason, so you rarely need to open the files by hand.
 
 `trace.jsonl` is NDJSON, so ordinary tools work on it:
 
@@ -542,6 +710,48 @@ python3 -m engine.cli models --refresh       # re-probe providers
 python3 -m engine.cli models --json          # for a tool
 ```
 
+### The default: the model everyone runs on
+
+Every agent — the built-in company, a hire you make, an auto-created helper — uses the **default
+provider and model** unless you bind it to something else. That default is resolved in *one* place, so
+"the default" means one thing everywhere rather than three:
+
+```bash
+python3 -m engine.cli defaults                     # what is in use, and why
+python3 -m engine.cli defaults set --provider Olla --model kimi-k2.7-code
+python3 -m engine.cli defaults set --provider ollama --model qwen2.5-coder:14b \
+        --context-window 32768                     # when the provider cannot report a window
+python3 -m engine.cli defaults set --reviewer-model glm-5.2   # keep reviewers independent
+```
+
+`defaults` prints the **effective** pair, not the file's literal contents — so a declared default that
+a removed provider invalidated resolves to something usable and *says why*:
+
+```
+default   : ollama/qwen2.5-coder:14b
+  why       : configured default
+  window    : 32768
+  usable    : Olla, ollama
+  autonomy  : gates=auto  gaps=auto  hires=ephemeral
+```
+
+Three rules make this safe:
+
+- **Merge, never replace.** `defaults set` changes only the keys you name. Your providers, windows and
+  policy survive — a person setting a default must never lose their keys.
+- **An unknown provider is refused, not written.** A default naming a provider that does not exist
+  would resolve to a fallback and silently not be what you chose, so it is refused with the real list.
+- **The window can be declared.** A model the provider never probed has no known window, and an agent
+  cannot bind to it — the commonest first-run failure. `--context-window` resolves it without a probe.
+
+`defaults autonomy` controls the *default authority* a new goal inherits (see
+[Autonomy](#autonomy-a-human-is-involved-only-if-you-choose-one)); `defaults set` controls the *model*.
+They are deliberately two commands, because changing which model your people run on should not
+silently change whether a run needs you.
+
+In the app, the **Providers** panel has a **Defaults** editor with the same fields and the same
+"in use / resolved because" line.
+
 Two behaviours worth knowing:
 
 - **A provider that is down still lists its configured models.** The app must open on a machine where
@@ -549,6 +759,43 @@ Two behaviours worth knowing:
   empty list.
 - **Each provider lists only models it can serve.** `gpt-4o` appears under OpenAI, not under
   Anthropic. Offering a model a provider cannot serve wastes your time and then fails at call time.
+
+## Seeing who is working on what
+
+`activity` is a *story* — what happened, in order. `flow` is a *board* — one row per unit of work,
+with its owner, its information flow and its progress. When several things are in flight at once, that
+is the question you actually have.
+
+```bash
+python3 -m engine.cli flow --project ~/code/my-app
+```
+
+```
+pm is stuck — contract violation: declared criteria not covered: c1, c2
+  run       : run_1789654842_console   phase: escalated
+  work      : 0 done, 0 working, 8 waiting, 1 stuck (0 gate(s))
+
+  node                 agent          status        in from        out to         verdict
+  !pm                  Priya          needs_review  —              —              contract-violation
+      ↳ contract violation: declared criteria not covered: c1, c2
+  ·architect           Arjun          pending       —              —              —
+  ·developer           Alice          pending       —              —              —
+  ·macos-developer     —              pending       —              —              —
+```
+
+Each row carries:
+
+- **the owner** — the agent bound to that node, resolved from the run context and the `node.bind`
+  diagnostics, so a resumed run still names who ran it. A blank owner is itself information: it is a
+  node nobody holds.
+- **what came in and what went out** — the handoff that brought the node its inputs, and the one it
+  produced for the next node. That is the "which agent handed what to whom" you asked for, derived
+  from the real handoff records rather than guessed from node names.
+- **progress and why it stopped** — the node's status, its verdict, and the runner's own words when it
+  is not done. Nothing is inferred.
+
+The same board is the app's **Flow** panel, fed from the same engine command, so the two cannot
+disagree.
 
 ## Approving and intervening
 

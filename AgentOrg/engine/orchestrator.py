@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -51,6 +52,7 @@ from .config import Config
 from .diagnostics import Diagnostics
 from .gateway import BudgetExceeded, Gateway
 from .goal import Goal, GoalState
+from .mission import Mission, MissionError, MissionState, ObjectiveState
 from .host import HostError, RunnerHost, RunOutcome, RunnerState
 from .idempotency import EffectJournal
 from .memory import MemoryEntry, MemoryStore, memory_entry_from_state
@@ -82,9 +84,100 @@ def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + f".{int(time.time() * 1000) % 1000:03d}Z"
 
 
+#: The runner's own log `action`s that mean "this stopped the run", mapped to a plain-English cause.
+#: A guardrail block and a contract violation are *decisions*, not crashes, so they are described as
+#: the decision rather than as a failure. Only the actions that name a specific, actionable cause are
+#: listed — an `escalate` entry is handled generically below with its own detail.
+_STOP_ACTIONS: dict[str, str] = {
+    "guardrail": "a hand-off payload was blocked by the edge guardrail",
+    "contract": "a node's completion contract was violated",
+    "error": "a node raised an error",
+}
+
+
+def _derive_stop_reason(state: dict[str, Any], outcome: Any,
+                        rendered: dict[str, Any]) -> str:
+    """One human-readable line explaining why a run stopped.
+
+    Derived from the runner's own record — its `log` actions and per-node verdicts — so the reason is
+    the runner's, not a guess. Priority is deliberate: a named cause (a guardrail block, an exhausted
+    loop) beats a generic outcome, because the cause is what a person can act on.
+
+    Empty string means "nothing to explain" — a run that completed cleanly has no stop reason.
+    """
+    log = state.get("log") or []
+    nodes = state.get("nodes") or {}
+    reason = str(state.get("outcome") or "") or str(rendered.get("outcome") or "")
+
+    # 1. A named blocking action in the log, most recent last, is the most specific cause.
+    for entry in reversed(log):
+        if not isinstance(entry, dict):
+            continue
+        action = str(entry.get("action") or "")
+        if action in ("guardrail", "contract", "error"):
+            node = entry.get("node") or "a node"
+            detail = str(entry.get("detail") or "").strip()
+            clause = _STOP_ACTIONS.get(action, action)
+            # A blocked node also owns a summary that states the reason in the agent's own words.
+            summary = ""
+            record = nodes.get(node) if isinstance(nodes, dict) else None
+            if isinstance(record, dict):
+                summary = str(record.get("summary") or "").strip()
+            tail = f" — {detail}" if detail else (f" — {summary}" if summary else "")
+            return f"{node}: {clause}{tail}"
+
+    # 2. Every node that ended blocked, with its own stated reason.
+    blocked = [
+        (name, rec) for name, rec in (nodes.items() if isinstance(nodes, dict) else [])
+        if isinstance(rec, dict) and str(rec.get("status")) == "blocked"
+    ]
+    if blocked:
+        name, rec = blocked[0]
+        verdict = str(rec.get("verdict") or "blocked")
+        detail = str(rec.get("summary") or "").strip()
+        suffix = f" — {detail}" if detail else ""
+        more = f" (and {len(blocked) - 1} more)" if len(blocked) > 1 else ""
+        return f"{name} is blocked ({verdict}){suffix}{more}"
+
+    # 3. An escalation with no blocked node — a loop exhausted, a budget hit, a cost ceiling.
+    if reason and reason not in ("complete", "None", ""):
+        loop_entry = next((e for e in reversed(log)
+                           if isinstance(e, dict) and e.get("action") == "escalate"), None)
+        detail = str((loop_entry or {}).get("detail") or "").strip() if loop_entry else ""
+        return f"run ended: {reason}" + (f" — {detail}" if detail else "")
+
+    if getattr(outcome, "killed", False):
+        return "the run was aborted"
+    error = str(getattr(outcome, "error", "") or "").strip()
+    if error:
+        return error
+    return ""
+
 
 class OrchestratorError(RuntimeError):
     """Raised when a run cannot proceed: an unusable plan, an unstaffed node, or a refused command."""
+
+
+#: Keys the **library runner's** checkpoint carries and the orchestrator's never does. `workflow` and
+#: `manifest_sha` are written by the runner's `save_state`; the orchestrator's `Run.as_dict` writes
+#: `run_id` and `run_phase_version` instead, so the two shapes are distinguishable without guessing.
+_RUNNER_CHECKPOINT_KEYS = ("workflow", "manifest_sha")
+
+
+def _is_runner_checkpoint(doc: dict[str, Any]) -> bool:
+    """Whether a document at `run_state.json` is the workflow runner's checkpoint, not ours.
+
+    Needed because both sides used to write this one file. A workspace that ran before they were
+    separated has only the runner's shape on disk, and treating it as our checkpoint crashed `status`
+    with a schema error that read like corruption. Detection is by the runner's own keys, and the
+    presence of our markers is checked first so a document that is genuinely ours — a newer schema the
+    registry must be allowed to refuse — is never mistaken for the runner's.
+    """
+    if not isinstance(doc, dict):
+        return False
+    if "run_id" in doc or "run_phase_version" in doc:
+        return False
+    return any(key in doc for key in _RUNNER_CHECKPOINT_KEYS)
 
 
 class RunPhase(str, Enum):
@@ -151,12 +244,21 @@ class Run:
     plan: Plan | None = None
     manifest_path: Path | None = None
     org: Org | None = None
+    #: Which org this run belongs to, and the principal who owns it. Denormalised from `org` so the
+    #: checkpoint, the trace and the console can name the org without walking the roster — which is
+    #: what makes a *fleet* of runs, one per org, legible in one place.
+    org_id: str = ""
+    principal_id: str = ""
     ledger: Ledger | None = None
     policy: PolicyResolver | None = None
     bindings: dict[str, Any] = field(default_factory=dict)
     staffing_gaps: list[dict[str, Any]] = field(default_factory=list)
     gate: GateRequest | None = None
     outcome: dict[str, Any] = field(default_factory=dict)
+    #: *Why* the run stopped, in one human-readable line. Derived from the runner's own log (a
+    #: guardrail block, a contract violation, an exhausted loop) rather than guessed — because a run
+    #: that died with `pm = blocked / guardrail-blocked` and no explanation is unusable.
+    stop_reason: str = ""
     # Owner input that must reach the nodes: instructions and non-negotiable constraints.
     instructions: list[str] = field(default_factory=list)
     constraints: list[str] = field(default_factory=list)
@@ -180,6 +282,7 @@ class Run:
             "run_phase_version": self.run_phase_version,
             "run_id": self.run_id, "slug": self.slug, "goal": self.goal,
             "phase": self.phase.value,
+            "org_id": self.org_id, "principal_id": self.principal_id,
             "manifest_path": str(self.manifest_path) if self.manifest_path else None,
             "plan": self.plan.as_dict() if self.plan else None,
             "bindings": {k: (v.as_dict() if hasattr(v, "as_dict") else v)
@@ -187,6 +290,7 @@ class Run:
             "staffing_gaps": self.staffing_gaps,
             "gate": self.gate.as_dict() if self.gate else None,
             "outcome": self.outcome,
+            "stop_reason": self.stop_reason,
             "instructions": list(self.instructions),
             "constraints": list(self.constraints),
             "pending_requisitions": self.pending_requisitions,
@@ -218,6 +322,9 @@ class Run:
             started_at=str(data.get("started_at") or _iso_now()),
             updated_at=str(data.get("updated_at") or _iso_now()),
         )
+        run.stop_reason = str(data.get("stop_reason") or "")
+        run.org_id = str(data.get("org_id") or "")
+        run.principal_id = str(data.get("principal_id") or "")
         gate = data.get("gate")
         if isinstance(gate, dict):
             run.gate = GateRequest(
@@ -253,15 +360,17 @@ class Orchestrator:
         self.bus = bus
         self.workspace.ensure()
         self.source = _skill_source(library, project=getattr(workspace, "root", None))
-        self.planner = Planner(self.source, config=config)
         self.diagnostics = diagnostics or Diagnostics(
             run_id="", state_dir=workspace.state_dir)
         self.registry: Registry = default_registry(dict(config.schemas or {}))
         self.org = org or default_company(
-            provider=config.defaults.get("provider", "ollama"),
-            model=config.defaults.get("model", "qwen2.5-coder:7b"),
+            provider=config.default_pair()[0] or "ollama",
+            model=config.default_pair()[1] or config.default_model_spec().model_id or "",
             context_window=self._default_window(),
         )
+        # The planner gets the roster so it can report which needed skills nobody holds — the gap is
+        # cheapest to fix before approval, when the Owner is looking at the graph.
+        self.planner = Planner(self.source, config=config, org=self.org)
         self.store = ArtifactStore(workspace_root=workspace.path)
         self.memory = MemoryStore(workspace.state_dir / "memory")
         self.telemetry = SpanExporter(path=workspace.spans_path, run_id="")
@@ -286,16 +395,44 @@ class Orchestrator:
         #: The active goal for this workspace, when one has been set. Loaded **disarmed** — see
         #: `goal.Goal.load` — so nothing continues until an explicit `goal_resume`.
         self._goal: Goal | None = Goal.load(workspace)
+        #: The durable *why* above the goal. Loaded disarmed for the same reason: a restart must not
+        #: resume a sequence of objectives nobody asked to continue.
+        try:
+            self._mission: Mission | None = Mission.load(workspace)
+        except MissionError as exc:  # noqa: BLE001 - a bad mission must not block a run
+            self.diagnostics.warning("mission.load.failed", message=str(exc))
+            self._mission = None
 
     # ── preparing a run ─────────────────────────────────────────────────────
 
+    def _run_workspace(self, slug: str) -> Workspace:
+        """Where a run's manifest and state live.
+
+        An **attached** workspace is the user's own folder, so a run against it must write *there* —
+        `run_state.json` beside the trace the orchestrator already writes into it. Rebuilding a managed
+        `root/<slug>` workspace instead is the split-brain this guards against: the run's state landed
+        in a sibling directory of the project while the trace landed inside it, so `status` (reading the
+        attached folder) saw no run at all and the app showed an idle project with work in flight.
+
+        A managed workspace keeps the old behaviour: the plan's own slug names a project under `root`.
+        """
+        if getattr(self.workspace, "is_attached", False):
+            return self.workspace
+        return Workspace.for_project(slug, root=self.workspace.root)
+
     def prepare(self, goal: str, *, slug: str | None = None,
-                max_iterations: int = 3) -> Run:
+                max_iterations: int = 3, auto_staff: bool | None = None,
+                honour_armed_goal: bool = False) -> Run:
         """Plan the goal, bind it to the roster, and present it for approval.
 
         Nothing executes here. The Owner approves a *graph*, and the graph is shown with its staffing
         gaps before it can be approved — because a plan needing a capability nobody holds would
         otherwise stop three nodes in, far from the cause.
+
+        `auto_staff` closes those gaps before binding when a goal authorises it: a node whose skill
+        nobody holds gets a helper on the default model, so the plan is runnable rather than blocked on
+        an administrative accident of the roster. `None` means "ask the goal's policy", which is the
+        autonomous default; `False` forces the gap to be reported instead.
 
         Raises
         ------
@@ -307,7 +444,14 @@ class Orchestrator:
         except PlanError as exc:
             raise OrchestratorError(f"cannot plan this goal: {exc}") from exc
 
-        project = Workspace.for_project(plan.slug, root=self.workspace.root)
+        # An explicit execution request may adopt an on-disk armed goal, so a `run` from a *new*
+        # process continues the loop the previous `goal set` armed. Without this the CLI could never
+        # drive a goal — every command is a new process, and each one disarmed the goal it read.
+        if honour_armed_goal and self._goal is not None:
+            self._goal.adopt()
+            self._goal.save(self.workspace)
+
+        project = self._run_workspace(plan.slug)
         project.ensure()
         manifest_path = project.path / f"{plan.slug}.yaml"
         manifest_path.write_text(emit_safe_yaml(plan.manifest), encoding="utf-8")
@@ -317,8 +461,18 @@ class Orchestrator:
             slug=plan.slug, goal=goal, workspace=project,
             phase=RunPhase.AWAITING_APPROVAL, plan=plan, manifest_path=manifest_path,
             org=self.org, ledger=self.ledger, policy=self.policy,
+            org_id=str(getattr(self.org, "id", "") or ""),
+            principal_id=str(getattr(self.org, "principal_id", "") or ""),
         )
-        run.staffing_gaps = self.binder.staffing_gaps(plan.manifest)
+        # Close the gaps first when the goal authorises it, then measure what is left — so the graph
+        # the Owner is shown is the graph that will actually run.
+        staffing = self._auto_staff(plan, enabled=auto_staff, run=run)
+        run.staffing_gaps = staffing["gaps"]
+        if staffing["created"]:
+            run.decisions.append({
+                "action": "auto-staff", "by": "goal", "at": _iso_now(),
+                "detail": [f"{c['skill']} -> {c['agent']}" for c in staffing["created"]],
+            })
         try:
             run.bindings = self.binder.plan_bindings(plan.manifest, skip_unstaffed=True)
         except Exception as exc:  # noqa: BLE001 - a binding failure is reported, not fatal
@@ -334,10 +488,199 @@ class Orchestrator:
                       for l in plan.loops],
             "gates": [g.get("id") for g in plan.gates],
             "staffing_gaps": run.staffing_gaps,
+            "auto_staffed": staffing["created"],
         })
         self.diagnostics.info("run.prepared", message=f"plan ready for approval: {run.slug}",
-                              detail={"nodes": len(plan.nodes), "gaps": len(run.staffing_gaps)})
+                              detail={"nodes": len(plan.nodes), "gaps": len(run.staffing_gaps),
+                                      "auto_staffed": len(staffing["created"])})
         return run
+
+    def _auto_staff(self, plan: Any, *, enabled: bool | None, run: Run) -> dict[str, Any]:
+        """Fill a plan's staffing gaps with helpers on the default model, when authorised.
+
+        This is the "if the person does not exist, create one" half. The gap is computed against the
+        real roster first, so an existing holder is always preferred — a helper is only ever created
+        for a capability *nobody* has. Creation happens in the org the run will actually use, so the
+        very next bind sees the helper.
+
+        Two decisions, both from the goal's policy:
+
+        - **ephemeral or durable.** By default the helper is ephemeral: it does the work and leaves no
+          roster entry to clean up. With `persist_hires` it is saved to the roster root, so the
+          capability is reusable and visible in `agents`.
+        - **how risky a hire.** `auto_hire_max_tier` (config) caps the delegation tier. Every node in a
+          plan is *work*, not a privileged operation, so the default tier is the safest one — a helper
+          that reads and writes inside the project. Anything above it is left for the Owner.
+        """
+        from .org.agent import AgentKind, AgentLevel, AgentSpec, Budget, new_agent_id
+        from .skills.roles import is_verifier
+
+        created: list[dict[str, Any]] = []
+        gaps = self.binder.staffing_gaps(plan.manifest)
+        if enabled is not None:
+            # An explicit override beats both the goal and the config — that is what makes
+            # `--no-auto-hire` on a single run meaningful.
+            allow = bool(enabled)
+            persist = bool(getattr(self.config.goal, "persist_auto_hires", False))
+        else:
+            # Otherwise the *goal's* policy decides when a goal exists, and the configured default
+            # applies when it does not — so a plain `run --goal` staffs its own gaps too, which is
+            # exactly "create the person if they do not exist".
+            policy = self._effective_goal_policy()
+            if policy is not None:
+                allow = bool(policy.auto_hire)
+                persist = bool(policy.persist_hires)
+            else:
+                allow = bool(getattr(self.config.goal, "auto_hire_missing", True))
+                persist = bool(getattr(self.config.goal, "persist_auto_hires", False))
+        if not allow or not gaps:
+            return {"gaps": gaps, "created": created}
+
+        provider, model, reason = self.config.default_pair()
+        # Resolve the window the same way a *hire* does — catalog first, declared table second — so a
+        # default on a model the provider reports (but the config never declared) can still be staffed.
+        # Using only the declared table refused exactly that case in a real run, leaving the gap
+        # unfilled and the plan unrunnable.
+        window, max_output = self._auto_staff_window(provider, model)
+        if not provider or not model or not window:
+            # Nothing to create an agent *on*. The gap is reported with the reason rather than
+            # silently producing a helper that cannot be projected or called.
+            self.diagnostics.warning(
+                "goal.autostaff.unavailable",
+                message="cannot staff the gap: no default provider/model with a known context window",
+                detail={"provider": provider, "model": model, "context_window": window})
+            return {"gaps": gaps, "created": created}
+
+        for gap in gaps:
+            skill = str(gap.get("skill") or "")
+            if not skill:
+                continue
+            name = self._helper_name(skill)
+            helper = AgentSpec(
+                id=new_agent_id(),
+                name=name,
+                title=gap.get("node_id", skill).replace("-", " ").title(),
+                skills=[skill],
+                provider=provider,
+                model=model,
+                context_window=int(window),
+                max_output=max_output,
+                kind=AgentKind.AI,
+                role="reviewer" if is_verifier(skill) else "worker",
+                level=AgentLevel.SENIOR,
+                team="Platform",
+                capabilities=["read:*", "write:src/**"],
+                budget=Budget(),
+                max_concurrency=1,
+                # `goal` origin, not `owner`: this employee was created by the engine on the goal's
+                # authority, and the roster and audit trail must be able to tell the difference.
+                origin="goal" if persist else "ephemeral",
+            )
+            try:
+                self.org.hire(helper, team=helper.team)
+            except Exception as exc:  # noqa: BLE001 - a hire failure must not break the plan
+                self.diagnostics.warning("goal.autostaff.failed",
+                                         message=f"could not staff {skill}: {exc}")
+                continue
+            created.append({"skill": skill, "node_id": gap.get("node_id"), "agent": helper.name,
+                            "agent_id": helper.id, "provider": provider, "model": model,
+                            "persisted": persist, "reason": reason})
+            self._emit(EventType.AGENT_SPAWN, {
+                "run_id": run.run_id, "agent_id": helper.id, "name": helper.name,
+                "skills": [skill], "provider": provider, "model": model,
+                "kind": "helper", "origin": helper.origin, "persisted": persist,
+                "why": "the plan needed a capability no agent held"})
+            self.diagnostics.info("goal.autostaff",
+                                  message=f"staffed {skill} with {helper.name}",
+                                  detail={"provider": provider, "model": model,
+                                          "persisted": persist})
+
+        if persist and created:
+            self._persist_helpers(created)
+        # Re-measure, so the graph shown to the Owner reflects the helpers just created.
+        return {"gaps": self.binder.staffing_gaps(plan.manifest), "created": created}
+
+    def _auto_staff_window(self, provider: str, model: str) -> tuple[int | None, int | None]:
+        """The context window (and max output) for an auto-created helper.
+
+        Resolved exactly as a *hire* resolves it — the live catalog first, the declared table second —
+        because a default provider the engine probed (`Olla`) reports models the config never declared,
+        and reading only the declared table then refused to staff a perfectly usable model. A config
+        override still wins, since it is the person's explicit statement about a window the provider
+        cannot report.
+        """
+        if not provider or not model:
+            return None, None
+        # An explicit `defaults.context_window` beats everything: it exists for the model the provider
+        # cannot report, which is the commonest first-run failure.
+        spec = self.config.default_model_spec()
+        if spec.context_window and spec.model_id == model:
+            return int(spec.context_window), spec.max_output
+        try:
+            from .catalog import ModelCatalog
+            from .providers.registry import build_providers
+
+            providers, _ = build_providers(self.config)
+            entry = ModelCatalog(self.config, providers).resolve(provider, model)
+            if entry is not None and entry.window_known:
+                return int(entry.context_window), entry.max_output
+        except Exception as exc:  # noqa: BLE001 - a catalog failure falls through to the table
+            self.diagnostics.warning("goal.autostaff.catalog.failed", message=str(exc))
+        return None, None
+
+    def _helper_name(self, skill: str) -> str:
+        """A readable, unique name for an auto-created helper.
+
+        Derived from the skill so the roster reads as *what it does*, and suffixed only when a clash
+        would otherwise make two helpers indistinguishable — the roster refuses a duplicate name, and a
+        refusal here would leave the gap unfilled.
+        """
+        base = "".join(part[:1].upper() + part[1:] for part in skill.split("-")) or "Helper"
+        candidate, index = base, 2
+        taken = {a.name.lower() for a in self.org.agents.values()}
+        while candidate.lower() in taken:
+            candidate = f"{base}{index}"
+            index += 1
+        return candidate
+
+    def _persist_helpers(self, created: list[dict[str, Any]]) -> None:
+        """Write the durable helpers to the roster root, best-effort.
+
+        A failure to persist must not undo a hire that is already usable in this run: the helper still
+        does the work, and the person is told it will not be there next time.
+        """
+        try:
+            from .people import People
+
+            people = People(library=self.library, config=self.config)
+            people.save(org=self.org, roster_root=self._roster_root())
+            self.diagnostics.info("goal.autostaff.persisted",
+                                  message=f"persisted {len(created)} helper(s) to the roster")
+        except Exception as exc:  # noqa: BLE001 - persistence is a nicety, not the work
+            self.diagnostics.warning("goal.autostaff.persist.failed", message=str(exc))
+
+    def _roster_root(self) -> Path | None:
+        """Where a durable helper is written: the **project's** `.agentorg`.
+
+        The project directory, not `workspace.root`. For an attached workspace `root` is the project's
+        *parent* (`Workspace.attach` sets `root=resolved.parent`), so writing to `root/.agentorg` put
+        the roster beside the repository rather than in it — a real run wrote five helpers to
+        `/tmp/.agentorg`, where nothing would ever read them again. `workspace.path` is the project
+        directory in both modes.
+        """
+        project = getattr(self.workspace, "path", None)
+        if project:
+            return Path(project) / ".agentorg"
+        root = getattr(self.workspace, "root", None)
+        return Path(root) / ".agentorg" if root else None
+
+    def _effective_goal_policy(self) -> Any:
+        """The active goal's policy with `human_gate` applied, or None when there is no goal."""
+        goal = self._goal
+        if goal is None:
+            return None
+        return goal.policy.effective()
+
 
     def approve(self, run: Run | None = None) -> Run:
         """Approve the graph and mark the run ready to execute.
@@ -405,7 +748,7 @@ class Orchestrator:
             )
 
         project_slug = slug or source.stem
-        project = Workspace.for_project(project_slug, root=self.workspace.root)
+        project = self._run_workspace(project_slug)
         project.ensure()
         target = project.path / f"{project_slug}.yaml"
 
@@ -423,6 +766,8 @@ class Orchestrator:
             slug=project_slug, goal=goal or f"adopted manifest {source.name}",
             workspace=project, phase=RunPhase.AWAITING_APPROVAL,
             manifest_path=target, org=self.org, ledger=self.ledger, policy=self.policy,
+            org_id=str(getattr(self.org, "id", "") or ""),
+            principal_id=str(getattr(self.org, "principal_id", "") or ""),
         )
         run.staffing_gaps = self.binder.staffing_gaps(manifest)
         try:
@@ -524,6 +869,14 @@ class Orchestrator:
                 self._host = None
 
         self._settle(run, outcome)
+        # Reconcile the mission with the goal's verdict, so a mission whose step finished advances
+        # on its own — the autonomy the hierarchy exists for. Conservative: only a goal's own
+        # explicit complete/blocked moves an objective. Tolerated if it fails: a mission problem
+        # must never turn a finished run into an error.
+        try:
+            self.mission_sync()
+        except Exception as exc:  # noqa: BLE001
+            self.diagnostics.warning("mission.sync.failed", message=str(exc))
         return outcome
 
     def _run_with_goal(self, run: Run, *, extra: list[str]) -> RunOutcome:
@@ -547,6 +900,7 @@ class Orchestrator:
         if goal is None or not goal.state.is_live:
             return outcome
 
+        policy = goal.policy.effective()
         max_rounds = self._goal_max_rounds()
         for round_index in range(1, max_rounds + 1):
             # Fold what this round cost, so "no ceiling" never means "no idea".
@@ -569,14 +923,17 @@ class Orchestrator:
                                                         "spend": goal.spend.as_dict()})
                 return outcome
 
-            # A gate still holds. Continuing past work finishing is the point; deciding for the Owner
-            # is not, so a Goal parks here exactly as an ordinary run does.
+            # A gate still holds. With autonomy on (the default) the org decides the gates it *can*
+            # decide and keeps going; a terminal gate — release, close, spend — is never passed, and a
+            # goal that chose a human gate parks here exactly as an ordinary run does.
             if run.gate is not None or run.phase in (RunPhase.AWAITING_GATE, RunPhase.AWAITING_HUMAN):
-                goal.pause(reason="gate")
-                goal.save(run.workspace)
-                self._emit(EventType.GOAL_PAUSED, {"objective": goal.objective, "reason": "gate",
-                                                   "spend": goal.spend.as_dict()})
-                return outcome
+                if not self._auto_pass(run, policy):
+                    goal.pause(reason="gate")
+                    goal.save(run.workspace)
+                    self._emit(EventType.GOAL_PAUSED, {"objective": goal.objective, "reason": "gate",
+                                                       "spend": goal.spend.as_dict()})
+                    return outcome
+                # The gate was passed and the run is ready again: fall through to the next round.
 
             if goal.budget_reached():
                 goal.pause(reason="budget_spend")
@@ -591,12 +948,115 @@ class Orchestrator:
 
             goal.save(run.workspace)
             self._emit(EventType.GOAL_PROGRESS, {"objective": goal.objective, "round": round_index,
-                                                 "spend": goal.spend.as_dict()})
+                                                 "spend": goal.spend.as_dict(),
+                                                 "autonomous": not policy.human_gate})
             outcome = self._host.resume_run(
                 manifest_path=run.manifest_path, run_id=run.run_id, workflow=run.slug,
                 project=run.slug, goal_active=True)
             self._settle(run, outcome)
         return outcome
+
+    def _auto_pass(self, run: Run, policy: Any) -> bool:
+        """Decide and pass an auto-approvable gate, so the loop can continue.
+
+        Returns False when the Owner must decide — a terminal gate, or a goal that asked for a human
+        gate. Returns True once the gate has been resolved (approved) and the run is ready to advance.
+
+        Two refusals make this safe rather than a rubber stamp:
+
+        - **A terminal gate is never passed.** The manifest marks it `kind: human`; that is the release,
+          close and spend authority, and autonomy does not extend to it.
+        - **An agent gate is answered by the org.** The reroute gate is `kind: agent`: the runner already
+          computed which channels were tried and which channel should lead the next pass, so approving
+          it is *recording a decision the org made*, not inventing one. When the runner offers no
+          channel (`requires` empty, dossier has no route), the gate is left for the Owner rather than
+          approved blind — an approval with nothing to act on would loop.
+        """
+        gate = run.gate
+        if gate is None:
+            # An AWAITING_* phase with no gate object: nothing to decide, so do not loop on it.
+            return False
+        if policy.human_gate or not policy.auto_approve:
+            return False
+        if not self._gate_is_auto_approvable(gate):
+            self._emit(EventType.HUMAN_GATE, {
+                "run_id": run.run_id, "gate_id": gate.gate_id, "kind": gate.kind,
+                "reason": gate.reason, "waiting_on": "owner",
+                "why": "a terminal gate is only passable by the Owner"})
+            return False
+        if gate.kind == "agent" and not self._gate_has_a_route(run, gate):
+            self._emit(EventType.HUMAN_GATE, {
+                "run_id": run.run_id, "gate_id": gate.gate_id, "kind": gate.kind,
+                "reason": gate.reason, "waiting_on": "owner",
+                "why": "the org gate found no untried route, so there is nothing to approve"})
+            return False
+        try:
+            self.decide(True, run=run, note="auto-approved by the goal policy",
+                        by="goal")
+        except OrchestratorError:
+            return False
+        self._emit(EventType.POLICY_CHANGED, {
+            "run_id": run.run_id, "gate_id": gate.gate_id, "approved": True,
+            "by": "goal", "kind": gate.kind,
+            "why": "the goal authorises the org to decide this gate"})
+        self.diagnostics.info("goal.autopass",
+                              message=f"auto-approved {gate.gate_id} ({gate.kind})")
+        return True
+
+    def _gate_is_auto_approvable(self, gate: GateRequest) -> bool:
+        """Whether the org, rather than the Owner, may decide this gate.
+
+        Three cases, and each is a *refusal* first:
+
+        - `kind: human` is terminal authority (release, close, spend) and is never auto-approved.
+        - `kind: agent` is a bounded reroute — the runner already computed the decision, so the goal
+          only records it.
+        - `kind: policy` is a route class the *config* already answered, so it is passed only when the
+          policy matrix actually permits action for that class. This is what keeps the documented
+          `R-ESCALATE` safety floor intact: an escalation is `confirm` by default, and a goal does not
+          get to overrule the config's own answer — `policy.allow_autonomous_escalation` is the one
+          explicit opt-in, exactly as before.
+        - An unknown kind defaults to *not* auto-approvable, the safe polarity for a gate type this
+          build does not understand.
+        """
+        kind = str(gate.kind or "").strip().lower()
+        if kind == "agent":
+            return True
+        if kind == "policy":
+            return self._policy_permits_escalation()
+        return False
+
+    def _policy_permits_escalation(self) -> bool:
+        """Whether the policy matrix lets the org proceed on an escalation without asking.
+
+        Read from the resolver rather than re-implemented, so the goal's autonomy and the router's
+        answer cannot disagree: `R-ESCALATE` is `confirm` until `allow_autonomous_escalation` is set,
+        and that floor is the whole reason it exists.
+        """
+        resolver = getattr(self, "policy", None)
+        if resolver is None:
+            return False
+        try:
+            return bool(resolver.may_act(RouteClass.ESCALATE))
+        except Exception:  # noqa: BLE001 - an unresolvable policy means "do not auto-pass"
+            return False
+
+    def _gate_has_a_route(self, run: Run, gate: GateRequest) -> bool:
+        """Whether an agent gate actually carries a decision to record.
+
+        The runner's reroute gate puts the untried channels in `dossier`/`requires`. Nothing to route
+        to means an approval would advance the graph with no corrective action — the definition of an
+        infinite loop — so the gate is left to the Owner instead.
+        """
+        dossier = gate.dossier if isinstance(gate.dossier, dict) else {}
+        if gate.requires:
+            return True
+        for key in ("route", "channel", "channels", "untried", "next"):
+            value = dossier.get(key)
+            if value:
+                return True
+        return False
+
 
     def _round_spend(self, run: Run) -> tuple[int, int, float]:
         """The tokens, requests and cost this round's ledger recorded.
@@ -645,27 +1105,60 @@ class Orchestrator:
                     "summary": "", "blocked_reason": "", "slice": {}, "spend": {}, "history": []}
         return self._goal.public()
 
-    def goal_set(self, objective: str, *, armed: bool = True, by: str = "cli") -> Goal:
+    def goal_set(self, objective: str, *, armed: bool = True, by: str = "cli",
+                 policy: Any = None) -> Goal:
         """Set the objective, and optionally arm it immediately.
 
         Arming is the deliberate act that begins spending, so `goal set` on an already-open objective
         replaces it only when asked — otherwise an in-flight objective would be silently overwritten.
+
+        `policy` is the goal's autonomy: whether it may pass gates and staff its own gaps. Omitting it
+        uses the configured default (autonomous), so the common case needs no argument; passing
+        `GoalPolicy(human_gate=True)` is the "I want to be involved" choice, stated per goal.
         """
+        from .goal import GoalPolicy
+
+        if policy is None:
+            policy = self._default_goal_policy()
+        elif isinstance(policy, dict):
+            policy = GoalPolicy.from_dict(policy)
+
         existing = self._goal
-        if existing is not None and existing.state.is_open and existing.objective == objective.strip():
+        if (existing is not None and existing.state.is_open
+                and existing.objective == objective.strip()
+                and existing.policy.as_dict() == policy.as_dict()):
             goal = existing
         else:
             budget = getattr(getattr(self.config, "goal", None), "token_budget", 0)
-            goal = Goal.new(objective, token_budget=int(budget or 0))
+            goal = Goal.new(objective, token_budget=int(budget or 0), policy=policy)
             if existing is not None:
                 goal.history = list(existing.history)[-20:]
         self._goal = goal
         if armed:
             goal.arm(by=by)
             self._emit(EventType.GOAL_ARMED, {"objective": goal.objective, "by": by,
-                                              "token_budget": goal.token_budget})
+                                              "token_budget": goal.token_budget,
+                                              "policy": goal.policy.as_dict()})
         goal.save(self.workspace)
         return goal
+
+    def _default_goal_policy(self) -> Any:
+        """The autonomy a new goal gets from configuration, in one place.
+
+        `goal.auto_pass_auto_gates` and `goal.auto_hire_missing` are the two config switches; a goal
+        inherits them at creation and may then overrule them per objective. Inheriting rather than
+        consulting the config live is deliberate: a goal's authority should not change under it because
+        someone edited credentials.json mid-run.
+        """
+        from .goal import GoalPolicy
+
+        cfg = getattr(self.config, "goal", None)
+        return GoalPolicy(
+            auto_approve=bool(getattr(cfg, "auto_pass_auto_gates", True)),
+            auto_hire=bool(getattr(cfg, "auto_hire_missing", True)),
+            persist_hires=bool(getattr(cfg, "persist_auto_hires", False)),
+            human_gate=False,
+        )
 
     def goal_pause(self) -> Goal:
         """Stop the loop, keeping the objective."""
@@ -702,6 +1195,172 @@ class Orchestrator:
         if self._goal is None:
             raise OrchestratorError("no goal is set for this workspace; use `goal set` first")
         return self._goal
+
+    # ── the mission API ─────────────────────────────────────────────────────
+    #
+    # A Mission is the *why* above the Goal. It owns an ordered list of objectives and activates one
+    # at a time; it deliberately does not plan, route or spend (see `mission.py`). The orchestrator's
+    # job here is only to load it, persist it, and connect one action — `mission start` — to the
+    # existing goal machinery, so "work this objective" is a goal whose objective is that step.
+
+    def mission(self) -> Mission | None:
+        """The active mission, or None when this workspace has none."""
+        return self._mission
+
+    def mission_status(self) -> dict[str, Any]:
+        """The mission picture for the console and the CLI, in one call."""
+        if self._mission is None:
+            return {"statement": "", "state": MissionState.EMPTY.value, "live": False,
+                    "armed": False, "pause_reason": "", "counts": {"total": 0},
+                    "progress": {"done": 0, "total": 0, "fraction": 0.0, "next": ""},
+                    "now": None, "objectives": [], "history": []}
+        return self._mission.public()
+
+    def mission_set(self, statement: str, *, objectives: Iterable[str] = (),
+                    armed: bool = False, by: str = "cli") -> Mission:
+        """Create the mission, replacing an empty/cleared one.
+
+        Refuses to clobber a mission that is still open unless it is finished — replacing a live
+        mission would silently drop objectives someone is working.
+        """
+        existing = self._mission
+        if existing is not None and existing.statement and not existing.state().terminal:
+            if existing.statement.strip() != statement.strip():
+                raise MissionError(
+                    "this workspace already has an open mission; `mission clear` it first, or "
+                    "add objectives to the existing one"
+                )
+            mission = existing
+        else:
+            mission = Mission.new(statement)
+            if existing is not None:
+                mission.history = list(existing.history)[-20:]
+        for text in objectives:
+            try:
+                mission.add_objective(str(text))
+            except MissionError:
+                continue  # a duplicate objective in the initial list is not worth refusing the set
+        if armed and mission.objectives:
+            mission.arm(by=by)
+        self._mission = mission
+        mission.save(self.workspace)
+        self._emit(EventType.AGENT_LOG, {
+            "stream": "stdout", "text": f"mission set: {mission.statement[:120]}"})
+        return mission
+
+    def mission_add(self, text: str, *, at: int | None = None) -> Mission:
+        mission = self._require_mission()
+        mission.add_objective(text, at=at)
+        mission.save(self.workspace)
+        return mission
+
+    def mission_remove(self, index: int) -> Mission:
+        mission = self._require_mission()
+        mission.remove_objective(index)
+        mission.save(self.workspace)
+        return mission
+
+    def mission_arm(self, *, by: str = "cli") -> Mission:
+        mission = self._require_mission()
+        mission.arm(by=by)
+        mission.save(self.workspace)
+        self._emit(EventType.AGENT_LOG, {
+            "stream": "stdout",
+            "text": f"mission armed: {mission.statement[:120]}"})
+        return mission
+
+    def mission_pause(self, *, reason: str = "manual") -> Mission:
+        mission = self._require_mission()
+        mission.pause(reason=reason)
+        mission.save(self.workspace)
+        return mission
+
+    def mission_advance(self, *, summary: str = "") -> Mission:
+        """Finish the active objective, activate the next, and return the mission.
+
+        This does not start work — it moves the cursor. Use `mission start` to hand the active
+        objective to a goal.
+        """
+        mission = self._require_mission()
+        mission.advance(summary=summary)
+        mission.save(self.workspace)
+        return mission
+
+    def mission_mark(self, index: int, state: ObjectiveState | str, *,
+                     summary: str = "", run_id: str = "", goal_id: str = "") -> Mission:
+        mission = self._require_mission()
+        mission.mark(index, state, summary=summary, run_id=run_id, goal_id=goal_id)
+        mission.save(self.workspace)
+        return mission
+
+    def mission_clear(self) -> Mission:
+        mission = self._require_mission()
+        mission.clear()
+        mission.save(self.workspace)
+        return mission
+
+    def mission_start(self, index: int | None = None, *, armed: bool = True,
+                      by: str = "cli") -> dict[str, Any]:
+        """Hand the active (or named) objective to a Goal, so the mission does real work.
+
+        This is the one place the mission and the goal machinery meet, and the join is deliberately
+        thin: it activates the objective, then sets a goal whose objective *is* that step's text. The
+        mission does not arm anything itself — the caller's ``armed`` decides, exactly as `goal set`
+        does — so the spend decision stays in one place.
+        """
+        mission = self._require_mission()
+        if index is not None:
+            mission.activate(index)
+        objective = mission.objective_now() or mission.activate()
+        if objective is None:
+            raise MissionError(
+                "this mission has no pending objective to start; add one, or `mission advance`")
+        active_index = mission.active_index() or 0
+        # Set the goal first, so its text can be recorded on the objective as the linkage from the
+        # step to the goal (and, through the run, to the artifacts).
+        goal = self.goal_set(objective.text, armed=armed, by=by)
+        mission.mark(active_index, ObjectiveState.ACTIVE,
+                     goal_id=str(getattr(goal, "objective", "") or objective.text))
+        mission.save(self.workspace)
+        return {"mission": mission.public(), "goal": self.goal_status(),
+                "objective": objective.as_dict()}
+
+    def mission_sync(self) -> Mission | None:
+        """Reconcile the active objective with the goal's own verdict, when a goal has one.
+
+        Called after a run settles: if the active objective's goal reported complete or blocked, the
+        objective follows it, and the mission advances. This is what makes a mission progress *without*
+        a person clicking through — the autonomy the hierarchy is for. It is conservative: only a
+        goal's own explicit verdict moves an objective, never a heuristic.
+        """
+        mission = self._mission
+        goal = self._goal
+        if mission is None or goal is None:
+            return mission
+        index = mission.active_index()
+        if index is None:
+            return mission
+        objective = mission.objectives[index]
+        if goal.state is GoalState.COMPLETED and objective.state is ObjectiveState.ACTIVE:
+            mission.mark(index, ObjectiveState.DONE, summary=goal.summary or "goal reported complete")
+            mission.advance()
+            mission.save(self.workspace)
+            self._emit(EventType.AGENT_LOG, {
+                "stream": "stdout",
+                "text": f"mission advanced: {objective.text[:80]} done"})
+        elif goal.state is GoalState.BLOCKED and objective.state is ObjectiveState.ACTIVE:
+            mission.mark(index, ObjectiveState.BLOCKED,
+                         summary=goal.blocked_reason or "goal reported blocked")
+            mission.save(self.workspace)
+            self._emit(EventType.AGENT_LOG, {
+                "stream": "stdout",
+                "text": f"mission blocked at: {objective.text[:80]}"})
+        return mission
+
+    def _require_mission(self) -> Mission:
+        if self._mission is None:
+            raise OrchestratorError("no mission is set for this workspace; use `mission set` first")
+        return self._mission
 
     def _write_run_context(self, run: Run) -> None:
         """Persist the roster, bindings and skill roots for the executing subprocess.
@@ -746,11 +1405,26 @@ class Orchestrator:
         state = outcome.summary or {}
         run.outcome = outcome.as_dict()
         run.outcome.update({
-            "nodes": {name: {"status": rec.get("status"), "verdict": rec.get("verdict")}
-                      for name, rec in (state.get("nodes") or {}).items()},
+            # Keep the per-node `summary` and `iterations` too, not just status/verdict. When a node
+            # blocks, the summary is *why* — dropping it left a run that said `blocked` and nothing
+            # else, which is the single most confusing state the product can be in.
+            "nodes": {
+                name: {
+                    "status": rec.get("status"),
+                    "verdict": rec.get("verdict"),
+                    "summary": rec.get("summary") or rec.get("detail") or "",
+                    "iterations": rec.get("iterations"),
+                    "cost_usd": rec.get("cost_usd"),
+                }
+                for name, rec in (state.get("nodes") or {}).items()
+            },
             "artifacts": sorted((state.get("artifacts") or {}).keys()),
             "open_questions": state.get("open_questions") or [],
+            # The runner's own log tail travels with the run so the reason for a stop is recoverable
+            # from the checkpoint alone, without re-reading `run_state.json` by hand.
+            "log_tail": (state.get("log") or [])[-20:],
         })
+        run.stop_reason = _derive_stop_reason(state, outcome, run.outcome)
 
         gate = self._detect_gate(state)
         if gate is not None:
@@ -826,11 +1500,16 @@ class Orchestrator:
 
     # ── Owner commands ──────────────────────────────────────────────────────
 
-    def decide(self, approved: bool, *, run: Run | None = None, note: str = "") -> Run:
+    def decide(self, approved: bool, *, run: Run | None = None, note: str = "",
+               by: str = "owner") -> Run:
         """Resolve a gate: approve and continue, or reject and park.
 
         A rejection requires no reason from the Owner but records one if given, because a rejection the
         agents cannot read is one they will re-attempt identically.
+
+        `by` names who decided. It is `owner` for a person and `goal` for an auto-approval the goal's
+        policy authorised — recorded distinctly, because "the org passed this" and "you passed this"
+        are different facts about a run, and conflating them would make the audit trail lie.
         """
         run = self._resolve(run)
         gate = run.gate
@@ -839,11 +1518,11 @@ class Orchestrator:
 
         run.decisions.append({
             "gate_id": gate.gate_id, "approved": approved, "note": note,
-            "by": "owner", "at": _iso_now(),
+            "by": by, "at": _iso_now(),
         })
         self._emit(EventType.HUMAN_DECISION, {
             "run_id": run.run_id, "gate_id": gate.gate_id, "approved": approved,
-            "note": note, "kind": gate.kind})
+            "note": note, "kind": gate.kind, "by": by})
 
         if approved:
             if note:
@@ -851,7 +1530,11 @@ class Orchestrator:
                 run.instructions.append(note)
             run.gate = None
             run.phase = RunPhase.READY
-            self.diagnostics.info("human.decision", message=f"approved {gate.gate_id}")
+            self.diagnostics.info("human.decision", message=f"approved {gate.gate_id}",
+                                  detail={"by": by})
+            # Move the runner's checkpoint past the node that parked, so continuing ADVANCES instead
+            # of parking again. See `_release_node_for_resume` for why this is needed at all.
+            self._release_node_for_resume(run, gate)
         else:
             run.phase = RunPhase.PAUSED
             if note:
@@ -861,6 +1544,151 @@ class Orchestrator:
         run.touch()
         self._persist(run)
         return run
+
+    def _release_node_for_resume(self, run: Run, gate: GateRequest) -> None:
+        """Advance the runner's checkpoint past an approved node, so continuing moves forward.
+
+        This is the last link in the chain that made gates unresolvable, and it is worth stating in
+        full because three separate defects hid behind one symptom.
+
+        The library runner seeds its frontier from `start`: `active = [] if start in done else [start]`.
+        When the *start* node parks at a gate, approving it clears the gate but leaves that node
+        `needs_review` in the checkpoint — which the runner counts as terminal — so on resume its
+        frontier is empty, every successor stays `pending`, and it re-escalates. Approving again does
+        the same thing. The gate is resolvable and the run can never move: a real approval did exactly
+        this, on the very first node of a six-node graph.
+
+        So on approval the engine does what a person means by "continue": it marks the node the gate
+        named as `done` and points `start` at that node's successor, which is the frontier the runner
+        could not compute for itself. A gate that names no node (a policy escalation) is left alone.
+
+        `done` rather than `needs_review` is the operative word: the Owner has accepted the work, so
+        downstream nodes should treat it as available rather than as an unresolved question.
+        """
+        node_id = str(gate.dossier.get("node") or "") if isinstance(gate.dossier, dict) else ""
+        if not node_id:
+            node_id = str(gate.gate_id)
+        state_path = getattr(run.workspace, "runner_state_path", None)
+        if state_path is None or not Path(state_path).is_file():
+            return
+        try:
+            state = json.loads(Path(state_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        record = (state.get("nodes") or {}).get(node_id)
+        if not isinstance(record, dict):
+            # The gate names something the runner never recorded (an escalation, or a gate node
+            # itself). Nothing to advance, and inventing a node would corrupt the checkpoint.
+            return
+        if record.get("status") == "done":
+            return
+
+        # Which node did the Owner effectively release? The producer whose work the gate judged.
+        manifest_path = run.manifest_path
+        successor = ""
+        if manifest_path is not None and Path(manifest_path).is_file():
+            manifest = self._read_manifest(Path(manifest_path))
+            for edge in manifest.get("edges") or []:
+                if str(edge.get("from")) == node_id:
+                    candidate = str(edge.get("to") or "")
+                    if candidate:
+                        successor = candidate
+                        break
+        record["status"] = "done"
+        record["verdict"] = record.get("verdict") or "approved"
+        state["phase"] = "ready"
+        state["node"] = successor or node_id
+        try:
+            Path(state_path).write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        except OSError as exc:  # noqa: BLE001 - a failed release is reported, not fatal
+            self.diagnostics.warning("gate.release.failed", message=str(exc))
+            return
+        # Advance the manifest past the released node. The runner's frontier is `[start]` unless
+        # `start` is terminal, and `start` comes from the **manifest** — never from run-state — so
+        # without this the run re-parks on the node the Owner just accepted, for ever.
+        if successor and manifest_path is not None and Path(manifest_path).is_file():
+            self._advance_manifest_past(Path(manifest_path), released=node_id, successor=successor)
+        self.diagnostics.info(
+            "gate.released",
+            message=f"released {node_id} on approval; resuming at {successor or '(end)'}",
+            detail={"gate": gate.gate_id, "by": "owner", "successor": successor})
+
+    def _advance_manifest_past(self, path: Path, *, released: str, successor: str) -> None:
+        """Rewrite a manifest so a resumed run begins at the released node's successor.
+
+        The library runner seeds its frontier from the manifest's `start` and only skips it when that
+        node is terminal — so the single way to move past an accepted node is to move `start`, and the
+        released node must then be **removed** from the graph. Leaving it in fails the library's own
+        validator with `nodes not reachable from start`, which surfaces as `the runner exited 1` and
+        looks like a crash rather than a refusal. Pruning it is not a loss: the node is finished, its
+        artifact is recorded, and the remaining graph is exactly the work still to do.
+
+        The edit is textual because the manifest is Safe YAML this engine wrote, and a parse-and-
+        re-emit would churn every unrelated line; a header records why `start` moved. The rewritten
+        manifest is validated by the runner on the next spawn, so a bad edit is refused loudly rather
+        than executed.
+        """
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return
+        lines = text.splitlines()
+        out: list[str] = []
+        index = 0
+        dropped = False
+        while index < len(lines):
+            line = lines[index]
+            # Drop the released node's block: from its `- id:` to the next `- id:`.
+            if re.match(rf"\s*- id:\s*{re.escape(released)}\s*$", line):
+                dropped = True
+                index += 1
+                continue
+            if dropped and re.match(r"\s*- id:\s*\S+", line):
+                dropped = False
+            if dropped:
+                index += 1
+                continue
+            # Repoint `start`.
+            if line.startswith("start:"):
+                out.append(f"start: {successor}")
+                index += 1
+                continue
+            # Drop any edge that mentions the released node, in either direction.
+            if re.match(rf"\s*- from:\s*{re.escape(released)}\s*$", line) or \
+                    re.match(rf"\s*- to:\s*{re.escape(released)}\s*$", line):
+                # An edge block is `- from: …` then indented keys; drop until the next `- from:`
+                # (or a non-indented section header).
+                is_from = "from:" in line
+                index += 1
+                while index < len(lines):
+                    nxt = lines[index]
+                    if re.match(r"\s*- from:\s*", nxt):
+                        break
+                    if nxt and not nxt.startswith((" ", "\t")):
+                        break
+                    index += 1
+                if not is_from:
+                    # A `- to:` line inside a block whose `- from:` was kept: the whole block is in
+                    # `out` already, so remove it.
+                    while out and not re.match(r"\s*- from:\s*", out[-1]):
+                        out.pop()
+                    if out:
+                        out.pop()
+                continue
+            out.append(line)
+            index += 1
+        if not dropped and not any(l.startswith("start:") for l in lines):
+            return
+        header = (
+            f"# `start` moved to {successor} after {released} was approved at a gate, and the\n"
+            f"# finished node was pruned. The library runner seeds its frontier from `start` and\n"
+            f"# only skips a terminal node, so this is how a resumed run advances past an accepted\n"
+            f"# node instead of parking on it again; pruning keeps the graph reachable for the\n"
+            f"# library's own validator.\n")
+        try:
+            path.write_text(header + "\n".join(out) + "\n", encoding="utf-8")
+        except OSError as exc:  # noqa: BLE001
+            self.diagnostics.warning("gate.manifest.rewrite.failed", message=str(exc))
 
     def instruct(self, text: str, *, run: Run | None = None, as_constraint: bool = False) -> Run:
         """Push guidance into a running org.
@@ -1039,6 +1867,13 @@ class Orchestrator:
         """
         if slug is None:
             project = self.workspace
+        elif getattr(self.workspace, "is_attached", False):
+            # An *attached* workspace IS the project: its slug is the folder name, and the run's slug
+            # is the workflow's. Looking up `root/slug` would point at a managed directory beside the
+            # repository — which does not exist — so `load` returned None and `decide`, `status` and
+            # `flow` all reported "no run found" for a run that was sitting right there. A real
+            # `decide --approve` failed on exactly this, leaving a gate that could not be resolved.
+            project = self.workspace
         else:
             # Resolve the slug under *this orchestrator's* root, not the default projects directory —
             # otherwise a run in a custom root would appear not to exist.
@@ -1046,6 +1881,28 @@ class Orchestrator:
                        else Workspace.for_project(slug, root=self.workspace.root))
         raw = project.read_checkpoint_raw()
         if raw is None:
+            return None
+        if _is_runner_checkpoint(raw):
+            # The file at `run_state.json` is the **library runner's** per-node checkpoint, not the
+            # orchestrator's, so there is no orchestrator run here to resume.
+            #
+            # This is a legacy-workspace case and it used to crash. Both sides wrote their own shape to
+            # this one file and the runner wrote last, so on a workspace that ran before the two files
+            # were separated (see `Workspace.runner_state_path`) the orchestrator's checkpoint is simply
+            # gone — replaced by the runner's. `read_checkpoint_raw` then returned the runner's
+            # `{workflow, manifest_sha, nodes, …}`, which carries no `run_state_version`, and the schema
+            # registry refused it with "no migration path for run_state from 0.0.0 to 1.0.0". That
+            # surfaced as a hard error in `status`, `decide` and `instruct` — `status` crashed outright
+            # — on a run whose node outcomes the Flow and Activity panels were still showing happily,
+            # because they read the file directly.
+            #
+            # Returning None rather than raising is the honest answer: this is not our document, so it is
+            # not a schema violation to report. The run's outcomes stay visible through `flow`,
+            # `activity` and the memory store, which is where the UI reads them.
+            self.diagnostics.info(
+                "run.checkpoint.foreign",
+                message=(f"{project.slug}: run_state.json is the workflow runner's checkpoint, not a "
+                         "resumable orchestrator run; showing it from flow/activity instead"))
             return None
         try:
             self.registry.check(raw, "run_state")
@@ -1065,11 +1922,16 @@ class Orchestrator:
         """Everything the UI needs about the current run, in one call."""
         run = self._run
         if run is None:
-            return {"phase": "idle", "running": False, "goal": self.goal_status()}
+            return {"phase": "idle", "running": False, "goal": self.goal_status(),
+                    "mission": self.mission_status()}
         with self._lock:
             host = self._host
         return {
             **run.as_dict(),
+            # The run's own goal text, kept under a distinct key because `goal` below is the
+            # *goal-status* document the app renders (state, live, spend) — the two are different
+            # things and collapsing them made `status` print a dict where the objective belonged.
+            "run_goal": run.goal,
             "running": host is not None and host.running,
             "liveness": host.wedged() if host is not None else None,
             "org": self.org.roster_view(),
@@ -1078,6 +1940,9 @@ class Orchestrator:
             # The goal travels with status, so the console shows whether the loop will continue
             # without needing a second command it has to remember to send.
             "goal": self.goal_status(),
+            # The mission travels too, so the console shows the standing purpose and which step is
+            # active without a second round trip.
+            "mission": self.mission_status(),
         }
 
     # ── internals ───────────────────────────────────────────────────────────
@@ -1163,10 +2028,11 @@ class Orchestrator:
         """The default model's context window, or a conservative fallback.
 
         A conservative fallback rather than an invented large number: assuming a big window would let a
-        prompt overflow, while assuming a small one only compacts earlier.
+        prompt overflow, while assuming a small one only compacts earlier. The window comes from the
+        one resolved default (including a `defaults.context_window` override), so the built-in company
+        and a hire agree on it.
         """
-        model = self.config.defaults.get("model", "")
-        spec = self.config.model_spec(model)
+        spec = self.config.default_model_spec()
         return int(spec.context_window or 8192)
 
     def _emit(self, event_type: Any, payload: dict[str, Any]) -> None:

@@ -22,6 +22,16 @@ DerivedData/
 # session transcripts, telemetry spans and the effect journal.
 projects/
 
+# A run writes its generated plugins and context beside the manifest. For a *managed* workspace that
+# is inside projects/, but an **attached** workspace is the user's own repository — so these landed in
+# the repo root and showed up as untracked noise in a working tree the engine merely inhabits.
+# Ignored by exact name because that is what the engine generates; the plan manifest (`<slug>.yaml`)
+# is deliberately not matched, since its name comes from the goal and could be a real file of yours.
+executor_run_*.py
+guardrail_run_*.py
+run-context.json
+runner_state.json
+
 # ── Telemetry and memory stores (may contain run content) ────────────────────
 .agent_state/
 .agent-run/

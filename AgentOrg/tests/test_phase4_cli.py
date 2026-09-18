@@ -47,7 +47,10 @@ def test_parser_accepts_every_documented_command():
     parser = build_parser()
     for argv in (["doctor"], ["skills", "list"], ["skills", "show", "code-reviewer"],
                  ["models"], ["models", "--refresh"],
-                 ["plan", "--goal", "x"], ["org"], ["org", "--goal", "x"], ["delegation"]):
+                 ["plan", "--goal", "x"], ["org"], ["org", "--goal", "x"], ["delegation"],
+                 ["mission", "status"], ["mission", "set", "ship it", "--objective", "a"],
+                 ["mission", "add", "a step"], ["mission", "start", "--index", "0"],
+                 ["mission", "advance"], ["mission", "mark", "0", "done"]):
         assert parser.parse_args(argv).func is not None, f"{argv} does not resolve to a command"
 
 
@@ -594,3 +597,375 @@ def test_status_for_an_unknown_run_fails_clearly(run_project):
     result = _run_cli("status", "--slug", "never-ran", "--root", str(root))
     assert result.returncode == EXIT_CHECK_FAILED
     assert "no run found" in result.stderr
+
+
+# ── roster discovery: `--project` must load the attached folder's roster ──────
+
+
+def test_project_root_for_honours_project_flag():
+    """The bug: `--project Ideas` was ignored, so the CEO hired there never entered a run."""
+    import argparse
+
+    from engine import usercfg
+    from engine.cli import _project_root_for
+
+    args = argparse.Namespace(project="/tmp/attached-proj", root=None)
+    assert _project_root_for(args) == pathlib.Path("/tmp/attached-proj")
+
+    args = argparse.Namespace(project=None, root="/tmp/projects-dir")
+    assert _project_root_for(args) == usercfg.project_root("/tmp/projects-dir")
+
+    args = argparse.Namespace(project=None, root=None)
+    assert _project_root_for(args) is None
+
+
+def test_project_flag_wins_over_root():
+    import argparse
+
+    from engine.cli import _project_root_for
+
+    args = argparse.Namespace(project="/tmp/attached-proj", root="/tmp/projects-dir")
+    assert _project_root_for(args) == pathlib.Path("/tmp/attached-proj")
+
+
+def test_agents_loads_the_roster_from_an_attached_project(tmp_path):
+    """A hire written into `<project>/.agentorg/roster.json` must appear under `--project`."""
+    project = tmp_path / "Attached"
+    (project / ".agentorg").mkdir(parents=True)
+    (project / ".git").mkdir()
+    (project / ".agentorg" / "roster.json").write_text(json.dumps({
+        "name": "AgentOrg", "org_version": "1.0.0",
+        "agents": [{
+            "id": "ag_ceo", "name": "CEO", "title": "SP", "kind": "ai", "role": "worker",
+            "level": 5, "provider": "Olla", "model": "deepseek-v4.1-flash",
+            "context_window": 1048576, "skills": ["ceo-strategist"],
+            "capabilities": ["read:*"], "origin": "owner", "team": "", "tags": [],
+        }],
+        "teams": [], "policy": {},
+    }))
+
+    result = _run_cli("agents", "--project", str(project), "--json")
+    assert result.returncode == EXIT_OK, result.stderr[:300]
+    payload = json.loads(result.stdout)
+    names = {a["name"] for a in payload["agents"]}
+    assert "CEO" in names, f"the attached roster was not read: {sorted(names)}"
+    assert any(str(project) in p for p in payload["loaded_from"])
+
+
+def test_roster_root_honours_project_flag(tmp_path):
+    """A hire with `--project X` must land in `X/.agentorg/`, where the loader looks for it."""
+    import argparse
+
+    from engine.cli import _roster_root_for
+
+    project = tmp_path / "Attached"
+    (project / ".git").mkdir(parents=True)
+    args = argparse.Namespace(project=str(project), root=None, roster_root=None)
+    assert _roster_root_for(args) == (project / ".agentorg").resolve()
+
+
+def test_skill_root_honours_project_flag(tmp_path):
+    """`skills new --project X` must author into the project the Owner named."""
+    import argparse
+
+    from engine.cli import _skill_root_for
+
+    project = tmp_path / "Attached"
+    (project / ".git").mkdir(parents=True)
+    args = argparse.Namespace(project=str(project), root=None, global_=False)
+    assert _skill_root_for(args) == (project / ".agentorg").resolve()
+
+
+def test_skills_new_writes_into_an_attached_project(tmp_path):
+    project = tmp_path / "Attached"
+    (project / ".git").mkdir(parents=True)
+    result = _run_cli("skills", "new", "custom-check", "--project", str(project),
+                      "--purpose", "check the thing", "--criterion", "the thing is checked")
+    assert result.returncode == EXIT_OK, result.stderr[:300]
+    written = project / ".agentorg" / "skills" / "custom-check" / "SKILL.md"
+    assert written.is_file(), f"skill not written into the project: {sorted(project.rglob('*'))}"
+
+
+def test_mission_set_status_and_advance_end_to_end(tmp_path):
+    """The mission is reachable from the CLI, and `start` hands an objective to a goal."""
+    project = tmp_path / "MissionProj"
+    (project / ".git").mkdir(parents=True)
+
+    result = _run_cli("mission", "set", "ship the MVP", "--objective", "get auth green",
+                      "--objective", "pagination", "--project", str(project))
+    assert result.returncode == EXIT_OK, result.stderr[:300]
+    assert "ship the MVP" in result.stdout
+
+    status = _run_cli("mission", "status", "--project", str(project), "--json")
+    payload = json.loads(status.stdout)
+    assert payload["mission"]["statement"] == "ship the MVP"
+    assert payload["mission"]["counts"]["total"] == 2
+
+    # `start` records the objective and sets a goal — but does not spend without arming.
+    started = _run_cli("mission", "start", "--index", "0", "--no-arm", "--project", str(project),
+                       "--json")
+    detail = json.loads(started.stdout)
+    assert detail["objective"]["text"] == "get auth green"
+    assert detail["goal"]["live"] is False
+
+    _run_cli("mission", "mark", "0", "done", "--summary", "auth is green", "--project", str(project))
+    advanced = _run_cli("mission", "advance", "--project", str(project), "--json")
+    payload = json.loads(advanced.stdout)
+    assert payload["mission"]["progress"]["done"] == 1
+    assert payload["mission"]["now"]["text"] == "pagination"
+
+
+# ── the portfolio: one principal, several orgs ───────────────────────────────
+
+
+def test_portfolio_commands_are_in_the_parser():
+    parser = build_parser()
+    for argv in (["portfolio", "init", "Elon"],
+                 ["portfolio", "status"],
+                 ["portfolio", "add", "Tesla", "--path", "/tmp/tesla"],
+                 ["portfolio", "use", "tesla"],
+                 ["portfolio", "show", "tesla"],
+                 ["portfolio", "run", "tesla", "do work"],
+                 ["portfolio", "stop", "tesla"],
+                 ["portfolio", "remove", "tesla"]):
+        assert parser.parse_args(argv).func is not None, f"{argv} does not resolve"
+
+
+def test_portfolio_init_add_status_end_to_end(tmp_path):
+    """One person, several orgs — set up and inspected from the CLI."""
+    home = tmp_path / "home"
+    env = {"AGENTORG_HOME": str(home)}
+
+    def run_home(*argv: str) -> subprocess.CompletedProcess:
+        import os as _os
+
+        merged = {**_os.environ, **env}
+        return subprocess.run([sys.executable, "-m", "engine.cli", *argv],
+                              capture_output=True, text=True, cwd=str(ROOT), env=merged)
+
+    init = run_home("portfolio", "init", "Elon Musk", "--json")
+    assert init.returncode == EXIT_OK, init.stderr[:300]
+    assert json.loads(init.stdout)["principal"]["name"] == "Elon Musk"
+
+    add = run_home("portfolio", "add", "Tesla", "--slug", "tesla",
+                   "--path", str(tmp_path / "tesla"), "--charter", "EVs", "--json")
+    assert add.returncode == EXIT_OK, add.stderr[:300]
+    entry = json.loads(add.stdout)
+    assert entry["slug"] == "tesla" and entry["id"] == "org_tesla"
+
+    run_home("portfolio", "add", "SpaceX", "--slug", "spacex",
+             "--path", str(tmp_path / "spacex"))
+
+    status = run_home("portfolio", "status", "--json")
+    payload = json.loads(status.stdout)
+    assert payload["rollup"]["totals"]["orgs"] == 2
+    assert [o["name"] for o in payload["rollup"]["orgs"]] == ["Tesla", "SpaceX"]
+
+
+def test_the_org_flag_selects_an_orgs_folder(tmp_path):
+    """`--org` resolves the org's folder, so every existing command is org-scoped for free."""
+    home = tmp_path / "home"
+    project = tmp_path / "tesla"
+    (project / ".git").mkdir(parents=True)
+    import os as _os
+
+    env = {**_os.environ, "AGENTORG_HOME": str(home)}
+
+    def run_home(*argv: str) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, "-m", "engine.cli", *argv],
+                              capture_output=True, text=True, cwd=str(ROOT), env=env)
+
+    run_home("portfolio", "init", "Elon")
+    run_home("portfolio", "add", "Tesla", "--slug", "tesla", "--path", str(project))
+    result = run_home("agents", "--org", "tesla", "--json")
+    assert result.returncode == EXIT_OK, result.stderr[:300]
+    payload = json.loads(result.stdout)
+    assert payload["agents"], "the org's roster should load"
+    # A bad org names the available ones rather than silently falling back.
+    bad = run_home("agents", "--org", "nosuch")
+    assert bad.returncode == EXIT_CHECK_FAILED
+    assert "known orgs" in bad.stderr
+
+
+# ── the serve bootstrap reports why the engine could not start ───────────────
+
+
+def test_serve_emits_a_typed_error_frame_when_the_bootstrap_fails(tmp_path):
+    """The app reads stdout, so a failing bootstrap must say why *there*, not only on stderr.
+
+    The bug: a config that would not load made `serve` exit 1 with the reason on stderr, which the
+    console never read, so it reported "the engine exited with status 1" and left the UI looking idle.
+    """
+    project = tmp_path / "engine"
+    project.mkdir()
+    creds = tmp_path / "credentials.json"
+    doc = json.loads((ROOT / "credentials.example.json").read_text())
+    doc["providers"]["ollama"]["kind"] = "weird"  # a genuine, fatal config error
+    creds.write_text(json.dumps(doc))
+    import os as _os
+
+    _os.chmod(creds, 0o600)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "engine.cli", "serve", "--config", str(creds)],
+        capture_output=True, text=True, cwd=str(ROOT))
+    assert result.returncode == EXIT_CHECK_FAILED
+    # stdout carries exactly one typed frame, and it is the error with the reason.
+    frames = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert frames, "the bootstrap failure must write a frame to stdout"
+    error = next((f for f in frames if f["type"] == "error"), None)
+    assert error is not None, f"no error frame in {frames}"
+    assert error["payload"]["fatal"] is True
+    assert error["payload"]["phase"] == "bootstrap"
+    assert "unsupported kind" in error["payload"]["message"]
+
+
+def test_serve_starts_when_a_stale_provider_reference_is_present(tmp_path):
+    """The end-to-end regression: the exact config that bricked the engine now starts it."""
+    creds = tmp_path / "credentials.json"
+    doc = json.loads((ROOT / "credentials.example.json").read_text())
+    doc["providers"].pop("anthropic", None)                     # provider removed ...
+    doc["concurrency"]["per_provider_limits"]["anthropic"] = 3  # ... limit left behind
+    creds.write_text(json.dumps(doc))
+    import os as _os
+
+    _os.chmod(creds, 0o600)
+
+    # Serve runs forever on a live stream; drive it with EOF on stdin so it exits cleanly, and check it
+    # got far enough to emit its first frame rather than failing the bootstrap.
+    result = subprocess.run(
+        [sys.executable, "-m", "engine.cli", "serve", "--config", str(creds)],
+        capture_output=True, text=True, cwd=str(ROOT), input="")
+    frames = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert not any(f["type"] == "error" for f in frames), frames
+    assert any(f["type"] == "agent.log" for f in frames), "the server should have started"
+
+
+# ── `defaults` — the one place that says what model everyone runs on ─────────
+
+
+def _creds(tmp_path, mutate=None) -> str:
+    """A hermetic credentials file, so these tests never read the developer's own.
+
+    `load()` prefers `./credentials.json`, which on a working machine holds *that person's* providers
+    and default model. A test that reads it passes or fails on who ran it — which is exactly how a
+    `defaults` assertion would depend on someone's private configuration.
+    """
+    doc = json.loads((ROOT / "credentials.example.json").read_text())
+    if mutate:
+        mutate(doc)
+    path = tmp_path / "credentials.json"
+    path.write_text(json.dumps(doc))
+    import os as _os
+
+    _os.chmod(path, 0o600)
+    return str(path)
+
+
+def test_bare_defaults_prints_the_answer_rather_than_crashing(tmp_path):
+    """`engine.cli defaults` with no action must show the default, not raise AttributeError.
+
+    It used to raise `'Namespace' object has no attribute 'func'` — the "nothing works" symptom on the
+    single command that answers "which model do my people run on".
+    """
+    result = _run_cli("--config", _creds(tmp_path), "defaults")
+    assert result.returncode == EXIT_OK, result.stderr[:400]
+    assert "default   :" in result.stdout
+
+
+def test_defaults_show_reports_the_declared_pair(tmp_path):
+    result = _run_cli("--config", _creds(tmp_path), "defaults", "show", "--json")
+    assert result.returncode == EXIT_OK, result.stderr[:400]
+    payload = json.loads(result.stdout)
+    assert payload["provider"] == "ollama"
+    assert payload["model"] == "qwen2.5-coder:7b"
+    assert payload["context_window"] == 32768, "the declared window must be reported"
+    assert payload["autonomy"]["auto_pass_auto_gates"] is True
+
+
+def test_defaults_set_changes_only_what_was_named(tmp_path):
+    creds = _creds(tmp_path)
+    before = json.loads(pathlib.Path(creds).read_text())
+    result = _run_cli("--config", creds, "defaults", "set", "--model", "qwen2.5-coder:14b")
+    assert result.returncode == EXIT_OK, result.stderr[:400]
+    after = json.loads(pathlib.Path(creds).read_text())
+    assert after["defaults"]["model"] == "qwen2.5-coder:14b"
+    assert set(after["providers"]) == set(before["providers"]), "a default must not cost you a provider"
+    assert after["policy"] == before["policy"], "nor your policy"
+
+
+def test_defaults_set_refuses_an_unknown_provider_rather_than_writing_it(tmp_path):
+    """A default naming a provider that does not exist would resolve to a fallback and silently not be
+    what the person chose, so it is refused with the real list."""
+    creds = _creds(tmp_path)
+    result = _run_cli("--config", creds, "defaults", "set", "--provider", "nope")
+    assert result.returncode == EXIT_CHECK_FAILED
+    assert "nope" in result.stderr
+
+
+def test_defaults_autonomy_turns_a_gate_human_for_every_new_goal(tmp_path):
+    creds = _creds(tmp_path)
+    result = _run_cli("--config", creds, "defaults", "autonomy", "--no-auto-gates")
+    assert result.returncode == EXIT_OK, result.stderr[:400]
+    payload = json.loads(_run_cli("--config", creds, "defaults", "show", "--json").stdout)
+    assert payload["autonomy"]["auto_pass_auto_gates"] is False
+    # Only the named switch changed.
+    assert payload["autonomy"]["auto_hire_missing"] is True
+
+
+def test_run_dry_run_json_emits_only_json(tmp_path):
+    """`--json` means only JSON on stdout: a human line first makes the output unparsable.
+
+    `run --goal … --dry-run --json` printed `(dry run: nothing executed)` before the document, so
+    `… | jq` failed on line one — on the command whose entire purpose is to be safe to inspect.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    manifest = project / "dryrun.yaml"
+    manifest.write_text(
+        "name: dryrun\nversion: '1.0.0'\ndescription: d\n"
+        "payloads:\n  handoff-v1: [status, summary]\nstart: dev\n"
+        "nodes:\n  - id: dev\n    skill: backend-developer\n    outputs: [change]\n"
+        "edges: []\nend: [dev]\n")
+    result = subprocess.run(
+        [sys.executable, "-m", "engine.cli", "run", "--manifest", str(manifest),
+         "--slug", "dryrun", "--root", str(tmp_path / "projects"), "--dry-run", "--json"],
+        capture_output=True, text=True, cwd=str(ROOT))
+    assert result.returncode == EXIT_OK, result.stderr[:400]
+    payload = json.loads(result.stdout)          # must not raise
+    assert payload["phase"] == "awaiting_approval"
+    assert "dry run" not in result.stdout, "the human line must not pollute the JSON stream"
+
+
+def test_decide_approve_continues_the_run(run_project):
+    """`decide --approve` is documented as "approve and continue" — it must actually continue.
+
+    It only cleared the gate, leaving the run at `ready` with nothing driving it, so an operator who
+    approved a gate saw the gate go and the work never resume. The CLI had no path that did the
+    second half, which is the difference between resolving a gate and resuming behind it.
+    """
+    root, project = run_project
+    _run_cli("run", "--manifest", str(project / "clirun.yaml"), "--slug", "clirun",
+             "--root", str(root), "--executor", str(project / "stub.py"))
+    result = _run_cli("decide", "--slug", "clirun", "--root", str(root), "--approve",
+                      "--executor", str(project / "stub.py"))
+    assert result.returncode == EXIT_OK, result.stderr[:400]
+    assert "approved release" in result.stdout
+    assert "Continuing the run past the gate" in result.stdout
+    # The run resumed and re-reached the gate (the stub always parks there) rather than staying ready.
+    status = _run_cli("status", "--slug", "clirun", "--root", str(root), "--json")
+    payload = json.loads(status.stdout)
+    assert payload["phase"] in ("awaiting_gate", "awaiting_human"), payload["phase"]
+
+
+def test_decide_no_continue_clears_the_gate_without_spending(run_project):
+    """The opt-out an operator wants when they intend to inspect before paying for more work."""
+    root, project = run_project
+    _run_cli("run", "--manifest", str(project / "clirun.yaml"), "--slug", "clirun",
+             "--root", str(root), "--executor", str(project / "stub.py"))
+    result = _run_cli("decide", "--slug", "clirun", "--root", str(root), "--approve",
+                      "--no-continue")
+    assert result.returncode == EXIT_OK, result.stderr[:400]
+    assert "Continuing the run" not in result.stdout
+    status = _run_cli("status", "--slug", "clirun", "--root", str(root), "--json")
+    assert json.loads(status.stdout)["phase"] == "ready"

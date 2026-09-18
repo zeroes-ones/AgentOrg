@@ -53,7 +53,15 @@ def library():
 
 @pytest.fixture(scope="module")
 def config():
-    return load()
+    """The shipped example, not `load()`.
+
+    A bare `load()` prefers the developer's own `credentials.json`, whose default model may be one the
+    provider *probes* rather than one the config *declares* — and a hire resolves a window from the
+    declared table. So a test that read the developer's file failed or passed on who ran it. Pinning
+    the example makes the fixture describe what it tests.
+    """
+    example = pathlib.Path(__file__).resolve().parent.parent / "credentials.example.json"
+    return load(example)
 
 
 # ── the layered roots ────────────────────────────────────────────────────────
@@ -173,7 +181,7 @@ def test_a_hire_appears_in_the_roster_and_persists(home, project, config, librar
     people = make_people(config, library, project)
     org = people.load(project=project)
     spec = people.hire(HireRequest(name="Dana", skill="security-reviewer",
-                                   provider="ollama", model="qwen2.5-coder:14b"),
+                                   provider="ollama", model="qwen2.5-coder:7b"),
                        org=org, roster_root=project / ".agentorg")
     assert spec.skills == ["security-reviewer"]
     assert spec.id in org.agents
@@ -187,7 +195,7 @@ def test_the_roster_file_records_only_the_hire(home, project, config, library):
     people = make_people(config, library, project)
     org = people.load(project=project)
     people.hire(HireRequest(name="Dana", skill="security-reviewer",
-                            provider="ollama", model="qwen2.5-coder:14b"),
+                            provider="ollama", model="qwen2.5-coder:7b"),
                 org=org, roster_root=project / ".agentorg")
     document = json.loads((project / ".agentorg" / "roster.json").read_text())
     names = [a["name"] for a in document["agents"]]
@@ -201,7 +209,7 @@ def test_a_hire_is_reachable_from_a_run_not_just_a_listing(home, project, config
     people = make_people(config, library, project)
     org = people.load(project=project)
     people.hire(HireRequest(name="Dana", skill="security-reviewer",
-                            provider="ollama", model="qwen2.5-coder:14b"),
+                            provider="ollama", model="qwen2.5-coder:7b"),
                 org=org, roster_root=project / ".agentorg")
     reloaded = make_people(config, library, project).load(project=project)
     assert "Dana" in {a.name for a in reloaded.agents.values()}
@@ -237,7 +245,7 @@ def test_a_reviewer_sharing_the_producers_model_warns_rather_than_failing(home, 
     people = make_people(config, library, project)
     org = people.load(project=project)
     people.hire(HireRequest(name="Dana", skill="security-reviewer",
-                            provider="ollama", model="qwen2.5-coder:14b"), org=org)
+                            provider="ollama", model="qwen2.5-coder:7b"), org=org)
     assert any("independence" in w for w in people.warnings)
 
 

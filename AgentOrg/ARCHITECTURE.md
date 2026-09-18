@@ -76,6 +76,8 @@ AgentOrg/
 │   │   ├── frontmatter.py     the strict YAML-subset parser
 │   │   ├── bundle.py          ★ SKILL.md → SkillBundle
 │   │   ├── filesystem.py      read from the pinned library
+│   │   ├── graph.py           ★ the library's chain: dependency graph
+│   │   ├── roles.py           ★ verifier-vs-producer, derived from the skill
 │   │   └── source.py          the SkillSource protocol
 │   │
 │   ├── prompts.py             ★ checklist-enforcing prompt assembly
@@ -119,6 +121,11 @@ AgentOrg/
 │   ├── fanout.py              template × items → N subagents      (built)
 │   ├── subagents.py           isolated child contexts + transcripts (built)
 │   ├── goal.py                the durable objective + its verdict  (built)
+│   ├── mission.py             the standing purpose above the goal   (built)
+│   ├── portfolio.py           the principal and the orgs they run   (built)
+│   ├── fleet.py               several orgs running at once, bounded (built)
+│   ├── activity.py            "what is happening" — one derived timeline (built)
+│   ├── flow.py                "who is working on what" — the org board (built)
 │   ├── improver.py            detect/draft/validate/promote — never applies (built)
 │   ├── tools.py               read/list/search/write + the gate   (built)
 │   └── agentloop.py           the bounded tool-calling loop       (built)
@@ -145,7 +152,16 @@ This is the useful part of the map: when a rule matters, exactly one layer is re
 | `skills/frontmatter.py` | A contract is never silently dropped | A strict subset; out-of-subset input refused with a line number |
 | `skills/bundle.py` | A node always has criteria | Three documented sources, then a refusal |
 | `prompts.py` | No checklist id is skippable | Every id named; PASS/FAIL/N/A **with evidence** required |
-| `planner.py` | Every graph terminates | The library's validator, plus a bounded loop and a reachable gate |
+| `planner.py` | Every graph terminates, and the org matches the goal | The library's validator plus a bounded loop and a reachable gate; a per-domain composition |
+| `activity.py` | A run's state is always explainable | Reads the artifacts the engine already writes; a missing source is skipped, never an error |
+| `flow.py` | "Who is on what" is never inferred from names | Reads the run context's bindings, the `node.bind` diagnostics and the `handoff.*` events; a node nobody holds shows a blank owner |
+| `goal.py` (policy) | An automatic gate decision is never confused with yours | `GoalPolicy` per objective; a terminal gate is never passed; every auto-approval records `by: goal` |
+| `orchestrator.py` (`_auto_staff`) | A missing capability never stalls a run on a roster accident | An existing holder always wins; the helper runs on the resolved default and is ephemeral unless `persist_hires` |
+| `mission.py` | A mission never spends, and never contradicts its own list | State is derived from the objectives; arming is separate from starting a goal; load disarms |
+| `skills/roles.py` | The binder and the planner agree on who judges | One derived answer, not two hardcoded sets |
+| `portfolio.py` | A register never runs or spends | It points at orgs; execution and budget stay one level down |
+| `fleet.py` | N orgs cannot over-subscribe the machine or the budget | One global ceiling (the scheduler's own) + a per-org daily budget |
+| `serve.py` (bootstrap) | A dead engine is never reported as running | `engine.ready` is the readiness proof; a fatal bootstrap failure is a typed `error` frame on stdout |
 | `binding.py` | A reviewer is never its own producer | The independence refusal, plus model preference |
 | `policy.py` | No setting disables every human gate | The safety floor, with an explicit opt-in to cross it |
 | `handoff.py` | Corrupt or lossy state never propagates | Rules R1–R8, each named on violation |
@@ -194,23 +210,23 @@ supply-chain sense: a modified `SKILL.md` is modified system-prompt content. So:
 
 ## The test strategy
 
-1096 tests, all offline. The point is that the interesting failures are not crashes.
+1482 tests, all offline. The point is that the interesting failures are not crashes.
 
 | Suite | Tests | What it proves |
 |---|---|---|
-| `test_phase1_foundation.py` | 109 | Pinning, config refusals, the protocol round-trip, containment, schema refusal, effect replay |
+| `test_phase1_foundation.py` | 111 | Pinning, config refusals, the protocol round-trip, containment, schema refusal, effect replay, and the self-healing config (a stale provider reference is repaired, not fatal) |
 | `test_phase2_gateway.py` | 90 | Every adapter's wire shape, retry/backoff, SSE reassembly, catalog provenance, cost labelling |
 | `test_phase2_rpc.py` | 22 | The socket seam: privacy, error propagation, path-length handling |
 | `test_phase3_skills.py` | 72 | The parser agreeing with PyYAML **on all 327 skills**, three criteria fallbacks, checklist ids |
 | `test_phase3_prompts.py` | 52 | Checklist enforcement, attention placement, trailer parsing |
-| `test_phase3_planner.py` | 53 | Validation, termination invariants, Safe-YAML round-trip |
+| `test_phase3_planner.py` | 67 | Validation, termination invariants, Safe-YAML round-trip, and the domain classification that chooses the org (strategy/gtm/research/data vs software) |
 | `test_phase4_org.py` | 147 | Every org, routing, delegation, health and scheduler refusal, plus an end-to-end pass |
-| `test_phase4_cli.py` | 55 | Every command the documentation tells you to run |
+| `test_phase4_cli.py` | 64 | Every command the documentation tells you to run, plus `--project`/`--root` roster and skill resolution |
 | `test_phase5_context.py` | 79 | The band thresholds, attention decay, priority eviction, AR-04 revert, rotation guards |
 | `test_phase5_memory.py` | 68 | The poisoning guard, consolidation, span honesty flags, sampling, the bundle leak refusal |
 | `test_phase5_evals.py` | 25 | The behavioural suite is sound: every scenario implemented, the gate blocks |
 | `test_phase6_executor.py` | 39 | The runner plugin: node execution, contract checks, the effect journal, cost labelling |
-| `test_phase6_orchestrator.py` | 35 | Lifecycle, gates, resume, reassignment, takeover and the run the UI reads |
+| `test_phase6_orchestrator.py` | 41 | Lifecycle, gates, resume, reassignment, takeover, why a run stopped, and the run the UI reads |
 | `test_phase7_chat.py` | 18 | The conversational loop: every command has a handler, cost is never rendered free, a failed turn is not kept |
 | `test_phase8_authoring.py` | 21 | The layered roots, authoring an enforceable skill, hiring with its refusals and persistence |
 | `test_phase9_swarm.py` | 20 | A swarm votes and the majority decides; the run context carries roster, bindings and skill roots |
@@ -226,11 +242,17 @@ supply-chain sense: a modified `SKILL.md` is modified system-prompt content. So:
 | `test_phase19_providers.py` | 38 | Custom headers on every dialect, and the credentials writer: merge not replace, mode 0600, never invent a path |
 | `test_phase20_roster.py` | 26 |
 | `test_phase21_improver.py` | 31 | The self-improvement loop: measurement not opinion, a baseline delta as the only proof, and the safety boundary that refuses anything touching its own judging machinery | Hiring and editing: the id (and so the history) survives an edit, save and load agree on one path |
+| `test_phase26_portfolio.py` | 24 | The register: the principal, org identity that survives a rename, and a portfolio that runs and spends nothing |
+| `test_phase27_fleet.py` | 19 | Several orgs at once: lazy load, per-org isolation, the global ceiling and per-org budget, and every refusal named |
+| `test_phase22_activity.py` | 12 | The "what is happening" report: a blocked run explains itself, a gate becomes a decision, the timeline is bounded and deduped, a fresh workspace reads calmly |
+| `test_phase23_mission.py` | 30 | The mission: one active objective, derived state, advance, disarm-on-load, and autonomous sync from a goal's verdict |
+| `test_phase24_skill_graph.py` | 17 | The library's chain graph: edges, closures, ordering with cycles reported, and a calibrated plan review |
+| `test_phase25_skill_roles.py` | 27 | Verifier vs producer derived from the skill (security-engineer produces, security-reviewer judges) |
 
 Plus **17 behavioural scenarios** in `engine/evals/`, scored against a frozen baseline with a gate that
 blocks a regression — see the README's testing section for why that is a separate suite.
 
-The `macos/` package adds **81 Swift tests** (`swift test`) over the process bridge, protocol models,
+The `macos/` package adds **130 Swift tests** (`swift test`) over the process bridge, protocol models,
 log store and the safe file writer. They live in the kit rather than a UI test so the parts that must
 not be guessed at stay exercisable without launching the app.
 

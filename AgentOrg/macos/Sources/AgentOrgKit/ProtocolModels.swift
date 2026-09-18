@@ -117,6 +117,9 @@ public struct EngineEvent: Codable, Sendable, Identifiable, Equatable {
             return "SLO breach: \(payload["objective"]?.stringValue ?? "?")"
         case "command.ack":
             return (payload["ok"]?.boolValue ?? false) ? "command acknowledged" : "command refused"
+        case "engine.ready":
+            let providers = payload["providers"]?.arrayValue?.count ?? 0
+            return "engine ready (\(providers) provider(s))"
         case "guardrail.blocked", "guardrail.block":
             return "guardrail blocked a payload"
         case "cost.ceiling": return "budget ceiling reached — the run parked"
@@ -193,6 +196,9 @@ public enum EventType {
         "schema.refused", "effect.applied", "effect.replayed", "leak.detected",
         "span.exported", "diagnostics.exported", "error", "command.ack",
         "guardrail.blocked",
+        // The readiness handshake: the console treats this as the proof the engine is usable, so an
+        // unknown-event warning here would be exactly backwards.
+        "engine.ready",
     ]
 
     public static func isKnown(_ type: String) -> Bool { known.contains(type) }

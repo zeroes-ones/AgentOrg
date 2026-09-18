@@ -279,8 +279,24 @@ class Workspace:
 
     @property
     def checkpoint_path(self) -> Path:
-        """`run_state.json` — the resumable checkpoint."""
+        """`run_state.json` — the orchestrator's resumable checkpoint."""
         return self.state_dir / "run_state.json"
+
+    @property
+    def runner_state_path(self) -> Path:
+        """`runner_state.json` — the **library runner's** per-node checkpoint.
+
+        Deliberately a different file from :attr:`checkpoint_path`. Both sides called their file
+        `run_state.json`, and they wrote it in turn: the runner writes `{workflow, manifest_sha, nodes}`
+        and the orchestrator writes `{run_id, phase, gate, outcome, …}`. So after the orchestrator's
+        post-run write, the runner's `load_state` found no `workflow`/`manifest_sha` and returned
+        `None` — meaning **every continuation restarted the graph from scratch** and re-ran the node
+        that had just failed. That is the "it keeps rejecting at some point" symptom: approving a gate
+        re-ran `pm`, hit the identical contract violation, and parked again, for ever.
+
+        Two writers, one file, incompatible shapes. One file each is the fix that cannot be got wrong.
+        """
+        return self.state_dir / "runner_state.json"
 
     @property
     def trace_path(self) -> Path:

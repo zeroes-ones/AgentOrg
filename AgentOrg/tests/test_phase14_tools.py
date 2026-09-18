@@ -513,3 +513,59 @@ def test_a_reply_carrying_tool_calls_is_not_a_finished_reply():
     response = provider._parse_message(body, "m", {"read_file"})
     assert response.tool_calls
     assert response.finish_reason is FinishReason.TOOL_CALLS
+
+
+# ── the step budget is declared, and the answer step is reserved ─────────────
+#
+# A real run: a capable model asked to write a PRD in a large monorepo spent every step calling
+# `list_dir`/`read_file`, reached the bound with no output, and the node failed its completion
+# contract. The model had never been told it had a budget, and its last step still offered tools — so
+# there was no step at which it had to deliver. Both halves are pinned here.
+
+
+class _RecordingModel:
+    """A model that always asks for a tool, recording every request it was given."""
+
+    def __init__(self) -> None:
+        self.requests: list[Any] = []
+
+    def __call__(self, request) -> ChatResponse:
+        self.requests.append(request)
+        return ChatResponse(text="", tool_calls=[ToolCall(id="c", name="list_dir",
+                                                          arguments={"path": "."})],
+                            usage=Usage(prompt_tokens=10, completion_tokens=5),
+                            model="m", provider_id="fake", finish_reason=FinishReason.STOP)
+
+
+def _budget_notices(request) -> list[str]:
+    out = []
+    for message in request.messages:
+        text = getattr(message, "text", "") or ""
+        if text.startswith("[budget]"):
+            out.append(text)
+    return out
+
+
+def test_the_model_is_told_its_step_budget_before_it_runs_out(developer):
+    """An invisible bound turns a thorough investigation into a silent failure."""
+    model = _RecordingModel()
+    AgentLoop(complete=model, tools=developer, max_steps=4).run(system="s", user="u")
+    notices = [n for request in model.requests for n in _budget_notices(request)]
+    assert notices, "the model must be warned that the budget is nearly spent"
+    assert any("Step 3 of 4" in n for n in notices), "and told exactly where it is"
+
+
+def test_the_final_step_runs_without_tools_so_it_must_answer(developer):
+    """The reserved answer step is what guarantees a trailer exists to parse."""
+    model = _RecordingModel()
+    AgentLoop(complete=model, tools=developer, max_steps=4).run(system="s", user="u")
+    offered = [len(request.tools or []) for request in model.requests]
+    assert offered[-1] == 0, f"the last step must not offer tools; got {offered}"
+    assert all(n > 0 for n in offered[:-1]), "every earlier step still offers them"
+
+
+def test_a_single_step_loop_still_offers_tools(developer):
+    """`max_steps=1` cannot reserve an answer step — reserving it would leave no step at all."""
+    model = _RecordingModel()
+    AgentLoop(complete=model, tools=developer, max_steps=1).run(system="s", user="u")
+    assert len(model.requests[0].tools or []) > 0

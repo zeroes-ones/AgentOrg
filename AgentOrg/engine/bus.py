@@ -106,10 +106,21 @@ class EventBus:
         self._redact = redact_payloads
         self._trace = Path(trace_path) if trace_path else None
         self._trace_fh = None
+        #: Why the trace could not be opened, when it could not. Recorded rather than raised so a
+        #: read-only command (`goal status`, `flow`, `activity`) still works in a workspace whose
+        #: state directory is not writable — losing the trace is a smaller failure than losing the
+        #: command, and a raw `PermissionError` out of a *reader* is the opposite of "it just works".
+        self.trace_error: str = ""
         if self._trace is not None:
-            self._trace.parent.mkdir(parents=True, exist_ok=True)
-            # Line-buffered append; never truncate, so a resumed run extends its trace.
-            self._trace_fh = open(self._trace, "a", encoding="utf-8")
+            try:
+                self._trace.parent.mkdir(parents=True, exist_ok=True)
+                # Line-buffered append; never truncate, so a resumed run extends its trace.
+                self._trace_fh = open(self._trace, "a", encoding="utf-8")
+            except OSError as exc:
+                self.trace_error = (
+                    f"the event trace at {self._trace} is not writable ({exc}); events are held "
+                    "in memory only and will not be persisted for this process."
+                )
 
     # ── lifecycle ───────────────────────────────────────────────────────────
 

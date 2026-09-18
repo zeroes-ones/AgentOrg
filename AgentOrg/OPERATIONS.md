@@ -44,6 +44,24 @@ than fastest: local concurrency 1, escalation gated, a 3-attempt loop, a $25 run
 | `delegation` | `max_depth` | 3 | longer chains, more compounding | flatter |
 | `delegation` | `budget_share_max` | 0.50 | children may take more | children are cheaper |
 | `delegation` | `span_of_control` | 5 | wider trees | flatter |
+| `executor` | `max_output_tokens` | 32768 | longer artifacts survive whole | cheaper, but a long artifact truncates |
+| `executor` | `max_tool_steps` | 12 | more investigation before answering | answers sooner |
+| `goal` | `auto_pass_auto_gates` | `true` | — | `false` makes every goal wait at a gate |
+| `goal` | `auto_hire_missing` | `true` | — | `false` reports a staffing gap instead |
+| `goal` | `persist_auto_hires` | `false` | auto-created helpers survive on the roster | helpers die with the run |
+
+### `executor.max_output_tokens` is the one that bites hardest
+
+It caps **one model reply**. The default was hardcoded at 4096, which silently truncated any long
+artifact — a PRD, a design doc, a large diff — *before* the model could emit its machine-readable
+trailer. The node then failed its own completion contract with *"declared criteria not covered"*,
+which points at the model while the real cause is this ceiling. Measured on a 1M-token model writing a
+PRD: the reply needed more than 16384 tokens and was still being cut off mid-JSON.
+
+Two things now bound it, so raising it is safe: the model's own declared `max_output` when it has one,
+and never more than **half the context window** (the other half is the prompt). If a run reports
+`finish_reason: length` in the trace, or a node fails with "no parsable trailer", this is the first
+knob to check.
 
 ## Policy tuning
 

@@ -82,6 +82,20 @@ def stack(tmp_path, config, library):
     return orch, ws, bus
 
 
+@pytest.fixture
+def workspace(tmp_path):
+    """A bare project workspace, for the tests that only inspect the on-disk layout.
+
+    Separate from `stack` because these assert the *files*, not a run: which file is the orchestrator's
+    checkpoint and which is the runner's. It was missing, and the runner used here treats an unknown
+    fixture as a skip rather than an error — so two tests pinning the two-writer guarantee were being
+    skipped silently, which is worse than failing.
+    """
+    ws = Workspace.for_project("gateprobe", root=tmp_path / "projects")
+    ws.ensure()
+    return ws
+
+
 def _run_to_gate(orch, ws):
     """Adopt, approve and execute the fixture graph so it parks at the gate."""
     run = orch.adopt(ws.path / "gateprobe.yaml", slug="gateprobe")
@@ -151,15 +165,38 @@ def test_approval_emits_its_event(stack):
 
 
 def test_prepare_plans_binds_and_reports_gaps(stack):
-    """The Owner approves a graph, and sees what it needs before approving it."""
+    """The Owner approves a graph, and sees what it needs before approving it.
+
+    `auto_staff=False` forces the gap to be *reported* rather than filled, which is the honest
+    "show me what is missing" mode — and the one an Owner who declined auto-hiring gets. The
+    auto-staffing path is asserted separately.
+    """
     orch, _, _ = stack
-    run = orch.prepare("Build a booking API with auth and payments", slug="booking")
+    run = orch.prepare("Build a booking API with auth and payments", slug="booking",
+                       auto_staff=False)
     assert run.phase is RunPhase.AWAITING_APPROVAL
     assert run.plan is not None and run.plan.validation.valid
     assert run.manifest_path.is_file()
     assert run.bindings, "a planned run must be bound to the roster"
     assert run.staffing_gaps, "the default company does not staff every skill the planner emits"
     assert all("skill" in gap for gap in run.staffing_gaps)
+
+
+def test_prepare_staffs_the_gaps_by_default(stack):
+    """The other half: with auto-staffing on (the default), a gap is filled, not just reported.
+
+    The plan was already shown to need a capability nobody holds; the engine creates a helper for it
+    on the default model, so the graph the Owner approves is runnable instead of stalling three nodes
+    in. A plan whose gaps are all filled reports none.
+    """
+    orch, _, bus = stack
+    run = orch.prepare("Build a booking API with auth and payments", slug="booking-auto")
+    proposed = [e for e in bus.history() if e.type_value == "manifest.proposed"]
+    assert proposed, "the graph is still proposed for approval"
+    staffed = proposed[-1].payload.get("auto_staffed") or []
+    assert staffed, "a gap nobody holds must be staffed on the default model"
+    assert all("skill" in entry for entry in staffed)
+    assert run.staffing_gaps == [], "the gaps were filled, so none remain"
 
 
 def test_prepare_reports_gaps_to_the_ui(stack):
@@ -408,3 +445,222 @@ def test_a_run_tolerates_an_unknown_field_on_reload(stack):
     data = run.as_dict()
     data["future_field"] = {"nested": True}
     assert Run.from_dict(data, workspace=ws).slug == run.slug
+
+
+# ── why a run stopped: the difference between "blocked" and understanding ─────
+
+
+def test_stop_reason_explains_a_guardrail_block():
+    """The reported failure: a run ended `pm = blocked / guardrail-blocked` with no explanation.
+
+    The runner logs the reason; `_derive_stop_reason` must lift it into one actionable line.
+    """
+    from engine.orchestrator import _derive_stop_reason
+
+    class Outcome:
+        killed = False
+        error = ""
+
+    state = {
+        "outcome": "guardrail-block", "phase": "escalated",
+        "nodes": {"pm": {"status": "blocked", "verdict": "guardrail-blocked",
+                         "summary": "instruction-shaped phrase at summary"}},
+        "log": [{"step": 1, "node": "pm", "action": "guardrail",
+                 "detail": "a hand-off payload was blocked"}],
+    }
+    reason = _derive_stop_reason(state, Outcome(), {"outcome": "guardrail-block"})
+    assert "pm" in reason
+    assert "guardrail" in reason
+    assert "blocked" in reason
+
+
+def test_stop_reason_names_a_blocked_node_and_its_own_words():
+    from engine.orchestrator import _derive_stop_reason
+
+    class Outcome:
+        killed = False
+        error = ""
+
+    state = {
+        "outcome": "incomplete", "nodes": {
+            "architect": {"status": "blocked", "verdict": "missing_prerequisites",
+                          "summary": "needs the product spec first"}},
+        "log": [],
+    }
+    reason = _derive_stop_reason(state, Outcome(), {})
+    assert "architect" in reason and "missing_prerequisites" in reason
+    assert "needs the product spec first" in reason
+
+
+def test_stop_reason_is_empty_for_a_clean_run():
+    from engine.orchestrator import _derive_stop_reason
+
+    class Outcome:
+        killed = False
+        error = ""
+
+    assert _derive_stop_reason({"outcome": "complete", "log": [], "nodes": {}}, Outcome(), {}) == ""
+
+
+def test_settle_preserves_the_node_summary(stack):
+    """A node's summary is why it is not done; keeping only status/verdict loses the reason."""
+    orch, ws, _ = stack
+    run = _run_to_gate(orch, ws)
+    record = (run.outcome.get("nodes") or {}).get("dev") or {}
+    assert "summary" in record, "the per-node summary must survive settling"
+    assert record["summary"], "the stub reported a summary; it must not be dropped"
+
+
+def test_run_as_dict_carries_the_stop_reason(stack):
+    orch, ws, _ = stack
+    run = orch.adopt(ws.path / "gateprobe.yaml")
+    run.stop_reason = "dev is blocked (guardrail-blocked)"
+    assert Run.from_dict(run.as_dict(), workspace=ws).stop_reason == run.stop_reason
+
+
+# ── an attached project keeps its own state ──────────────────────────────────
+
+
+def test_a_run_on_an_attached_project_writes_state_into_it(tmp_path, config, library):
+    """The split-brain bug: run state landed in a sibling `root/<slug>` dir while the trace landed in
+    the attached folder — so `status`, reading the folder, saw no run and showed an idle project."""
+    project = tmp_path / "MyProject"
+    project.mkdir()
+    (project / ".git").mkdir()
+    ws = Workspace.attach(project)
+    ws.ensure()
+    orch = Orchestrator(config=config, library=library, workspace=ws,
+                        bus=EventBus(run_id="r", history_size=200))
+
+    run = orch.prepare("use the CEO skill and capture market")
+
+    # The checkpoint, the manifest and the state directory are all inside the attached folder.
+    assert run.workspace.path == project.resolve()
+    assert run.workspace.checkpoint_path.is_file()
+    assert run.manifest_path.parent == project.resolve()
+    # And nothing leaked into a sibling directory named after the slug.
+    assert not (tmp_path / run.slug).exists()
+
+
+def test_the_runner_checkpoint_and_the_orchestrator_checkpoint_are_different_files(workspace):
+    """They must not share `run_state.json`, or continuation restarts the whole graph.
+
+    The bug this pins is the worst kind: both sides wrote `run_state.json`, in turn, with
+    incompatible shapes. The runner writes `{workflow, manifest_sha, nodes}`; the orchestrator writes
+    `{run_id, phase, gate, outcome, …}`. So after the orchestrator's post-run write, the runner's
+    `load_state` found no `workflow`/`manifest_sha` and returned None — meaning **every continuation
+    restarted from scratch** and re-ran the node that had just failed. Approving a gate therefore
+    re-hit the identical contract violation and parked again, for ever. That is precisely the
+    "it keeps rejecting at some point" report.
+    """
+    assert workspace.checkpoint_path != workspace.runner_state_path
+    assert workspace.runner_state_path.name == "runner_state.json"
+    assert workspace.checkpoint_path.name == "run_state.json"
+
+
+def test_the_orchestrator_write_does_not_destroy_the_runners_checkpoint(workspace, stack):
+    """The property that makes resume possible: one writer per file."""
+    import json
+
+    orch, ws, _ = stack
+    ws.runner_state_path.write_text(json.dumps({
+        "workflow": "gateprobe", "manifest_sha": "abc123",
+        "nodes": {"dev": {"status": "done", "verdict": "ok"}}}))
+
+    run = orch.adopt(ws.path / "gateprobe.yaml", slug="gateprobe")
+    orch._persist(run)          # the orchestrator's own checkpoint write
+
+    runner = json.loads(ws.runner_state_path.read_text())
+    assert runner["workflow"] == "gateprobe", "the runner's checkpoint must survive intact"
+    assert runner["manifest_sha"] == "abc123"
+    assert "dev" in runner["nodes"], "the completed node must still be recorded, or resume redoes it"
+    # And the orchestrator's own file was written.
+    assert json.loads(ws.checkpoint_path.read_text())["run_id"] == run.run_id
+
+
+def test_approving_the_start_node_advances_the_run_instead_of_reparking(stack):
+    """The deepest defect behind "it keeps rejecting at some point".
+
+    Three faults hid behind one symptom. (1) The orchestrator and the runner shared `run_state.json`,
+    so the orchestrator's write destroyed the runner's `{workflow, manifest_sha, nodes}` shape and
+    every continuation restarted the graph. (2) With that fixed, the runner's frontier is `[start]`
+    unless `start` is terminal — and an *approved* start node is terminal — so a resume had no
+    frontier and re-escalated. (3) Repointing `start` alone makes the earlier nodes unreachable from
+    `start`, which the library's validator refuses (`nodes not reachable from start`), surfacing as
+    `the runner exited 1`.
+
+    The fix releases the node in the checkpoint, moves the manifest's `start` to its successor, and
+    prunes the finished node so the graph stays reachable. This test pins the manifest half, because
+    that is the part that must satisfy the library's own validator.
+    """
+    import re
+
+    orch, ws, _ = stack
+    manifest = ws.path / "gateprobe.yaml"
+    text = manifest.read_text()
+    assert re.search(r"^start:\s*dev\s*$", text, re.M), "the fixture starts at dev"
+
+    orch._advance_manifest_past(manifest, released="dev", successor="release")
+    rewritten = manifest.read_text()
+    assert re.search(r"^start:\s*release\s*$", rewritten, re.M), "start must move to the successor"
+    assert "- id: dev" not in rewritten, "the finished node must be pruned for reachability"
+    assert "- from: dev" not in rewritten, "and its edges with it"
+    assert "- id: release" in rewritten, "the successor must survive"
+
+
+def test_releasing_a_gate_marks_the_node_done_for_downstream(stack):
+    """`done`, not `needs_review`: the Owner accepted the work, so downstream may rely on it."""
+    import json
+
+    orch, ws, _ = stack
+    run = orch.adopt(ws.path / "gateprobe.yaml", slug="gateprobe")
+    orch.approve(run)
+    orch.execute(run, executor=ws.path / "stub.py")
+    assert run.gate is not None and run.gate.gate_id == "release"
+
+    # The runner checkpoint carries the node the gate judged, still not-done.
+    ws.runner_state_path.write_text(json.dumps({
+        "workflow": "gateprobe", "manifest_sha": "x",
+        "nodes": {"dev": {"status": "needs_review", "verdict": "awaiting_owner"}}}))
+    # The gate's dossier names the node it parked on — that is how the release finds it.
+    run.gate.dossier = {"node": "dev"}
+    orch._release_node_for_resume(run, run.gate)
+    state = json.loads(ws.runner_state_path.read_text())
+    assert state["nodes"]["dev"]["status"] == "done"
+    assert state["phase"] == "ready"
+
+
+def test_a_runner_shaped_checkpoint_is_not_a_resumable_run(stack):
+    """`status` crashed with a schema error on a workspace whose run_state.json was the runner's.
+
+    Both sides used to write `run_state.json`, so on a workspace that ran before they were separated
+    the orchestrator's checkpoint is gone — replaced by the runner's `{workflow, manifest_sha, nodes}`
+    shape, which carries no `run_state_version`. The registry refused it with "no migration path for
+    run_state from 0.0.0 to 1.0.0", and because `load` raised, `status`, `decide` and `instruct` all
+    failed on a project whose node outcomes the Flow panel was displaying without trouble. Returning
+    None is the right answer: the document is not ours, so it is not a schema violation to report.
+    """
+    import json
+
+    orch, ws, _ = stack
+    ws.checkpoint_path.write_text(json.dumps({
+        "workflow": "gateprobe", "manifest_sha": "a69609c3426b",
+        "nodes": {"dev": {"status": "needs_review", "verdict": "contract-violation"}},
+    }))
+
+    assert orch.load("gateprobe") is None, "the runner's checkpoint is not our run"
+
+
+def test_a_genuinely_ours_checkpoint_is_still_version_checked(stack):
+    """The runner-shape guard must not swallow a document that *is* ours but from a newer schema."""
+    import json
+
+    orch, ws, _ = stack
+    # A future checkpoint carries both our markers and an impossible version.
+    ws.checkpoint_path.write_text(json.dumps({
+        "run_id": "run_x", "run_phase_version": "1.0.0",
+        "run_state_version": "9.0.0", "phase": "running",
+    }))
+
+    with pytest.raises(OrchestratorError, match="cannot open this run"):
+        orch.load("gateprobe")

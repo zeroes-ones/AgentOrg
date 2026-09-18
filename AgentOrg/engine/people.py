@@ -112,16 +112,28 @@ class People:
 
     # ── loading and merging ─────────────────────────────────────────────────
 
-    def load(self, *, project: Path | str | None = None) -> Org:
+    def load(self, *, project: Path | str | None = None, org_id: str = "",
+             principal_id: str = "", name: str = "") -> Org:
         """Build the effective roster: built-ins, then global, then project.
 
         Later sources win per agent *name*, not per file, so a project that hires one specialist keeps
         every global agent too.
+
+        `org_id`, `principal_id` and `name` identify the org this roster belongs to when it is one of
+        several in a portfolio. They are applied to the *base* company so the identity survives even a
+        roster file that predates it — a portfolio must be able to find an org it registered before
+        this field existed.
         """
         self.loaded_from = []
         if project is not None:
             self.project = project
         org = self._base_company()
+        if org_id:
+            org.id = org_id
+        if principal_id:
+            org.principal_id = principal_id
+        if name:
+            org.name = name
         # Lowest priority last: apply global, then project, so the project overwrites.
         for root in reversed(usercfg.roots(project=project)):
             path = root / "roster.json"
@@ -133,6 +145,10 @@ class People:
                 raise HireError(f"roster at {path} could not be read: {exc}") from exc
             self._merge(org, extra)
             self.loaded_from.append(str(path))
+        # A roster file that carried its own identity wins over the caller's hint, because the file is
+        # what a person actually edited; the hint only fills a blank.
+        org.id = org.id or org_id
+        org.principal_id = org.principal_id or principal_id
         self.org = org
         return org
 
@@ -189,6 +205,13 @@ class People:
 
         provider = request.provider or str(self.config.defaults.get("provider") or "ollama")
         model = request.model or str(self.config.defaults.get("model") or "")
+        # Fall back to the *one resolved default* rather than a second, hardcoded guess. Before this,
+        # a hire with no explicit model used `config.defaults` while the built-in company used its own
+        # fallback — so "the default unless I specify" was two different answers.
+        if not model:
+            pair_provider, pair_model, _reason = self.config.default_pair()
+            provider = request.provider or pair_provider or provider
+            model = pair_model
         window = request.context_window or self._window_for(provider, model)
         if not window:
             raise HireError(
@@ -462,12 +485,19 @@ def _is_owner_hired(spec: Any) -> bool:
 
     `origin` is the engine's own provenance field, so this asks the model rather than guessing from a
     name or an id scheme.
+
+    `origin="goal"` counts. It is an agent the engine created **on the goal's authority** — the
+    "create the person if they do not exist" path — and once the goal asked for it to be persisted it
+    is exactly as durable as a manual hire. Excluding it meant `persist_auto_hires` reported success
+    and wrote an empty roster: the helper did the work, the log said it was saved, and it was gone
+    next run. `ephemeral` is the one origin deliberately not persisted.
     """
     if isinstance(spec, dict):
         if spec.get("kind") == "human":
             return False
-        return spec.get("origin") == "owner"
-    return not getattr(spec, "is_human", False) and getattr(spec, "origin", "") == "owner"
+        return spec.get("origin") in ("owner", "goal")
+    return (not getattr(spec, "is_human", False)
+            and getattr(spec, "origin", "") in ("owner", "goal"))
 
 
 def _new_id(name: str, org: Org) -> str:

@@ -123,14 +123,75 @@ final class OrgControllerTests: XCTestCase {
             XCTAssertFalse(tab.question.isEmpty, "\(tab) has no question")
             XCTAssertTrue(tab.question.hasSuffix("?"), "\(tab)'s question should be a question")
         }
-        // Eight views now: the original five, plus People (who can I hire), Providers (which models can
-        // I reach) and Improve (what does the system think is wrong with itself). Each still answers
-        // exactly one question — the count is asserted so adding a tab without a question is caught here
-        // rather than becoming a panel nobody can describe.
-        XCTAssertEqual(ConsoleTab.allCases.count, 8, "eight views, one question each")
+        // Eleven views now: the original five, plus People (who can I hire), Providers (which models
+        // can I reach), Improve (what does the system think is wrong with itself), Activity (what is
+        // happening, why, and what do I do next), Flow (who is working on what, and what crossed
+        // between them) and Portfolio (which orgs am I running). Each still answers exactly one
+        // question — the count is asserted so adding a tab without a question is caught here rather
+        // than becoming a panel nobody can describe.
+        XCTAssertEqual(ConsoleTab.allCases.count, 11, "eleven views, one question each")
         XCTAssertTrue(ConsoleTab.allCases.contains(.people))
         XCTAssertTrue(ConsoleTab.allCases.contains(.providers))
         XCTAssertTrue(ConsoleTab.allCases.contains(.improve))
+        XCTAssertTrue(ConsoleTab.allCases.contains(.activity))
+        XCTAssertTrue(ConsoleTab.allCases.contains(.flow))
+        XCTAssertTrue(ConsoleTab.allCases.contains(.portfolio), "the portfolio comes first")
+    }
+
+    func testThePortfolioTabIsFirstAndDescribesItself() {
+        // The whole picture precedes any single org, because every other tab is a view *within* one.
+        XCTAssertEqual(ConsoleTab.allCases.first, .portfolio)
+        XCTAssertEqual(ConsoleTab.portfolio.rawValue, "Portfolio")
+        XCTAssertFalse(ConsoleTab.portfolio.symbol.isEmpty)
+    }
+
+    func testThePortfolioStartsEmpty() {
+        let controller = makeController(root: FileManager.default.temporaryDirectory)
+        XCTAssertFalse(controller.hasPortfolio)
+        XCTAssertTrue(controller.portfolioOrgs.isEmpty)
+        XCTAssertTrue(controller.portfolioRows.isEmpty)
+        XCTAssertEqual(controller.activeOrgId, "")
+    }
+
+    /// The Activity panel's derived data, which is what the app actually reads.
+    func testStaffingGapsAreReadFromTheActivityReport() {
+        let controller = makeController(root: FileManager.default.temporaryDirectory)
+        // With no engine the report is empty, so the panel shows nothing rather than stale rows.
+        XCTAssertTrue(controller.staffingGaps.isEmpty)
+    }
+
+    func testTheMissionStartsEmpty() {
+        // The mission travels with status; before any poll it is empty rather than fabricated.
+        let controller = makeController(root: FileManager.default.temporaryDirectory)
+        XCTAssertTrue(controller.mission.isEmpty)
+    }
+
+    func testTheActivityTabIsAFirstClassPanel() {
+        // The panel exists because "I do not know what is happening" is the real complaint about an
+        // autonomous org, so it must be reachable and must describe itself.
+        XCTAssertTrue(ConsoleTab.allCases.contains(.activity))
+        XCTAssertEqual(ConsoleTab.activity.rawValue, "Activity")
+        XCTAssertTrue(ConsoleTab.activity.question.hasSuffix("?"))
+        XCTAssertFalse(ConsoleTab.activity.symbol.isEmpty)
+    }
+
+    func testTheFlowTabAnswersWhoIsWorkingOnWhat() {
+        // The board is a distinct question from the Activity story — *who is on what, and what crossed
+        // between them* — so it must be reachable and must describe itself.
+        XCTAssertTrue(ConsoleTab.allCases.contains(.flow))
+        XCTAssertEqual(ConsoleTab.flow.rawValue, "Flow")
+        XCTAssertTrue(ConsoleTab.flow.question.hasSuffix("?"))
+        XCTAssertTrue(ConsoleTab.flow.question.contains("what"))
+        XCTAssertFalse(ConsoleTab.flow.symbol.isEmpty)
+    }
+
+    func testTheFlowBoardStartsEmpty() {
+        // The board travels with status; before any poll it is empty rather than fabricated, so the
+        // panel shows a calm "no work yet" rather than stale rows.
+        let controller = makeController(root: FileManager.default.temporaryDirectory)
+        XCTAssertTrue(controller.flowRows.isEmpty)
+        XCTAssertTrue(controller.flowHandoffs.isEmpty)
+        XCTAssertEqual(controller.defaultPairLabel, "not set")
     }
 
     func testCommandsWithNoEngineAreRefusedRatherThanSilentlyDropped() async {

@@ -176,6 +176,18 @@ public final class AgentProcessService: @unchecked Sendable {
     private var _lastError: EngineError?
     private var _pid: Int32?
 
+    /// Whether the child has sent `engine.ready` — the proof it is actually usable.
+    ///
+    /// A process that is *spawned* is not an engine that *works*: a configuration or bootstrap failure
+    /// is a process that exists for a moment and exits. Without this flag the app called that moment
+    /// "running", printed a pid, and left the UI looking healthy while nothing ran. So `.running` is
+    /// only published once this is true; before it, the state stays `.launching`.
+    private var _ready = false
+    /// The reason reported by a fatal `error` frame, kept so the exit can say *why* rather than only
+    /// "status 1". Set from the frame, which the child writes to stdout precisely so the app can read
+    /// it before the exit.
+    private var _fatalReason: String?
+
     /// Called on the main queue when the state changes. The UI subscribes here.
     public var onStateChange: (@Sendable (EngineState) -> Void)?
     /// Called on a background queue for each decoded event.
@@ -188,6 +200,8 @@ public final class AgentProcessService: @unchecked Sendable {
     public var state: EngineState { stateLock.withLock { _state } }
     public var lastError: EngineError? { stateLock.withLock { _lastError } }
     public var pid: Int32? { stateLock.withLock { _pid } }
+    /// Whether the engine has confirmed it is usable (sent `engine.ready`).
+    public var isReady: Bool { stateLock.withLock { _ready } }
 
     // MARK: - Process state
 
@@ -250,10 +264,8 @@ public final class AgentProcessService: @unchecked Sendable {
         process.standardError = errPipe
         process.standardInput = Pipe()
 
-        let decoder = LineDecoder()
-        let errorDecoder = LineDecoder()
-        stdoutDecoder = decoder
-        stderrDecoder = errorDecoder
+        stdoutDecoder = LineDecoder()
+        stderrDecoder = LineDecoder()
 
         // A `readabilityHandler` fires *repeatedly* with empty data once the pipe reaches EOF, so a
         // handler that simply returns on empty data busy-loops for as long as the file handle lives —
@@ -265,12 +277,7 @@ public final class AgentProcessService: @unchecked Sendable {
                 handle.readabilityHandler = nil
                 return
             }
-            for frame in decoder.append(data) {
-                switch frame {
-                case .event(let event): self?.dispatch(event)
-                case .unparsable(let text): self?.onUnparsable?(text)
-                }
-            }
+            self?.consumeStdout(data)
         }
 
         // stderr: diagnostics. A separate decoder, because interleaving the two streams would corrupt
@@ -281,22 +288,38 @@ public final class AgentProcessService: @unchecked Sendable {
                 handle.readabilityHandler = nil
                 return
             }
-            for frame in errorDecoder.append(data) {
-                switch frame {
-                case .event(let event): self?.onDiagnostic?(event.type)
-                case .unparsable(let text): self?.onDiagnostic?(text)
-                }
-            }
+            self?.consumeStderr(data)
         }
 
         process.terminationHandler = { [weak self] finished in
             guard let self else { return }
+            // **Drain before detaching.** The child may have written its fatal `error` frame to stdout
+            // and exited in the same instant; a handler removed first would discard that frame and the
+            // app would only have "status 1". So the remaining bytes are read and dispatched *before*
+            // the handlers are torn down, which is what makes the reason survive the exit.
+            self.drain(outPipe: outPipe, errPipe: errPipe)
             self.detachHandlers(outPipe: outPipe, errPipe: errPipe)
+
             // A non-zero exit with no prior terminal state is a failure, not a clean finish. Reporting
             // it as `finished` would hide a crash.
             let code = finished.terminationStatus
-            let error = code == 0 ? nil : EngineError(
-                .launchFailed, "the engine exited with status \(code)")
+            let fatal = self.stateLock.withLock { self._fatalReason }
+            let error: EngineError?
+            if code == 0 {
+                error = nil
+            } else if let fatal, !fatal.isEmpty {
+                // The engine told us why. This is the message a person needs, not "status 1".
+                error = EngineError(.launchFailed, fatal)
+            } else if !self.isReady {
+                // Exited non-zero without ever becoming ready and without a stated reason: it never
+                // started successfully. Say that, rather than implying a run had been under way.
+                error = EngineError(
+                    .launchFailed,
+                    "the engine exited (status \(code)) before it finished starting. "
+                    + "Run `engine.cli doctor` to see what failed.")
+            } else {
+                error = EngineError(.launchFailed, "the engine exited with status \(code)")
+            }
             self.setState(code == 0 ? .finished : .failed, error: error)
             self.failPendingCommands(EngineError(.notRunning, "the engine stopped"))
         }
@@ -313,8 +336,14 @@ public final class AgentProcessService: @unchecked Sendable {
         }
 
         self.process = process
-        stateLock.withLock { _pid = process.processIdentifier }
-        setState(.running)
+        stateLock.withLock {
+            _pid = process.processIdentifier
+            // A fresh process is *not* ready: readiness is the `engine.ready` frame, not this spawn.
+            _ready = false
+            _fatalReason = nil
+        }
+        // Deliberately left `.launching`. The `.running` transition happens in `dispatch` when the
+        // readiness frame arrives — so a process that dies during bootstrap is never shown as running.
     }
 
     /// Stop the engine, checkpoint first.
@@ -407,6 +436,20 @@ public final class AgentProcessService: @unchecked Sendable {
     // MARK: - Event handling
 
     private func dispatch(_ event: EngineEvent) {
+        // The readiness handshake. This is what turns `.launching` into `.running`, so a process that
+        // was spawned but never became usable is *never* reported as running — the bug where the app
+        // claimed "engine running (pid …)" for an engine that had already died.
+        if event.type == "engine.ready" {
+            stateLock.withLock { _ready = true }
+            setState(.running)
+        }
+        // A fatal frame carries the reason the engine is about to exit. Recorded here, before the exit,
+        // so the termination handler can report *why* instead of a bare status code. The child writes
+        // this to stdout for exactly this reason: stderr never reaches the app's state.
+        if event.type == "error", event.payload["fatal"]?.boolValue == true {
+            let message = event.payload["message"]?.stringValue ?? "the engine reported a fatal error"
+            stateLock.withLock { _fatalReason = message }
+        }
         // A `command.ack` resolves the awaiting caller; every other event is the UI's.
         if event.type == "command.ack", let cmdId = event.payload["cmd_id"]?.stringValue {
             let waiter: PendingCommand? = pendingLock.withLock { pending.removeValue(forKey: cmdId) }
@@ -441,6 +484,46 @@ public final class AgentProcessService: @unchecked Sendable {
         errPipe.fileHandleForReading.readabilityHandler = nil
     }
 
+    /// Decode and dispatch a chunk from the child's stdout.
+    ///
+    /// Split out of the `readabilityHandler` so the same decoding runs both for a live read and for the
+    /// final drain at exit — one code path, so a frame cannot be handled one way while running and
+    /// another way while dying.
+    private func consumeStdout(_ data: Data) {
+        for frame in stdoutDecoder.append(data) {
+            switch frame {
+            case .event(let event): dispatch(event)
+            case .unparsable(let text): onUnparsable?(text)
+            }
+        }
+    }
+
+    /// Decode and forward a chunk from the child's stderr (diagnostics).
+    private func consumeStderr(_ data: Data) {
+        for frame in stderrDecoder.append(data) {
+            switch frame {
+            case .event(let event): onDiagnostic?(event.type)
+            case .unparsable(let text): onDiagnostic?(text)
+            }
+        }
+    }
+
+    /// Read whatever remains on both pipes and dispatch it, before the process is torn down.
+    ///
+    /// The child can write its last frames — most importantly a fatal `error` frame — and exit in the
+    /// same instant. The `readabilityHandler` may not have fired for those bytes yet, and the
+    /// termination handler used to detach the handlers first, discarding them. This synchronous read
+    /// closes that race: whatever the child managed to write is decoded before the pipes are closed.
+    ///
+    /// `readDataToEndOfFile` is bounded by the child having exited (its write end is closed), so it
+    /// cannot block indefinitely.
+    private func drain(outPipe: Pipe, errPipe: Pipe) {
+        let remainingOut = outPipe.fileHandleForReading.readDataToEndOfFile()
+        if !remainingOut.isEmpty { consumeStdout(remainingOut) }
+        let remainingErr = errPipe.fileHandleForReading.readDataToEndOfFile()
+        if !remainingErr.isEmpty { consumeStderr(remainingErr) }
+    }
+
     private func setState(_ new: EngineState, error: EngineError? = nil) {
         stateLock.withLock {
             _state = new
@@ -463,6 +546,7 @@ public final class AgentProcessService: @unchecked Sendable {
         if let pid { info["pid"] = String(pid) }
         if let error = lastError { info["error"] = error.message }
         if case .system(let url) = config.runtime { info["python"] = url.path }
+        info["ready"] = isReady ? "yes" : "no"
         return info
     }
 }

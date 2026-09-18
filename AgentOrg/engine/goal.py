@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
-    "GoalError", "GoalState", "GoalSpend", "Goal", "GoalDecision",
+    "GoalError", "GoalState", "GoalSpend", "Goal", "GoalDecision", "GoalPolicy",
     "GOAL_FILENAME", "GOAL_VERSION", "DECISION_FILENAME",
 ]
 
@@ -129,6 +129,58 @@ class GoalSpend:
 
 
 @dataclass
+class GoalPolicy:
+    """What a goal is authorised to decide on its own.
+
+    The person asked for a tool they can leave running, so the polarity is **autonomous unless a human
+    gate was chosen**. Three switches, and the reasoning for each:
+
+    - ``auto_approve`` — may a gate the *org* can decide be passed without asking. A **terminal** gate
+      (release, close, spend) is never passed, whatever this says: that authority is not delegable.
+    - ``auto_hire`` — may a staffing gap be closed by spawning a helper on the default model, rather
+      than parking the run. The work is what the objective asked for; the gap is an administrative
+      accident of the roster, not a decision.
+    - ``persist_hires`` — does that helper become a durable roster entry, or stay ephemeral. Off by
+      default: an ephemeral subagent leaves nothing to clean up.
+    - ``human_gate`` — the master switch. When set, no gate is passed and no helper is spawned; the run
+      parks exactly as it did before. This is the "I want to be involved" choice, stated per goal.
+    """
+
+    auto_approve: bool = True
+    auto_hire: bool = True
+    persist_hires: bool = False
+    human_gate: bool = False
+
+    def effective(self) -> "GoalPolicy":
+        """The policy with `human_gate` applied, so callers never repeat the override."""
+        if not self.human_gate:
+            return self
+        return GoalPolicy(auto_approve=False, auto_hire=False,
+                          persist_hires=self.persist_hires, human_gate=True)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"auto_approve": self.auto_approve, "auto_hire": self.auto_hire,
+                "persist_hires": self.persist_hires, "human_gate": self.human_gate}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "GoalPolicy":
+        """Read a policy, tolerating a document written before it existed.
+
+        An older goal.json has no `policy` key; the defaults apply, which are the autonomous ones. That
+        is deliberate: a goal set before this feature should keep behaving, and the person who set it
+        chose no human gate.
+        """
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            auto_approve=bool(data.get("auto_approve", True)),
+            auto_hire=bool(data.get("auto_hire", True)),
+            persist_hires=bool(data.get("persist_hires", False)),
+            human_gate=bool(data.get("human_gate", False)),
+        )
+
+
+@dataclass
 class Goal:
     """One durable objective, and everything needed to resume it honestly.
 
@@ -156,12 +208,15 @@ class Goal:
     slice_spend: GoalSpend = field(default_factory=GoalSpend)
     spend: GoalSpend = field(default_factory=GoalSpend)
     history: list[dict[str, Any]] = field(default_factory=list)
+    #: What this goal may decide without the Owner. See :class:`GoalPolicy`.
+    policy: GoalPolicy = field(default_factory=GoalPolicy)
     version: str = GOAL_VERSION
 
     # ── construction ────────────────────────────────────────────────────────
 
     @classmethod
-    def new(cls, objective: str, *, token_budget: int | None = None) -> "Goal":
+    def new(cls, objective: str, *, token_budget: int | None = None,
+            policy: GoalPolicy | None = None) -> "Goal":
         """A fresh goal, **not yet armed**.
 
         Creating and arming are separate so that `goal set` can record an objective without starting
@@ -170,7 +225,8 @@ class Goal:
         text = (objective or "").strip()
         if not text:
             raise GoalError("a goal needs an objective; an empty one would arm nothing")
-        return cls(objective=text, token_budget=int(token_budget or 0))
+        return cls(objective=text, token_budget=int(token_budget or 0),
+                   policy=policy or GoalPolicy())
 
     # ── transitions ─────────────────────────────────────────────────────────
 
@@ -233,6 +289,25 @@ class Goal:
             self.pause_reason = "restored"
             self._note("paused", "restored: a goal must be explicitly resumed after a reload")
 
+    def adopt(self) -> None:
+        """Take an on-disk `armed` goal as live, for an **explicit** execution request.
+
+        `disarm_on_load` exists to stop a *silent* resume — a process starting up must not begin
+        spending on its own. It also made the CLI unable to drive a goal at all: every command is a new
+        process, so `goal set` armed the goal and the very next `run` disarmed it in memory and never
+        continued it. Only the long-lived `serve` process could drive a loop, because it held the
+        orchestrator across commands.
+
+        This is the narrow counterpart: a caller that is *explicitly executing* (a `run` command, or the
+        console's Start) says so, and the goal it was told about keeps its authority. The safety
+        property is unchanged — nothing resumes without an explicit act, and nothing resumes merely
+        because a process restarted.
+        """
+        if self.state is GoalState.PAUSED and self.pause_reason == "restored":
+            self.state = GoalState.ARMED
+            self.pause_reason = ""
+            self._note("armed", "adopted for an explicit run")
+
     # ── budget ──────────────────────────────────────────────────────────────
 
     def budget_reached(self) -> bool:
@@ -263,6 +338,7 @@ class Goal:
             "slice_spend": self.slice_spend.as_dict(),
             "spend": self.spend.as_dict(),
             "history": list(self.history),
+            "policy": self.policy.as_dict(),
         }
 
     def public(self) -> dict[str, Any]:
@@ -286,6 +362,10 @@ class Goal:
             "slice": self.slice_spend.as_dict(),
             "spend": self.spend.as_dict(),
             "history": list(self.history[-20:]),
+            "policy": self.policy.as_dict(),
+            # The two derived booleans the UI asks about, so no caller re-implements the override.
+            "decides_gates": self.policy.effective().auto_approve,
+            "staffs_gaps": self.policy.effective().auto_hire,
         }
 
     @classmethod
@@ -312,6 +392,7 @@ class Goal:
             slice_spend=GoalSpend.from_dict(data.get("slice_spend")),
             spend=GoalSpend.from_dict(data.get("spend")),
             history=list(data.get("history") or []),
+            policy=GoalPolicy.from_dict(data.get("policy")),
             version=version,
         )
 

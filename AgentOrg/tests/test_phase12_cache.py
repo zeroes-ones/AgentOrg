@@ -315,6 +315,28 @@ def test_two_swarm_voters_share_almost_all_of_their_prompt(source):
     )
 
 
+def test_the_recency_zone_stays_small_so_it_cannot_dilute_the_prefix(source):
+    """The contract must stay compact, because growing it dilutes the cacheable prefix.
+
+    Measured, not stylistic. An attempt to fix a real trailer-completeness failure by pre-filling every
+    criterion and checklist id into the schema grew this zone from ~2.8KB to ~5.6KB and dropped the
+    stable-prefix ratio from 0.90/0.88/0.85 to 0.82/0.79/0.75 — below the floor asserted above, i.e. a
+    cache regression bought with no proven benefit. The contract shapes the reply and must say what it
+    needs; the *criteria themselves* belong in the completion block in the body, where every node reads
+    them once. This pins the budget so the same mistake is a failing test next time rather than a
+    silent cost increase.
+    """
+    builder = PromptBuilder()
+    for skill in ("backend-developer", "system-architect", "code-reviewer"):
+        bundle = source.load(skill)
+        prompt = builder.node_prompt(bundle, TaskContext(node_id="a", instruction="x"),
+                                     agent_name="A", agent_skill=skill)
+        assert len(prompt.recency) < 3500, (
+            f"{skill}: the recency zone is {len(prompt.recency)} chars. It is the last thing the model "
+            "reads and it sits inside the cacheable prefix; keep it to the contract and its rules."
+        )
+
+
 def test_the_identity_is_still_stated(source):
     """Cache alignment must not have been bought by dropping who the agent is."""
     builder = PromptBuilder()

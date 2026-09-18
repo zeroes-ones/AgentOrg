@@ -163,7 +163,32 @@ def test_output_contract_requires_verdict_for_a_reviewer(reviewer):
 
 def test_output_contract_states_that_no_evidence_is_not_done(reviewer):
     prompt = PromptBuilder().node_prompt(reviewer, _review_task())
-    assert "empty `criteria_satisfied`" in prompt.recency
+    assert "nothing was verified" in prompt.recency
+    assert "blocked result, not a done one" in prompt.recency
+
+
+def test_output_contract_mandates_an_entry_per_criterion_not_just_per_id(developer):
+    """The checklist got a per-id mandate; the criteria did not, and a run failed on exactly that.
+
+    A real `pm` node reported *one* criterion out of three — because the contract named all twelve
+    checklist ids but gave `criteria_satisfied` only a one-item example — and the node failed its own
+    contract, parking the whole run on its first node. The rule must now be stated with equal force.
+
+    It points at the `## COMPLETION CRITERIA` block rather than repeating the criteria here, and that
+    is deliberate: this is the measured recency zone, and duplicating ~1.3KB of criteria into it
+    diluted the cacheable prefix below the floor asserted by
+    `test_phase12_cache.test_the_prompt_prefix_is_stable_across_different_tasks`.
+    """
+    prompt = PromptBuilder().node_prompt(developer, _review_task(is_reviewer=False))
+    assert "Include an entry in `criteria_satisfied` for **every** criterion" in prompt.recency
+    assert "One entry is not coverage" in prompt.recency
+    assert "`## COMPLETION CRITERIA`" in prompt.recency
+    # And the checklist mandate is still there — the fix adds, it does not replace.
+    assert "Include an entry in `checklist` for **every** id" in prompt.recency
+    # The criteria are enumerated once, in the body, where every node reads them.
+    assert "## COMPLETION CRITERIA" in prompt.body
+    for criterion in developer.contract.criteria:
+        assert criterion in prompt.body, f"criterion {criterion!r} must be named in the body"
 
 
 # ── enforcement: every id and criterion is named ─────────────────────────────
@@ -424,6 +449,24 @@ def test_extract_trailer_raises_when_required_and_absent():
         extract_trailer("just prose, no json")
 
 
+def test_extract_trailer_rejects_a_json_object_that_is_not_a_trailer():
+    """An arbitrary JSON blob is not the result trailer, and accepting one hid a real failure.
+
+    A node answered with a JSON object shaped like its own *intake* block — `task`, `received`, `owed`,
+    `assumptions`, `open_questions` — and nothing else. The old extractor returned it because it was a
+    dict, so the engine recorded a parsed trailer with zero criteria coverage and failed the node's
+    contract, while the log claimed the trailer had parsed. The reply must be refused as *not a
+    trailer*, which is the honest diagnosis and the one a repair can act on.
+    """
+    intake_shaped = '```json\n{"task": "x", "received": {}, "owed": {}, "assumptions": {}}\n```'
+    with pytest.raises(TrailerError, match="no parsable JSON trailer"):
+        extract_trailer(intake_shaped)
+    assert extract_trailer(intake_shaped, require=False) is None
+    # A genuine trailer — even a minimal one — is still accepted.
+    assert extract_trailer('```json\n{"status": "done"}\n```')["status"] == "done"
+    assert extract_trailer('```agentorg\n{"checklist": []}\n```')["checklist"] == []
+
+
 def test_extract_trailer_returns_none_when_lenient():
     assert extract_trailer("just prose", require=False) is None
 
@@ -473,3 +516,35 @@ def test_prompt_and_parser_agree_on_the_schema_keys(reviewer):
     for key in ("status", "summary", "criteria_satisfied", "checklist", "findings",
                 "artifacts", "decisions", "open_questions"):
         assert key in schema, f"the prompt's schema omits {key}, which the parser expects"
+
+
+def test_extract_trailer_handles_a_nested_fence_inside_the_json():
+    """A trailer whose `artifacts[].content` embeds ``` fences must still parse.
+
+    This is the defect behind a real, reproduced failure. A model returned a complete, valid 53KB
+    trailer whose markdown artifact contained its own Gherkin fence. The extractor used a non-greedy
+    `(.*?)` up to the next ```, so it stopped *inside* the JSON, the parse failed, and the engine
+    reported "no parsable JSON trailer" — failing the node's contract on work that was actually
+    correct. The fence body is now delimited by balanced braces.
+    """
+    body = {
+        "status": "done",
+        "criteria_satisfied": [{"criterion": "c1", "satisfied": True, "evidence": "x"}],
+        "artifacts": [{
+            "type": "product-spec",
+            "path": "specs/prd.md",
+            "content": "## Stories\n\n```gherkin\nScenario: a user logs in\n  Given a user\n```\n\nDone.",
+        }],
+    }
+    text = "Prose first.\n\n```agentorg\n" + json.dumps(body) + "\n```\n"
+    payload = extract_trailer(text)
+    assert payload["status"] == "done"
+    assert payload["artifacts"][0]["path"] == "specs/prd.md"
+    assert "gherkin" in payload["artifacts"][0]["content"]
+
+
+def test_extract_trailer_handles_braces_inside_a_json_string():
+    """Brace counting must respect string literals, or a `}` in content closes the object early."""
+    body = {"status": "done", "summary": "a dict literal like {\"k\": 1} and a closing } brace"}
+    text = "```agentorg\n" + json.dumps(body) + "\n```\n"
+    assert extract_trailer(text)["summary"].endswith("brace")

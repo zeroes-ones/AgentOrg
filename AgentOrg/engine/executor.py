@@ -128,12 +128,52 @@ class ExecutorContext:
     # The prefixes pinned for this run. A skill edited mid-run must not silently change the bytes a
     # running session sends, or the cache goes cold with nothing reporting why.
     pins_for_prefix: Any = None
-    max_output_tokens: int = 4096
+    #: The ceiling on one model reply, in tokens. Resolved once, at construction, from the bound
+    #: model's declared `max_output`, then the config's `executor.max_output_tokens`, then a floor.
+    #:
+    #: The hardcoded 4096 this replaced truncated long artifacts *before* the trailer, so a capable
+    #: model looked like it was refusing to satisfy its contract when in fact its reply was cut off.
+    max_output_tokens: int = 32768
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def __post_init__(self) -> None:
         if self.store is None:
             self.store = ArtifactStore(workspace_root=self.workspace)
+        self.max_output_tokens = self._resolve_max_output()
+
+    def _resolve_max_output(self) -> int:
+        """The output ceiling for this run, preferring what the model actually supports.
+
+        A model that declares a larger output should be allowed to use it: the artifact is what the
+        contract is judged on, and truncating it fails the node for a reason the model cannot see.
+        The *context window* is the natural bound — an output cannot exceed what the model accepts —
+        so a window that is smaller than the configured ceiling caps the answer rather than risking a
+        provider-side rejection.
+        """
+        ceiling = 0
+        if self.org is not None:
+            for agent in self.org.agents.values():
+                if agent.is_ai and agent.max_output:
+                    ceiling = max(ceiling, int(agent.max_output))
+        if not ceiling and self.config is not None:
+            section = getattr(self.config, "executor", None)
+            ceiling = int(getattr(section, "max_output_tokens", 0) or 0)
+        if not ceiling:
+            ceiling = 32768
+        # Never ask for more output than the model's own window can hold, or the provider rejects the
+        # whole call — a worse failure than a shorter answer.
+        window = 0
+        if self.org is not None:
+            for agent in self.org.agents.values():
+                if agent.is_ai and agent.context_window:
+                    window = max(window, int(agent.context_window))
+        if not window and self.config is not None:
+            window = int(self.config.default_model_spec().context_window or 0)
+        if window:
+            # Leave room for the prompt: an output cap equal to the window would leave nothing for the
+            # input. Half is the conventional split and matches `output_reserve_frac`'s intent.
+            ceiling = min(ceiling, max(1024, window // 2))
+        return max(1024, ceiling)
 
 
 @dataclass
@@ -488,6 +528,14 @@ class NodeExecutor:
         session.attempt = attempt
         prepared = self._prepare_context(session, bundle, node, inputs, node_id=node_id,
                                          agent_id=agent.id)
+        # `_prepare_context` may have *rotated* the session, and it returns the fresh one. Adopting it
+        # matters because rotation SEALS AND CLOSES the old session — so continuing to use the one that
+        # went in raised `SessionError: session … is closed; only an ACTIVE session takes turns` and
+        # failed the whole run. A real run died exactly there, on the node that had just been
+        # auto-staffed and was doing its first real work.
+        rotated_session = prepared.get("session")
+        if rotated_session is not None and rotated_session is not session:
+            session = rotated_session
 
         prompt = self.builder.node_prompt(
             bundle,
@@ -496,7 +544,8 @@ class NodeExecutor:
                 instruction=self._pooled_instruction(
                     pooled,
                     instruction_override
-                    or self._instruction_for(node_id, node, skill, state)),
+                    or self._instruction_for(node_id, node, skill, state,
+                                             resolved_inputs=inputs)),
                 inputs=inputs,
                 handoff=self._handoff_payload(state),
                 recalled=prepared["recall"],
@@ -943,7 +992,7 @@ class NodeExecutor:
         pinned = "\n".join(session.pinned)
         skill_body = bundle.system_body(tier=2, max_tokens=bundle.token_budget)
         system = self._system_prompt(bundle)
-        new_message = self._instruction_for(node_id, node, bundle.name, {})
+        new_message = self._instruction_for(node_id, node, bundle.name, {}, resolved_inputs=inputs)
 
         projection = project(session, system=system, skill_body=skill_body, pinned=pinned,
                              recall=recall, new_message=new_message,
@@ -1396,16 +1445,91 @@ class NodeExecutor:
     def _repair_trailer(self, agent: Any, *, node_id: str, session: Session, reply: str,
                         bundle: SkillBundle, attempt: int, reason: str = "parse",
                         ) -> tuple[dict[str, Any], str] | None:
-        """Ask once, in a focused turn, for the trailer the first reply omitted or mis-scoped.
+        """Ask, in a focused turn, for the trailer the first reply omitted or mis-scoped.
 
         The original reply is *carried into the request* rather than replaced, so the model restates
-        its own work as evidence instead of inventing new work. Nothing here is graded: if the repair
-        turn also fails to parse, the node keeps its `needs_review` outcome and the original error.
+        its own work as evidence instead of inventing new work.
+
+        **Verified, not assumed.** The repair exists to salvage a real result that failed on
+        formatting, so it is only useful if the salvaged trailer actually covers the node's criteria.
+        A repair turn that parses but under-covers — one criterion of three, or a shape the model got
+        wrong — used to be logged `trailer.repair.ok` and accepted, and the node then failed its
+        contract anyway with a log line claiming the repair had worked. That is worse than the
+        original problem: it made a real run's diagnosis read "repair.ok then contract violation".
+
+        So the repair is bounded and coverage-checked: up to two turns, and the best-covered trailer
+        is returned. `ok` is logged only when the criteria are actually covered; otherwise the
+        incompleteness is named — which is what the reader needs to know, because it distinguishes
+        "the model could not evidence its own work" from "the engine mangled a good reply".
         """
         from .providers.base import ChatRequest, Message, Role
 
         checklist = ", ".join(bundle.checklist_ids()) or "(none)"
-        criteria = "\n".join(f"- {c}" for c in bundle.contract.criteria) or "- (none declared)"
+        criteria_list = list(bundle.contract.criteria)
+        criteria = "\n".join(f"- {c}" for c in criteria_list) or "- (none declared)"
+        best: tuple[dict[str, Any], int] | None = None
+        last_error = ""
+        turns = 2 if criteria_list else 1
+        # The repair carries the model's own work back to it, so it can restate that work rather than
+        # redo it. The slice used to be a flat 6000 characters, which for a long artifact (a 57KB PRD
+        # was observed) showed only the first tenth — and the *end* is exactly where a trailer would be.
+        # So the tail is kept as well as the head: the head says what the work was about, the tail is
+        # where a model that tried to comply would have put the block. 12KB total is a cheap call.
+        excerpt = reply if len(reply) <= 12000 else (
+            reply[:6000] + "\n\n… [" + str(len(reply) - 12000) +
+            " characters omitted from the middle] …\n\n" + reply[-6000:])
+        for turn in range(1, turns + 1):
+            instruction = self._repair_instruction(
+                reason=reason, turn=turn, criteria=criteria, checklist=checklist)
+            request = ChatRequest(
+                model=agent.model,
+                messages=[Message.text_message(Role.USER,
+                                               f"{instruction}\n\n--- YOUR PREVIOUS REPLY ---\n\n"
+                                               f"{excerpt}")],
+                system="You emit one JSON object in a fenced block, and nothing else.",
+                max_tokens=min(self.ctx.max_output_tokens, 2048),
+            )
+            self._log("trailer.repair", node_id=node_id, agent_id=agent.id,
+                      detail={"original_chars": len(reply), "turn": turn})
+            try:
+                response = self.ctx.gateway.complete(
+                    request, provider_id=agent.provider, agent_id=agent.id,
+                    node_id=node_id, session_id=session.session_id,
+                )
+            except Exception as exc:  # noqa: BLE001 - a failed repair must not fail the node
+                self._log("trailer.repair.failed", level="warning", node_id=node_id,
+                          agent_id=agent.id, message=str(exc))
+                break
+            trailer, error = self._parse(response.text)
+            if error:
+                last_error = error
+                continue
+            covered = len(self._criteria_met(trailer, criteria_list))
+            if best is None or covered > best[1]:
+                best = (trailer, covered)
+            if not criteria_list or covered >= len(criteria_list):
+                self._log("trailer.repair.ok", node_id=node_id, agent_id=agent.id,
+                          detail={"turn": turn, "covered": covered,
+                                  "criteria": len(criteria_list)})
+                return trailer, ""
+            # Under-covered: say so plainly, and try once more with a sharper restatement. The
+            # missing criteria are named because "which ones" is the actionable part.
+            self._log("trailer.repair.incomplete", level="warning", node_id=node_id,
+                      agent_id=agent.id,
+                      detail={"turn": turn, "covered": covered, "criteria": len(criteria_list)})
+        if best is not None:
+            # Return the best attempt even when incomplete: the node stays `needs_review` through the
+            # contract check, and the trailer gives the Owner the most coverage the model produced.
+            return best[0], last_error
+        return None
+
+    def _repair_instruction(self, *, reason: str, turn: int, criteria: str, checklist: str) -> str:
+        """The repair prompt. Turn 2 is sharper and explicit about the failure mode.
+
+        A model that under-covered once is usually one restatement away from covering everything, and
+        the second turn names *why* the first was rejected — so the retry is a correction rather than a
+        repetition, which is the only kind of retry worth spending.
+        """
         if reason == "criteria":
             framing = (
                 "You have already produced the work below. It is complete; do not redo it.\n\n"
@@ -1420,16 +1544,27 @@ class NodeExecutor:
                 "Your previous reply is in the user message. It is MISSING the required machine-readable "
                 "trailer, so the engine could not record your result.\n\n"
             )
-        instruction = (
+        if turn > 1:
+            framing += (
+                "Your LAST attempt was rejected as well: it still did not cover every criterion "
+                "below. This must be exactly one JSON object, and `criteria_satisfied` must be an "
+                "**array with one entry per criterion below** — not a single object, not a partial "
+                "list, not an object keyed by text. If you genuinely cannot evidence a criterion, "
+                "still include its entry with `\"satisfied\": false` and say what is missing.\n\n"
+            )
+        return (
             framing
             + "Reply with ONLY a fenced block tagged "
             f"`{TRAILER_FENCE}` containing one JSON object that describes the work you already did. "
             "No prose before or after.\n\n"
             "The object must have:\n"
             '- `status`: "done" if the work is complete, otherwise "needs_review" or "blocked".\n'
-            '- `criteria_satisfied`: for every criterion below, an object with `criterion` '
-            '(verbatim, copied from the list) `satisfied` (true/false) and `evidence` (a path, a '
-            'hash, or command output). Cover ALL of them.\n'
+            '- `summary`: one paragraph in plain prose saying what you did and the headline result. '
+            "This is a required handoff field: a payload without it is refused at the edge, so an "
+            "answer with no summary cannot advance even when every criterion is covered.\n"
+            '- `criteria_satisfied`: an ARRAY with one object for EVERY criterion below, each with '
+            '`criterion` (verbatim, copied from the list) `satisfied` (true/false) and `evidence` (a '
+            'path, a hash, or command output). Cover ALL of them.\n'
             f'- `checklist`: one entry per id for every id here: {checklist}. Each entry is '
             '`{"id":…,"status":"PASS|FAIL|N/A","evidence":…}`. Do not omit an id.\n'
             '- `artifacts`: the files you produced, each as '
@@ -1439,30 +1574,6 @@ class NodeExecutor:
             "Rules: valid JSON only inside the fence; `evidence` must be concrete; do not claim a "
             "pass you cannot evidence."
         )
-        request = ChatRequest(
-            model=agent.model,
-            messages=[Message.text_message(Role.USER,
-                                           f"{instruction}\n\n--- YOUR PREVIOUS REPLY ---\n\n"
-                                           f"{reply[:6000]}")],
-            system="You emit one JSON object in a fenced block, and nothing else.",
-            max_tokens=min(self.ctx.max_output_tokens, 2048),
-        )
-        self._log("trailer.repair", node_id=node_id, agent_id=agent.id,
-                  detail={"original_chars": len(reply)})
-        try:
-            response = self.ctx.gateway.complete(
-                request, provider_id=agent.provider, agent_id=agent.id,
-                node_id=node_id, session_id=session.session_id,
-            )
-        except Exception as exc:  # noqa: BLE001 - a failed repair must not fail the node
-            self._log("trailer.repair.failed", level="warning", node_id=node_id,
-                      agent_id=agent.id, message=str(exc))
-            return None
-        trailer, error = self._parse(response.text)
-        if error:
-            return None
-        self._log("trailer.repair.ok", node_id=node_id, agent_id=agent.id)
-        return trailer, ""
 
     def _parse(self, reply: str) -> tuple[dict[str, Any], str]:
         """Parse the machine-readable trailer, degrading rather than discarding.
@@ -1512,6 +1623,16 @@ class NodeExecutor:
             summary = summary or (
                 f"only {len(met)} of {len(criteria)} completion criteria were covered"
             )
+
+        # A summary is **always** produced, and this is a correctness rule rather than a nicety.
+        #
+        # The handoff contract lists `summary` as required, and the edge guardrail refuses a payload
+        # without one — so a node that answered with a valid trailer but no prose (status plus criteria
+        # coverage, which the contract asks for and the repair prompt requests) had its own completed
+        # work blocked at the edge and reported as `guardrail-blocked`. That blamed the guardrail for a
+        # blank field the executor emitted, and it is exactly what a real run hit: `trailer.repair.ok`
+        # followed by a guardrail block on `pm`, with nothing actionable in the log.
+        summary = summary or self._derived_summary(reply, status, verdict, met, criteria)
 
         result: dict[str, Any] = {
             "status": status,
@@ -1578,6 +1699,40 @@ class NodeExecutor:
                 "fix": "address the reviewer's summary before resubmitting",
             }]
         return result
+
+    def _derived_summary(self, reply: str, status: str, verdict: str,
+                         met: list[str], criteria: list[str]) -> str:
+        """A summary when the model wrote none, so the handoff never carries a blank one.
+
+        The model is asked for `summary`, but a valid trailer can arrive without prose — and a blank
+        summary is not merely unhelpful: the runner's handoff contract lists it as required and the edge
+        guardrail refuses a payload without it, so an honest, criteria-complete result was blocked and
+        reported as `guardrail-blocked` with no actionable cause.
+
+        Three sources, in order of usefulness, and the answer is always non-empty:
+
+        1. The first paragraph of the reply's own prose, which is what the model actually said.
+        2. A statement of the criteria it covered, which is the machine-readable content it *did* emit.
+        3. The status and verdict, which is always available and never wrong.
+
+        This is deliberately a fallback, not a replacement: a model-supplied summary is left untouched.
+        """
+        prose = ""
+        for block in (reply or "").split("\n\n"):
+            candidate = block.strip()
+            # Skip the fenced trailer itself and any heading-only line: neither is a summary.
+            if not candidate or candidate.startswith("```") or candidate.startswith("#"):
+                continue
+            if candidate.startswith("{") or candidate.startswith("["):
+                continue
+            prose = candidate
+            break
+        if prose:
+            return prose[:400]
+        if criteria and met:
+            return (f"{status} ({verdict}): covered {len(met)} of {len(criteria)} completion "
+                    "criteria; the model returned no prose summary.")
+        return f"{status} ({verdict}): the model returned no prose summary."
 
     def _criteria_met(self, trailer: dict[str, Any], criteria: list[str]) -> list[str]:
         """Map the trailer's satisfied criteria onto the node's *declared* criteria.
@@ -1955,7 +2110,7 @@ class NodeExecutor:
         }
 
     def _instruction_for(self, node_id: str, node: dict[str, Any], skill: str,
-                         state: dict[str, Any]) -> str:
+                         state: dict[str, Any], *, resolved_inputs: dict[str, Any] | None = None) -> str:
         """What this node is being asked to do.
 
         Built from the node's identity and its declared outputs, plus the run's own goal. The goal
@@ -1964,18 +2119,48 @@ class NodeExecutor:
         goal here leaves the entry node with literally nothing to do, and a competent model correctly
         replies that it received no input. Downstream nodes see the goal restated for the same reason:
         it is cheap, and it keeps every node anchored to what was actually asked for.
+
+        **The declared-input trap.** A skill declares inputs for its *typical* use —
+        `backend-developer` declares `inputs: [findings]` because fixing review findings is its
+        documented primary use, yet in a greenfield build nothing produces `findings`. The planner
+        copies those declarations onto the node, so an instruction reading "Consume: findings" while
+        the intake block in the *same prompt* reads "Nothing. This is the first node…" tells the model
+        two contradictory things. A real run failed on exactly this: `pm` was instructed to consume
+        `market-context` (which no node produces) and, correctly reading its intake as empty, reported
+        "No input provided to start the PRD writing process" and failed its own completion contract.
+
+        So when the resolved inputs are known, only the inputs the node *actually received* are named
+        as things to consume, and a declared-but-unproduced input is stated plainly as not supplied —
+        which is the honest description of the situation, and the one a competent model can act on.
         """
         outputs = ", ".join(node.get("outputs") or []) or "the node's declared outputs"
-        inputs = ", ".join(node.get("inputs") or []) or "everything produced so far"
+        declared = [str(i) for i in (node.get("inputs") or [])]
+        inputs = ", ".join(declared) or "everything produced so far"
+        missing: list[str] = []
+        if resolved_inputs is not None:
+            received = sorted(k for k in resolved_inputs)
+            missing = [i for i in declared if i not in received]
+            inputs = ", ".join(received) if received else "nothing yet"
         role = "Review" if self._is_reviewer(skill, node) else "Produce"
         goal = str(self._manifest(state).get("description") or "").strip()
         statement = (
             f"The goal for this run is: {goal}\n\n" if goal else ""
         )
+        # Naming a missing input is deliberate. It is the difference between "you are missing
+        # something and here is what" — which the model can route around, or say it cannot start — and
+        # a silent contradiction it can only misread.
+        caveat = ""
+        if missing:
+            named = "`, `".join(missing)
+            caveat = (
+                f" (declared `{named}` is not produced by any upstream node, so it was "
+                "not supplied; proceed from what you have and record it as an assumption or an open "
+                "question rather than treating it as a blocker)"
+            )
         return (
             f"{statement}"
             f"{role} as node `{node_id}` using the {skill} skill. "
-            f"Consume: {inputs}. Produce: {outputs}. "
+            f"Consume: {inputs}{caveat}. Produce: {outputs}. "
             f"Work to the completion criteria and checklist below, and report every checklist id "
             f"with its evidence."
         )

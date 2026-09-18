@@ -453,3 +453,211 @@ def test_emitted_edge_conditions_survive_a_round_trip(plan):
         assert edge["when"] == original[(edge["from"], edge["to"])], (
             "an edge condition that changes on round-trip would change control flow"
         )
+
+
+# ── domain classification: the org must match the work ───────────────────────
+
+
+def test_a_strategy_goal_does_not_get_a_software_pipeline(planner):
+    """The reported failure: "use the CEO skill and bring a market researcher" ran as
+    product-manager → architect → backend-developer, which is simply the wrong org for the goal."""
+    plan = planner.plan(
+        "Can You use CEO skill and bring any other people like market researcher "
+        "and improve this project and add how to capture market",
+        slug="ceo-market",
+    )
+    used = set(plan.skills_used)
+    assert plan.shape == "strategy"
+    assert "ceo-strategist" in used, "naming the CEO skill must put the CEO in the plan"
+    assert "ux-researcher" in used, "naming a market researcher must put that role in the plan"
+    assert "backend-developer" not in used, "a strategy goal must not be run as an engineering build"
+    assert plan.validation.valid
+
+
+def test_a_go_to_market_goal_selects_the_gtm_org(planner):
+    plan = planner.plan("Plan a go-to-market launch and capture demand for the app", slug="gtm")
+    assert plan.shape == "gtm"
+    assert {"marketing-manager", "growth-engineer"} & set(plan.skills_used)
+
+
+def test_a_research_goal_selects_the_research_org(planner):
+    plan = planner.plan("Do user research with interviews and personas", slug="research")
+    assert plan.shape == "research"
+    assert "ux-researcher" in plan.skills_used
+
+
+def test_a_data_goal_selects_the_data_org(planner):
+    plan = planner.plan("Build a data warehouse ETL pipeline and a dashboard", slug="data")
+    assert plan.shape == "data"
+    assert "data-engineer" in plan.skills_used
+
+
+def test_a_plain_build_goal_stays_software(planner):
+    """A technical noun without a stated business intent is still a software goal."""
+    plan = planner.plan("Build a booking SaaS MVP with auth and payments", slug="booking")
+    assert plan.shape == "software"
+    assert "product-manager" in plan.skills_used
+    assert "backend-developer" in plan.skills_used
+
+
+@pytest.mark.parametrize(
+    "goal, slug, shape",
+    [
+        ("Refactor the authentication module", "refactor", "software"),
+        ("Raise a seed round and prepare the cap table", "raise", "strategy"),
+        ("Design a go-to-market plan with positioning", "positioning", "gtm"),
+        ("Understand our users through interviews", "interviews", "research"),
+        ("Build an analytics dashboard with KPIs", "kpis", "data"),
+        ("Build a mobile fitness tracker", "fitness", "software"),
+    ],
+)
+def test_domain_classification_is_stable(planner, goal, slug, shape):
+    plan = planner.plan(goal, slug=slug)
+    assert plan.shape == shape
+    assert plan.validation.valid, f"{goal}: {plan.validation.errors}"
+
+
+def test_every_domain_shape_produces_a_terminating_plan(planner):
+    """Whatever the org, the invariants hold: a start, a bounded loop, a reachable human gate."""
+    goals = [
+        ("use the CEO skill", "strategy"),
+        ("plan a go-to-market launch", "gtm"),
+        ("do market research with surveys", "research"),
+        ("build a data warehouse ETL", "data"),
+        ("build a booking service", "software"),
+    ]
+    for goal, expected in goals:
+        plan = planner.plan(goal, slug="shape-" + expected)
+        assert plan.shape == expected
+        resolvable = {n["id"] for n in plan.nodes} | {g["id"] for g in plan.gates}
+        assert plan.manifest["start"] in resolvable
+        assert plan.loops and plan.loops[0]["exit_when"]
+        assert plan.loops[0]["max_iterations"] >= 1
+        for node_id in plan.loops[0]["nodes"]:
+            assert node_id in resolvable, f"{goal}: loop references unknown node {node_id}"
+        assert any(g.get("kind") == "human" for g in plan.gates)
+
+
+def test_the_rework_loop_returns_to_a_node_the_plan_contains(planner):
+    """A hardcoded `backend-developer` rework target broke every non-software plan."""
+    for goal in ("use the CEO skill and bring a market researcher", "plan a go-to-market launch"):
+        plan = planner.plan(goal, slug="rework")
+        node_ids = {n["id"] for n in plan.nodes}
+        for loop in plan.loops:
+            for node_id in loop["nodes"]:
+                assert node_id in node_ids, f"{goal}: loop names absent node {node_id}"
+
+
+def test_shape_and_staffing_travel_with_the_plan(planner):
+    plan = planner.plan("use the CEO skill", slug="shape-json")
+    payload = plan.as_dict()
+    assert payload["shape"] == "strategy"
+    assert isinstance(payload["staffing"], list)
+    assert "Shape:" in plan.summary()
+
+
+# ── roster awareness: a gap must be named, with the hire that closes it ───────
+
+
+class _StubOrg:
+    """The two methods the planner needs from a roster, and nothing else."""
+
+    def __init__(self, staffed: set[str]) -> None:
+        self._staffed = staffed
+
+    def agents_for_skill(self, skill: str) -> list:
+        from engine.org.agent import AgentKind
+
+        class _A:
+            kind = AgentKind.AI
+
+        return [_A()] if skill in self._staffed else []
+
+
+def test_a_gap_is_reported_with_the_hire_that_closes_it(source):
+    org = _StubOrg(staffed={"ceo-strategist"})
+    plan = Planner(source, org=org).plan("use the CEO skill and a market researcher", slug="gaps")
+    skills_gap = {gap["skill"] for gap in plan.staffing}
+    assert "ceo-strategist" not in skills_gap, "a staffed skill must not be reported as a gap"
+    assert "ux-researcher" in skills_gap
+    gap = next(g for g in plan.staffing if g["skill"] == "ux-researcher")
+    assert "hire" in gap and "ux-researcher" in gap["hire"]
+    assert "ux-researcher" in plan.summary()
+
+
+def test_no_roster_reports_no_gaps(planner):
+    """Without a roster the planner must not invent gaps it cannot know about."""
+    plan = planner.plan("use the CEO skill", slug="no-roster")
+    assert plan.staffing == ()
+
+
+# ── the library's own graph rides with the plan ──────────────────────────────
+
+
+def test_a_plan_is_reviewed_against_the_library_graph(planner):
+    """The library's chain: graph is now read, so a plan says how it hangs together."""
+    plan = planner.plan("Build a booking SaaS MVP with auth and payments", slug="graphed")
+    review = plan.graph_review
+    assert review, "a plan with a loadable library should carry a graph review"
+    assert "coherence" in review and "consensus_missing" in review
+    # A real software plan's own skills are related to each other in the corpus.
+    assert review["isolated"] == []
+
+
+def test_the_graph_review_travels_in_the_serialised_plan(planner):
+    plan = planner.plan("Build a booking SaaS MVP with auth and payments", slug="graphed-json")
+    payload = plan.as_dict()
+    assert "graph_review" in payload
+    assert isinstance(payload["graph_review"], dict)
+
+
+# ── bounded-reroute agent gates ──────────────────────────────────────────────
+
+
+def test_the_plan_escalates_to_an_agent_gate_then_the_human(planner):
+    """Exhaustion should get a bounded, org-made reroute before it bothers the Owner."""
+    plan = planner.plan("Build a booking service with auth", slug="agentgate")
+    gates = {g["id"]: g for g in plan.gates}
+    assert "reroute-gate" in gates, "the plan should emit a bounded-reroute agent gate"
+    assert gates["reroute-gate"]["kind"] == "agent"
+    assert gates["human-gate"]["kind"] == "human"
+    # The agent gate escalates onward to the human gate, which is the terminal authority.
+    assert gates["reroute-gate"]["escalate_to"] == "human-gate"
+    # The loop escalates to the agent gate, not straight to a person.
+    loop = plan.loops[0]
+    assert loop["escalate_to"] == "reroute-gate"
+    # The gate's pool is the loop's own members, so a reroute stays inside the rework.
+    assert set(gates["reroute-gate"]["pool"]) == set(loop["nodes"])
+    assert gates["reroute-gate"]["max_reroutes"] >= 1
+
+
+def test_the_agent_gate_is_validated_by_the_library(planner):
+    plan = planner.plan("Build a booking service with auth", slug="agentgate-valid")
+    assert plan.validation.valid, plan.validation.errors
+    assert any(g.get("kind") == "agent" for g in plan.gates)
+
+
+@pytest.mark.parametrize("goal, slug", [
+    ("Build a booking service", "ag-software"),
+    ("use the CEO skill and capture market", "ag-strategy"),
+    ("plan a go-to-market launch", "ag-gtm"),
+    ("do market research with surveys", "ag-research"),
+])
+def test_every_domain_emits_a_bounded_reroute_gate(planner, goal, slug):
+    plan = planner.plan(goal, slug=slug)
+    kinds = {g.get("kind") for g in plan.gates}
+    assert "agent" in kinds and "human" in kinds
+    assert plan.loops[0]["escalate_to"] == "reroute-gate"
+
+
+def test_the_rework_target_is_the_chain_producer_not_a_verifier(planner):
+    """The bug the shared chain/verifier split fixed: the loop handed findings to a reviewer."""
+    plan = planner.plan("Build a booking service with auth", slug="rework-target")
+    loop = plan.loops[0]
+    verifier_ids = {g["id"] for g in plan.gates if g.get("kind") == "agent"}
+    for gate in plan.gates:
+        if gate.get("kind") == "agent":
+            # The last loop node is the producer handed the findings; it must not be the first
+            # verifier (which is the loop's exit-condition node).
+            assert loop["nodes"][-1] != loop["nodes"][0]
+    assert verifier_ids  # sanity: there is an agent gate

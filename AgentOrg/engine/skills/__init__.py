@@ -20,17 +20,28 @@ from .bundle import (
 )
 from .filesystem import FilesystemSkillSource
 from .frontmatter import FrontmatterError, parse_frontmatter
+from .graph import FRAMEWORK_SKILLS, GraphStats, SkillGraph
+from .roles import PRODUCER, VERIFIER, RoleVerdict, classify, is_verifier, verifier_skills_for
 from .source import SkillSource
 
 __all__ = [
     "ChecklistItem",
+    "FRAMEWORK_SKILLS",
     "FilesystemSkillSource",
     "FrontmatterError",
+    "GraphStats",
+    "PRODUCER",
+    "RoleVerdict",
     "SkillBundle",
     "SkillContract",
     "SkillError",
+    "SkillGraph",
     "SkillSource",
     "Tier",
+    "VERIFIER",
+    "classify",
+    "is_verifier",
     "parse_frontmatter",
     "parse_skill",
+    "verifier_skills_for",
 ]

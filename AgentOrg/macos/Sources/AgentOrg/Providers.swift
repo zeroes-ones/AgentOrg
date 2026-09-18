@@ -73,6 +73,10 @@ struct ProvidersPanel: View {
 
                 Divider()
 
+                DefaultsSection(controller: controller)
+
+                Divider()
+
                 editor
 
                 if let path = Optional(controller.providersConfigPath), !path.isEmpty {
@@ -640,5 +644,158 @@ struct EditableAgentRow: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(agent["name"]?.stringValue ?? "agent"), \(status), "
                             + "\(agent["provider"]?.stringValue ?? "") \(agent["model"]?.stringValue ?? "")")
+    }
+}
+
+// MARK: - Defaults — "which model does everyone run on, unless I say otherwise?"
+
+/// The default provider/model and the default autonomy, editable in one place.
+///
+/// This is the panel for the setting a person reaches for most often — *what model are my people on* —
+/// and for the related one they should be able to see: *will a run stop for me*. Both are read from the
+/// engine (which resolves a declared default against what is actually configured), so the panel shows
+/// the **effective** answer with its reason, not the file's literal contents.
+struct DefaultsSection: View {
+    @ObservedObject var controller: OrgController
+
+    @State private var provider: String = ""
+    @State private var model: String = ""
+    @State private var reviewerModel: String = ""
+    /// The autonomy switches, three-state so "unchanged" is distinct from "off".
+    @State private var autoGates: Bool = true
+    @State private var autoHire: Bool = true
+    @State private var persistHires: Bool = false
+    /// Set once the engine's answer has seeded the form, so a poll cannot overwrite what is being typed.
+    @State private var seeded = false
+
+    private var providers: [[String: JSONValue]] { controller.providers }
+    private var reason: String { controller.defaults["reason"]?.stringValue ?? "" }
+    private var window: Int? { controller.defaults["context_window"]?.intValue }
+
+    /// The models the chosen provider actually offers, so the model field is a picker when it can be.
+    private var modelsForProvider: [String] {
+        guard !provider.isEmpty else { return [] }
+        let entry = providers.first { $0["id"]?.stringValue == provider }
+        let models = (entry?["models"]?.arrayValue ?? []).compactMap {
+            $0.objectValue?["model_id"]?.stringValue
+        }
+        return models
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Defaults").font(.headline)
+            Text("Every agent uses this unless you give it something else. A plan that needs a "
+                 + "capability nobody holds is staffed on this model.")
+                .font(.caption).foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                Picker("Provider", selection: $provider) {
+                    Text("Choose…").tag("")
+                    ForEach(providers, id: \.self) { entry in
+                        Text(entry["id"]?.stringValue ?? "?").tag(entry["id"]?.stringValue ?? "")
+                    }
+                }
+                .frame(maxWidth: 220)
+                .accessibilityLabel("Default provider")
+
+                if modelsForProvider.isEmpty {
+                    TextField("model id", text: $model)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(maxWidth: 300)
+                        .accessibilityLabel("Default model, typed")
+                } else {
+                    Picker("Model", selection: $model) {
+                        Text("Choose…").tag("")
+                        ForEach(modelsForProvider, id: \.self) { Text($0).tag($0) }
+                    }
+                    .frame(maxWidth: 300)
+                    .accessibilityLabel("Default model")
+                }
+
+                Button("Set default") {
+                    Task {
+                        await controller.setDefaults(provider: provider, model: model,
+                                                     reviewerModel: reviewerModel)
+                    }
+                }
+                .disabled(provider.isEmpty || model.isEmpty || controller.engineState != .running)
+                .accessibilityLabel("Set the default provider and model")
+            }
+
+            TextField("reviewer model (optional — keeps reviewers independent)", text: $reviewerModel)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 420)
+                .accessibilityLabel("Reviewer model")
+
+            // The effective answer, with why. A declared default invalidated by a removed provider
+            // resolves to something else — and the person should be told, not left confused.
+            HStack(spacing: 8) {
+                Label("In use: \(controller.defaultPairLabel)", systemImage: "checkmark.seal")
+                    .font(.callout)
+                if let window {
+                    Text("window \(window)").font(.caption2.monospaced()).foregroundStyle(.secondary)
+                } else {
+                    Text("window unknown — no agent can bind")
+                        .font(.caption2).foregroundStyle(.orange)
+                }
+            }
+            if !reason.isEmpty {
+                Text("resolved because: \(reason)").font(.caption2).foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            Text("Default autonomy").font(.subheadline.weight(.medium))
+            Text("This is what a new goal inherits. A goal can still overrule it when you set it.")
+                .font(.caption).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Pass gates the org can decide", isOn: $autoGates)
+                    .accessibilityLabel("Goals pass gates the org can decide by default")
+                Toggle("Create a person when a skill is missing", isOn: $autoHire)
+                    .accessibilityLabel("Goals staff missing skills by default")
+                Toggle("Write auto-created people to the roster", isOn: $persistHires)
+                    .accessibilityLabel("Auto-created people persist by default")
+            }
+            .toggleStyle(.checkbox)
+            .font(.caption)
+            Text("A release, close or spend gate is never passed automatically — that is always yours.")
+                .font(.caption2).foregroundStyle(.secondary)
+
+            Button("Apply autonomy") {
+                Task {
+                    await controller.setAutonomy(autoPassGates: autoGates, autoHire: autoHire,
+                                                 persistHires: persistHires)
+                }
+            }
+            .disabled(controller.engineState != .running)
+            .accessibilityLabel("Apply the default autonomy")
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.06))
+        .cornerRadius(8)
+        .onAppear(perform: seed)
+        .onChange(of: controller.defaults) { _, _ in seed() }
+    }
+
+    /// Seed the form from the engine's answer, once — so a poll does not fight what is being typed,
+    /// but a `Set default` that changed the file does refresh the shown values.
+    private func seed() {
+        let autonomy = controller.defaults["autonomy"]?.objectValue
+        if let current = controller.defaults["provider"]?.stringValue, !current.isEmpty,
+           provider.isEmpty || !seeded {
+            provider = current
+        }
+        if let current = controller.defaults["model"]?.stringValue, !current.isEmpty,
+           model.isEmpty || !seeded {
+            model = current
+        }
+        if let gates = autonomy?["auto_pass_auto_gates"]?.boolValue, !seeded {
+            autoGates = gates
+            autoHire = autonomy?["auto_hire_missing"]?.boolValue ?? true
+            persistHires = autonomy?["persist_auto_hires"]?.boolValue ?? false
+        }
+        seeded = true
     }
 }

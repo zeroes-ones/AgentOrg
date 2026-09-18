@@ -766,3 +766,75 @@ def test_the_status_snapshot_carries_what_every_panel_needs(tmp_path):
     detail = server._cmd_status({})
     for key in ("org", "goal", "subagents", "proposals", "workspace", "cache", "swarm"):
         assert key in detail, f"the snapshot omits {key}, so that panel can never populate"
+
+
+def test_status_carries_the_activity_timeline(config, library):
+    """The "what is happening" panel is populated from the poll every panel already makes."""
+    _, events = drive(config, library, [{"cmd_id": "c1", "type": "status"}])
+    detail = ack_for(events, "c1")["detail"]
+    assert "activity" in detail, "the status snapshot must carry the activity timeline"
+    activity = detail["activity"]
+    for key in ("headline", "timeline", "counts", "next_action", "going"):
+        assert key in activity, f"activity is missing {key!r}"
+
+
+def test_activity_is_pollable_on_its_own(config, library):
+    """A snapshot command, so the panel can refresh without a start/stop."""
+    _, events = drive(config, library, [{"cmd_id": "c1", "type": "activity"}])
+    detail = ack_for(events, "c1")["detail"]
+    assert "headline" in detail and isinstance(detail.get("timeline"), list)
+
+
+def test_status_carries_the_mission(config, library):
+    """The console shows the standing purpose from the poll it already makes."""
+    _, events = drive(config, library, [{"cmd_id": "c1", "type": "status"}])
+    detail = ack_for(events, "c1")["detail"]
+    assert "mission" in detail, "the status snapshot must carry the mission"
+    assert "state" in detail["mission"] and "objectives" in detail["mission"]
+
+
+def test_mission_is_pollable_on_its_own(config, library):
+    _, events = drive(config, library, [{"cmd_id": "c1", "type": "mission"}])
+    detail = ack_for(events, "c1")["detail"]
+    assert "mission" in detail
+    assert detail["mission"]["statement"] == ""
+
+
+def test_status_carries_the_portfolio(config, library):
+    """The console shows every org the principal runs from the poll it already makes."""
+    _, events = drive(config, library, [{"cmd_id": "c1", "type": "status"}])
+    detail = ack_for(events, "c1")["detail"]
+    assert "portfolio" in detail, "the status snapshot must carry the portfolio"
+    assert "orgs" in detail["portfolio"]
+
+
+def test_portfolio_is_pollable_on_its_own(config, library):
+    _, events = drive(config, library, [{"cmd_id": "c1", "type": "portfolio"}])
+    detail = ack_for(events, "c1")["detail"]
+    assert "orgs" in detail and "active_org_id" in detail
+
+
+def test_portfolio_live_is_a_separate_command(config, library):
+    """The live cross-org view is expensive, so it is its own command, not the status poll."""
+    _, events = drive(config, library, [{"cmd_id": "c1", "type": "portfolio_live"}])
+    detail = ack_for(events, "c1")["detail"]
+    assert "rollup" in detail or "fleet" in detail
+
+
+def test_the_status_snapshot_carries_the_new_panels(tmp_path):
+    """The app polls `status`; every new panel's data must travel with it.
+
+    The console reads these keys by name, so a missing one is a blank panel. `flow` (who is working on
+    what), `defaults` (the model everyone runs on) and `goal` all have to be present in **both** the
+    idle and the running branch, which is why the idle branch is tested here.
+    """
+    server, _ = _server_with_creds(tmp_path, slug="panels")
+    payload = server._cmd_status({})
+    for key in ("flow", "defaults", "goal", "activity", "portfolio", "subagents"):
+        assert key in payload, f"{key} must travel with status or its panel cannot render"
+    defaults = payload["defaults"]
+    assert defaults["provider"] == "ollama"
+    assert defaults["model"] == "qwen2.5-coder:7b"
+    # The window the system will actually bind with — not the declared table alone.
+    assert defaults["context_window"] == 32768
+    assert defaults["autonomy"]["auto_pass_auto_gates"] is True

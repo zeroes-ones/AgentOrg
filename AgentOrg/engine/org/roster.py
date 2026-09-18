@@ -190,6 +190,14 @@ class Org:
     runtimes: dict[str, AgentRuntime] = field(default_factory=dict)
     teams: dict[str, Team] = field(default_factory=dict)
     policy: dict[str, Any] = field(default_factory=dict)
+    #: A stable identity for this org, so a rename changes its label and not its identity. Generated
+    #: once; a portfolio entry points at it. Empty on a bare `Org()` and filled by `default_company`
+    #: or `Org.from_dict`, because a hand-built org in a test has no register to be part of.
+    id: str = ""
+    #: The principal (the human) who owns this org, when it belongs to a portfolio. Lets several orgs
+    #: resolve to the same person without their rosters, budgets or mailboxes touching — the
+    #: *shared principal, independent agents* split.
+    principal_id: str = ""
     org_version: str = "1.0.0"
     _locks: dict[str, threading.RLock] = field(default_factory=dict, repr=False)
 
@@ -468,6 +476,8 @@ class Org:
         return {
             "org_version": self.org_version,
             "name": self.name,
+            "id": self.id,
+            "principal_id": self.principal_id,
             "agents": [spec.as_dict() for spec in sorted(self.agents.values(), key=lambda a: a.id)],
             "teams": [team.as_dict() for team in sorted(self.teams.values(), key=lambda t: t.name)],
             "policy": self.policy,
@@ -483,6 +493,8 @@ class Org:
         """
         org = cls(
             name=str(data.get("name") or "AgentOrg"),
+            id=str(data.get("id") or ""),
+            principal_id=str(data.get("principal_id") or ""),
             org_version=str(data.get("org_version") or "1.0.0"),
             policy=data.get("policy") if isinstance(data.get("policy"), dict) else {},
         )
@@ -583,7 +595,9 @@ def default_company(*, provider: str, model: str, context_window: int,
                     max_output: int | None = None, reviewer_provider: str | None = None,
                     reviewer_model: str | None = None,
                     reviewer_context_window: int | None = None,
-                    owner_name: str = "Owner") -> Org:
+                    owner_name: str = "Owner",
+                    name: str = "AgentOrg", org_id: str = "",
+                    principal_id: str = "") -> Org:
     """Seed a runnable company.
 
     The reviewers are bound to a *different* model than the builders when one is supplied,
@@ -597,8 +611,12 @@ def default_company(*, provider: str, model: str, context_window: int,
         When omitted the builders' model is used, and the independence property then rests on
         context lineage alone (the reviewer never receives the producer's reasoning), which is
         still a valid boundary but a weaker one.
+    name, org_id, principal_id:
+        Identity, for an org that belongs to a portfolio. `org_id` is recorded so a portfolio entry
+        can find this org by identity rather than by the display name; `principal_id` links it to the
+        person who runs it.
     """
-    org = Org(name="AgentOrg")
+    org = Org(name=name, id=org_id, principal_id=principal_id)
 
     # The Owner is a real agent, so a human handoff travels the same path as an automated one.
     owner = AgentSpec(

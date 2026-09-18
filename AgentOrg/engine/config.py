@@ -37,7 +37,7 @@ import re
 import stat
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 __all__ = [
     "ConfigError",
@@ -52,11 +52,15 @@ __all__ = [
     "BudgetConfig",
     "PolicyConfig",
     "TelemetryConfig",
+    "GoalConfig",
+    "DefaultsConfig",
     "Config",
     "load",
     "redact",
     "scan_for_leaks",
     "write_provider",
+    "set_defaults",
+    "set_autonomy",
 ]
 
 SUPPORTED_KINDS = ("openai", "anthropic", "ollama")
@@ -400,6 +404,20 @@ class ExecutorConfig:
     #: Whether `fleet` (the parallel shape) is offered. The single `task` shape is the conservative
     #: default; N-at-once is the throughput shape and is turned on deliberately.
     subagent_fleet_enabled: bool = False
+    #: The ceiling on **one model reply** in tokens, when the bound model does not declare its own.
+    #:
+    #: This matters more than it looks, and it is the single most consequential number in the run.
+    #: It was hardcoded at 4096, so a capable model writing a long artifact — a PRD, a design doc, a
+    #: large diff — was cut off mid-sentence *before* it could emit its machine-readable trailer. The
+    #: node then failed its own completion contract with "declared criteria not covered", and the real
+    #: cause (truncation) was visible only as `finish_reason: length` in the trace. A real PRD run on a
+    #: 1M-token model hit this repeatedly and it read as the model refusing to comply.
+    #:
+    #: Measured: the same run needed >16384 tokens and was still truncating. A model with a 1M-token
+    #: window exists precisely to hold large artifacts, so the ceiling is generous and scales with the
+    #: window — see `ExecutorContext._resolve_max_output`, which never asks for more than half the
+    #: window (so the prompt still fits). Lower it to trade artifact completeness for cheaper calls.
+    max_output_tokens: int = 32768
 
     def __post_init__(self) -> None:
         if self.swarm_max_voters < 1:
@@ -422,13 +440,19 @@ class ExecutorConfig:
 
 @dataclass
 class GoalConfig:
-    """The `[goal]` section: how a long-running objective is bounded.
+    """The `[goal]` section: how a long-running objective is bounded, and how autonomous it is.
 
     A Goal has **no ceiling by default** (``token_budget = 0``), matching a coding agent you leave
     running: it continues until the agent reports completion, a genuine blocker, or you stop it. That
     is a deliberate weakening of the engine's "no unbounded bill" rule, so the cumulative spend is
     always tracked and shown, and a positive budget is both resumably enforceable and the recommended
     setting for anything unattended.
+
+    **Autonomy.** The default is *autonomous*: arming a goal is standing authorisation to pass every
+    gate that is mechanically decidable (the agent gate, a policy `confirm` route class) and to staff a
+    gap by spawning a subagent on the default model. The person asked for a tool they can leave, so
+    "a human is needed unless I chose one" is the intended polarity. Two per-goal switches restore the
+    pause: `human_gate` parks at every gate, and setting `auto_approve`/`auto_hire` false narrows it.
     """
 
     #: Tokens a Goal may spend per *slice* before pausing. `0` means no ceiling (the default). A
@@ -437,9 +461,27 @@ class GoalConfig:
     #: How many times the same consecutive tool call is repeated before the run is reminded. Reminders,
     #: not stops: the calls still execute, because a legitimate retry after a transient failure is real.
     repeat_call_reminders: tuple[int, ...] = (3, 5, 8)
-    #: Whether arming a goal is standing authorisation to pass auto-approvable gates. Off by default:
-    #: a gate is a decision someone asked to make, and a Goal parks at it rather than deciding for them.
-    auto_pass_auto_gates: bool = False
+    #: Whether arming a goal is standing authorisation to pass auto-approvable gates.
+    #:
+    #: On by default. A **terminal** gate (release, close, spend — the manifest's `kind: human`) is
+    #: never auto-approved: only the Owner holds that authority. This switch covers the gates the *org*
+    #: can decide itself, and the per-goal `human_gate` / `auto_approve` override wins over it.
+    auto_pass_auto_gates: bool = True
+    #: Whether a plan's staffing gap is closed automatically instead of parking the run.
+    #:
+    #: On by default. A node whose skill no agent holds would otherwise stop the run three nodes in,
+    #: far from the cause; spawning a subagent on the default model keeps the work moving, which is
+    #: what "if the person does not exist, create one" asks for.
+    auto_hire_missing: bool = True
+    #: Whether an auto-created helper is *persisted* to the roster, or stays ephemeral.
+    #:
+    #: Off by default: an ephemeral subagent does the work and leaves no roster entry to clean up. A
+    #: goal can opt in per-objective (`--persist-hires`) when the capability should be reused, and then
+    #: the created employee appears in `agents` and the Org/People panels like any other hire.
+    persist_auto_hires: bool = False
+    #: The highest delegation tier an auto-hire may reach without asking. `0` means the safest tier
+    #: only: a cheap, reversible helper. Anything above it parks rather than silently spending.
+    auto_hire_max_tier: int = 0
 
     def __post_init__(self) -> None:
         if self.token_budget < 0:
@@ -449,6 +491,57 @@ class GoalConfig:
         if any(n < 1 for n in reminders):
             raise ConfigError("goal.repeat_call_reminders must all be >= 1")
         self.repeat_call_reminders = reminders or (3, 5, 8)
+        if int(self.auto_hire_max_tier) < 0 or int(self.auto_hire_max_tier) > 2:
+            raise ConfigError(
+                "goal.auto_hire_max_tier must be between 0 (safest only) and 2; got "
+                f"{self.auto_hire_max_tier}"
+            )
+
+
+@dataclass
+class DefaultsConfig:
+    """The `[defaults]` section: the provider and model everyone uses unless told otherwise.
+
+    This is the one answer to "which model do my people run on". Before it, three separate places
+    each picked their own fallback — `hire` defaulted to `ollama`, `default_company` to
+    `qwen2.5-coder:7b`, the planner to whatever was first in the catalog — so a person could hire onto
+    one model and watch the built-in company run on another. Resolving it **once**, here, is what makes
+    "the default unless I specify" actually hold everywhere.
+
+    A provider/model pair is only a *preference*: :meth:`Config.default_pair` validates it against what
+    is actually configured and reachable, and degrades with a stated reason rather than binding an
+    agent to a model that no longer exists.
+    """
+
+    provider: str = ""
+    model: str = ""
+    #: The model reviewers run on, so a verifier differs from its producer by construction.
+    #: Empty means "find a distinct one, or fall back with a warning" — never a silent same-model
+    #: verdict presented as independent.
+    reviewer_provider: str = ""
+    reviewer_model: str = ""
+    temperature: float = 0.2
+    #: A context window to use when the catalogue cannot report one. Without it a default model with an
+    #: unknown window cannot be bound at all, which is the most common first-run failure.
+    context_window: int | None = None
+
+    def __post_init__(self) -> None:
+        if not (0.0 <= float(self.temperature) <= 2.0):
+            raise ConfigError(
+                f"defaults.temperature must be between 0 and 2; got {self.temperature}"
+            )
+        if self.context_window is not None and int(self.context_window) < 1024:
+            raise ConfigError(
+                "defaults.context_window must be at least 1024 when set; got "
+                f"{self.context_window}"
+            )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"provider": self.provider, "model": self.model,
+                "reviewer_provider": self.reviewer_provider,
+                "reviewer_model": self.reviewer_model,
+                "temperature": self.temperature,
+                "context_window": self.context_window}
 
 
 @dataclass
@@ -601,7 +694,10 @@ class Config:
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     known_models: dict[str, ModelSpec] = field(default_factory=dict)
     catalog: dict[str, Any] = field(default_factory=dict)
+    #: The raw `[defaults]` document, kept for compatibility with the loader's warnings machinery.
     defaults: dict[str, Any] = field(default_factory=dict)
+    #: The validated view of `[defaults]`, and the single source of truth for the default pair.
+    default: DefaultsConfig = field(default_factory=DefaultsConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
@@ -651,6 +747,98 @@ class Config:
         if spec is None:
             return model
         return spec.model_aliases.get(model, model)
+
+    # ── the default pair ────────────────────────────────────────────────────
+    #
+    # One resolution, used by every caller that needs "the model my people run on". Before this each
+    # of `hire`, `default_company` and the planner picked its own fallback, which is how a person
+    # could hire onto one model and watch the built-in company run on another.
+
+    def _usable_providers(self) -> list[str]:
+        """Configured provider ids that look reachable, most-preferred first.
+
+        A provider with no key and no local host is *configured but unusable*; choosing it as the
+        default would make every hire fail with a key error. Local kinds (ollama) need no key, so
+        they stay in. The ordering is deterministic so two runs agree.
+        """
+        usable: list[str] = []
+        for pid in sorted(self.providers):
+            spec = self.providers[pid]
+            if spec.kind == "ollama" or spec.resolve_key():
+                usable.append(pid)
+        return usable
+
+    def default_pair(self) -> tuple[str, str, str]:
+        """The effective default ``(provider, model, reason)`` for the whole organisation.
+
+        Resolution order, and the reason is always returned so a caller can say *why* the answer
+        differs from the file:
+
+        1. ``defaults.provider`` + ``defaults.model`` when both are configured and usable.
+        2. the configured provider with a declared model that has a known window.
+        3. the first usable provider with any model, else the first configured provider at all.
+
+        The model is expanded through the provider's alias table, so ``claude-sonnet`` becomes the
+        provider's real id at the one place that decides. An empty model is a legitimate result — it
+        means *nothing is configured yet* — and callers say so rather than binding a placeholder.
+        """
+        configured = self.providers
+        declared = self.default
+        if declared.provider and declared.provider in configured:
+            model = self.alias(declared.provider, declared.model) if declared.model else ""
+            if model:
+                return declared.provider, model, "configured default"
+            # A default naming a provider but no model: use that provider's first known model.
+            for model_id, spec in sorted(self.known_models.items()):
+                if spec.context_window:
+                    return declared.provider, model_id, "configured provider, first known model"
+
+        for pid in self._usable_providers():
+            for model_id, spec in sorted(self.known_models.items()):
+                if spec.context_window and pid in self.default_models_for(pid):
+                    return pid, model_id, "first usable provider with a known model"
+
+        usable = self._usable_providers()
+        if usable:
+            return usable[0], "", "first usable provider, no model declared"
+        if configured:
+            first = sorted(configured)[0]
+            return first, "", "first configured provider (no usable one)"
+        return "", "", "no providers are configured"
+
+    def default_models_for(self, provider_id: str) -> set[str]:
+        """Model ids that plausibly belong to a provider.
+
+        The catalogue records `provider_id` on a probed entry; a declared model (the `known` table) has
+        none. So a declared model is attributable to any provider whose alias table names it, and to
+        every provider when nothing narrows it down — the alternative is refusing a perfectly good
+        declared default because it was never probed.
+        """
+        out: set[str] = set()
+        for entry in (self.catalog.get("models") or []):
+            if isinstance(entry, dict) and str(entry.get("provider_id") or "") == provider_id:
+                out.add(str(entry.get("model_id") or ""))
+        spec = self.providers.get(provider_id)
+        if spec is not None:
+            out.update(spec.model_aliases.values())
+        if not out:
+            out.update(self.known_models.keys())
+        return {m for m in out if m}
+
+    def default_model_spec(self) -> ModelSpec:
+        """What we know about the default model, with the configured override applied.
+
+        ``defaults.context_window`` exists because a *declared but unprobed* model is the most common
+        first-run failure: the window is unknown, so no agent can be bound, and the person sees a
+        refusal instead of an agent. Naming the window in the config resolves it without a probe.
+        """
+        _, model, _ = self.default_pair()
+        spec = self.model_spec(model)
+        if spec.context_window is None and self.default.context_window:
+            return ModelSpec(model_id=model, context_window=int(self.default.context_window),
+                             max_output=spec.max_output, locality=spec.locality,
+                             provider_id=spec.provider_id, source="config")
+        return spec
 
     def public_dict(self) -> dict[str, Any]:
         """A redacted, JSON-serialisable view safe to emit as an event."""
@@ -722,6 +910,29 @@ def _check_permissions(path: Path) -> list[str]:
     return warnings
 
 
+def _remove_provider_references(document: dict[str, Any], provider_id: str) -> None:
+    """Drop every reference to a provider that has just been removed.
+
+    Two places name a provider: `concurrency.per_provider_limits[pid]` and `defaults.provider`. Leaving
+    either behind produced a config the loader had to repair — and before the loader learned to repair,
+    it refused to load at all, which made removing a provider from the console a way to brick the whole
+    engine. Both are pruned here so the state is never written in the first place.
+
+    Removing the default is deliberately *not* replaced with a guess at another provider: a default
+    chosen silently by this function would be a routing decision the user did not make. The absence is
+    resolved by the loader (`defaults.provider` is dropped, a configured provider is used), and the
+    console shows the remaining providers so a new default is one click away.
+    """
+    concurrency = document.get("concurrency")
+    if isinstance(concurrency, dict):
+        limits = concurrency.get("per_provider_limits")
+        if isinstance(limits, dict):
+            limits.pop(provider_id, None)
+    defaults = document.get("defaults")
+    if isinstance(defaults, dict) and str(defaults.get("provider") or "") == provider_id:
+        defaults.pop("provider", None)
+
+
 def write_provider(path: os.PathLike | str, entry: dict[str, Any], *,
                    provider_id: str | None = None,
                    remove: bool = False) -> Path:
@@ -742,22 +953,10 @@ def write_provider(path: os.PathLike | str, entry: dict[str, Any], *,
 
     `entry` is stored under `providers[provider_id]`; pass `remove=True` with an id to delete one.
     """
-    target = Path(path).expanduser()
-    if not target.is_file():
-        raise ConfigError(
-            f"no credentials file at {target}; refusing to create one. Copy "
-            "credentials.example.json to credentials.json first, or edit the existing file."
-        )
+    target, document = _read_document(path)
     pid = str(provider_id or entry.get("id") or "").strip()
     if not pid:
         raise ConfigError("a provider entry needs an id")
-
-    try:
-        document = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ConfigError(f"cannot read {target}: {exc}") from exc
-    if not isinstance(document, dict):
-        raise ConfigError(f"{target} is not a JSON object")
 
     providers = document.get("providers")
     if not isinstance(providers, dict):
@@ -766,6 +965,12 @@ def write_provider(path: os.PathLike | str, entry: dict[str, Any], *,
 
     if remove:
         providers.pop(pid, None)
+        # Prune the references to the provider that has just gone, in the same write, so the console
+        # cannot leave a config the loader must repair. A dangling `per_provider_limits` entry or a
+        # `defaults.provider` naming the removed provider is exactly what made "remove a provider"
+        # brick the engine (the loader refuses-or-prunes it), so the fix belongs at the writer too:
+        # the state is never created, rather than cleaned up afterwards.
+        _remove_provider_references(document, pid)
     else:
         payload = dict(entry)
         payload.pop("id", None)
@@ -773,6 +978,17 @@ def write_provider(path: os.PathLike | str, entry: dict[str, Any], *,
         providers[pid] = payload
 
     tmp = target.with_name(target.name + f".tmp.{os.getpid()}")
+    _write_document_atomic(target, document, tmp)
+    return target
+
+
+def _write_document_atomic(target: Path, document: dict[str, Any], tmp: Path) -> None:
+    """Write a JSON document with mode `0600`, fsynced, then renamed into place.
+
+    Split out so `write_provider`, `set_defaults` and `set_autonomy` share exactly one
+    implementation of the rule that matters: **the mode is set before the secret is written**, and a
+    torn write never replaces a good file.
+    """
     try:
         # Mode first, contents second: the file is never on disk with a secret in it and a lax mode.
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -792,6 +1008,96 @@ def write_provider(path: os.PathLike | str, entry: dict[str, Any], *,
         except OSError:
             pass
         raise ConfigError(f"failed to write {target}: {exc}") from exc
+
+
+def _read_document(path: os.PathLike | str) -> tuple[Path, dict[str, Any]]:
+    """Read a credentials document, refusing to invent one at a path that does not exist."""
+    target = Path(path).expanduser()
+    if not target.is_file():
+        raise ConfigError(
+            f"no credentials file at {target}; refusing to create one. Copy "
+            "credentials.example.json to credentials.json first, or edit the existing file."
+        )
+    try:
+        document = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"cannot read {target}: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ConfigError(f"{target} is not a JSON object")
+    return target, document
+
+
+def set_defaults(path: os.PathLike | str, *, provider: str = "", model: str = "",
+                 reviewer_provider: str = "", reviewer_model: str = "",
+                 context_window: int | None = None,
+                 clear: Iterable[str] = ()) -> Path:
+    """Merge a change into `defaults`, atomically, leaving everything else untouched.
+
+    This is what makes "a default provider and model that everyone uses unless I specify" a real,
+    one-command setting rather than a hand edit. Three rules, the same ones `write_provider` follows:
+
+    - **Merge, never replace.** Only the named keys change; providers, windows and the policy block
+      survive. A person setting a default must never lose their keys.
+    - **Atomic, then `0600`.** A partial defaults block is a config that loads to something nobody
+      chose.
+    - **An empty string does not silently overwrite.** Pass `clear=("model",)` to remove a key
+      deliberately; omitting `model` leaves the existing value alone.
+    """
+    target, document = _read_document(path)
+    defaults = document.get("defaults")
+    if not isinstance(defaults, dict):
+        defaults = {}
+        document["defaults"] = defaults
+
+    if provider:
+        defaults["provider"] = str(provider).strip()
+    if model:
+        defaults["model"] = str(model).strip()
+    if context_window is not None:
+        defaults["context_window"] = int(context_window)
+    # The reviewer pair is written in the readable nested form the loader also accepts.
+    reviewer = defaults.get("reviewer")
+    if reviewer_provider or reviewer_model:
+        if not isinstance(reviewer, dict):
+            reviewer = {}
+            defaults["reviewer"] = reviewer
+        if reviewer_provider:
+            reviewer["provider"] = str(reviewer_provider).strip()
+        if reviewer_model:
+            reviewer["model"] = str(reviewer_model).strip()
+        if not reviewer:
+            defaults.pop("reviewer", None)
+
+    for key in clear:
+        defaults.pop(str(key), None)
+    if not defaults:
+        document.pop("defaults", None)
+
+    tmp = target.with_name(target.name + f".tmp.{os.getpid()}")
+    _write_document_atomic(target, document, tmp)
+    return target
+
+
+def set_autonomy(path: os.PathLike | str, *, goal: dict[str, Any] | None = None) -> Path:
+    """Merge a change into the `[goal]` autonomy block, atomically.
+
+    Kept separate from `set_defaults` so the *model* decision and the *authority* decision are two
+    deliberate writes. A person changing which model their people run on should not accidentally
+    change whether a run needs them.
+    """
+    target, document = _read_document(path)
+    if not goal:
+        return target
+    section = document.get("goal")
+    if not isinstance(section, dict):
+        section = {}
+        document["goal"] = section
+    valid = {f.name for f in fields(GoalConfig)}
+    for key, value in goal.items():
+        if str(key) in valid and value is not None:
+            section[str(key)] = value
+    tmp = target.with_name(target.name + f".tmp.{os.getpid()}")
+    _write_document_atomic(target, document, tmp)
     return target
 
 
@@ -909,6 +1215,53 @@ def _build_simple(cls, raw_section: Any, name: str):
         raise ConfigError(f"config {name!r} has an invalid value: {exc}") from exc
 
 
+def _build_defaults(raw_section: Any) -> DefaultsConfig:
+    """Instantiate :class:`DefaultsConfig`, tolerating the legacy and the nested shapes.
+
+    `defaults` was a plain dict before this change, and the example file still writes the flat form
+    (`{"provider": …, "model": …}`). Both are read, so an existing credentials.json keeps working —
+    the nested form exists only so a caller can hand it a validated object.
+    """
+    if raw_section is None:
+        return DefaultsConfig()
+    if isinstance(raw_section, DefaultsConfig):
+        return raw_section
+    if not isinstance(raw_section, dict):
+        raise ConfigError("config 'defaults' must be an object")
+    # A `reviewer` sub-object is the readable form; the flat keys are kept alongside it.
+    nested = raw_section.get("reviewer")
+    reviewer = nested if isinstance(nested, dict) else {}
+    known = {f.name for f in fields(DefaultsConfig)}
+    kwargs: dict[str, Any] = {k: v for k, v in raw_section.items() if k in known}
+    if reviewer:
+        for key, target in (("provider", "reviewer_provider"), ("model", "reviewer_model")):
+            value = reviewer.get(key)
+            if value and not kwargs.get(target):
+                kwargs[target] = str(value)
+    if "context_window" in kwargs and kwargs["context_window"] in ("", None):
+        kwargs.pop("context_window")
+    try:
+        return DefaultsConfig(**kwargs)
+    except (TypeError, ConfigError) as exc:
+        # A bad defaults block must not brick the engine — every other setting would still be usable.
+        # It is reported as a warning and the safe defaults apply, which is the same degradation the
+        # loader already applies to a stale `defaults.provider`.
+        raise ConfigError(f"config 'defaults' has an invalid value: {exc}") from exc
+
+
+def _defaults_or_warn(raw_section: Any, warnings: list[str]) -> DefaultsConfig:
+    """Build the defaults view, degrading to the safe defaults with a stated reason.
+
+    A *typo* in one optional block must not take down `doctor`, which exists to explain the problem —
+    the same reasoning that makes a stale `defaults.provider` degrade rather than refuse.
+    """
+    try:
+        return _build_defaults(raw_section)
+    except ConfigError as exc:
+        warnings.append(f"{exc}; using the built-in defaults. Fix the file or the Defaults editor.")
+        return DefaultsConfig()
+
+
 def load(path: os.PathLike | str | None = None, *, warn: bool = True) -> Config:
     """Load and validate configuration.
 
@@ -968,19 +1321,35 @@ def load(path: os.PathLike | str | None = None, *, warn: bool = True) -> Config:
         raise ConfigError("config 'defaults' must be an object")
     default_provider = defaults.get("provider")
     if default_provider and default_provider not in providers:
-        raise ConfigError(
-            f"defaults.provider {default_provider!r} is not a configured provider; "
-            f"configured: {', '.join(sorted(providers))}"
+        # A default naming a provider that is no longer configured is a *stale pointer*, not a typo to
+        # refuse over. Refusing here bricked the whole engine — every command, including `doctor`, which
+        # exists to diagnose it — the moment a provider was removed from the console. So it degrades:
+        # the default is dropped, the reason is recorded as a warning, and the caller falls back to
+        # whatever provider is configured. A call that *names* the missing provider still fails
+        # loudly at the gateway (`unknown provider … available: …`), so nothing is silently misrouted.
+        warnings.append(
+            f"defaults.provider {default_provider!r} is not a configured provider "
+            f"({', '.join(sorted(providers)) or 'none'}); ignoring it and using a configured default. "
+            f"Fix the file or pick a provider in the console."
         )
+        defaults = dict(defaults)
+        defaults.pop("provider", None)
+        default_provider = None
 
     concurrency = _build_simple(ConcurrencyConfig, raw.get("concurrency"), "concurrency")
-    # A per-provider limit naming an unknown provider is a typo, not a harmless extra.
+    # A per-provider limit naming an unknown provider is a *dangling reference* left by a provider
+    # removal, not a reason to refuse the whole config. Pruning it here is the fix that cannot brick
+    # the engine: `write_provider(remove=True)` already avoids leaving it behind, and this recovers the
+    # files it created before that fix. The prune is reported so it is never silent.
     unknown_limits = set(concurrency.per_provider_limits) - set(providers)
     if unknown_limits:
-        raise ConfigError(
-            "concurrency.per_provider_limits names unknown providers: "
-            + ", ".join(sorted(unknown_limits))
+        warnings.append(
+            "concurrency.per_provider_limits named providers that are not configured "
+            f"({', '.join(sorted(unknown_limits))}); those entries were pruned. "
+            "This is left behind when a provider is removed."
         )
+        for stale in sorted(unknown_limits):
+            concurrency.per_provider_limits.pop(stale, None)
     # A configured provider with no explicit limit inherits its own concurrency field.
     for pid, prov in providers.items():
         concurrency.per_provider_limits.setdefault(pid, prov.concurrency)
@@ -1007,6 +1376,7 @@ def load(path: os.PathLike | str | None = None, *, warn: bool = True) -> Config:
         known_models=known_models,
         catalog=catalog if isinstance(catalog, dict) else {},
         defaults=defaults,
+        default=_defaults_or_warn(defaults, warnings),
         context=_build_simple(ContextConfig, raw.get("context"), "context"),
         concurrency=concurrency,
         health=_build_simple(HealthConfig, raw.get("health"), "health"),

@@ -135,6 +135,23 @@ class AgentLoop:
         messages.append(Message.text_message(Role.USER, user))
         specs = self.tools.specs() if hasattr(self.tools, "specs") else []
 
+        # ── the step budget is declared, and the last step is reserved for the answer ──
+        #
+        # A real run exposed why this is necessary. A capable model asked to write a PRD in a large
+        # monorepo spent *every* step calling `list_dir`/`read_file`, reached the bound with no output
+        # at all, and the node failed its completion contract. The log said "declared criteria not
+        # covered", which blames the model — but the model had never been told it had a budget, and
+        # its 12th step came with tools still on offer, so there was no step at which it had to
+        # deliver. Two mechanisms fix that:
+        #
+        #   1. A reminder once the budget is nearly spent, stating how many steps remain and that the
+        #      next reply must carry the work and its trailer.
+        #   2. The final step runs **without tools**, so the model cannot defer again — it must answer.
+        #      A reserved answer step is what guarantees a trailer exists to parse, which is the thing
+        #      every downstream guarantee (contract, evidence, handoff) is built on.
+        reserve_final_step = self.max_steps > 1
+        answer_step = self.max_steps if reserve_final_step else None
+
         for step in range(1, self.max_steps + 1):
             if self.can_continue is not None:
                 allowed, reason = self.can_continue()
@@ -145,8 +162,26 @@ class AgentLoop:
                         f"[the run stopped before this node finished: {outcome.stop_reason}]")
                     return outcome
 
+            final = answer_step is not None and step >= answer_step
+            remaining = self.max_steps - step
+            if remaining <= 1 and not final:
+                # Tell the model, in the conversation, that it is about to run out. Without this the
+                # bound is invisible and a thorough investigation becomes a silent failure.
+                messages.append(Message.text_message(
+                    Role.USER,
+                    f"[budget] Step {step} of {self.max_steps}. One step remains after this one, and "
+                    "that final step cannot call tools. Stop investigating now: deliver your work and "
+                    "its required output trailer in your next reply."))
+            elif final:
+                messages.append(Message.text_message(
+                    Role.USER,
+                    "[budget] This is the final step and tools are disabled. Produce your work and the "
+                    "required output trailer now, from what you have already gathered. Do not ask for "
+                    "more information."))
+
             request = ChatRequest(model="", messages=list(messages), system=system,
-                                  tools=list(specs), max_tokens=self.max_output_tokens)
+                                  tools=[] if final else list(specs),
+                                  max_tokens=self.max_output_tokens)
             response = self.complete(request)
             outcome.steps = step
             usage = getattr(response, "usage", None)

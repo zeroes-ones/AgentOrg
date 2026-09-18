@@ -19,12 +19,13 @@ work together the way a team does.
 | Document | Read it when |
 |---|---|
 | **README.md** (this file) | You want to know what this is, install it, and run it |
+| [AUTONOMY-MAP.md](AUTONOMY-MAP.md) | You want the whole picture: portfolio → mission → goal → run, skills, hand-off, hiring, swarms, gates — and where it is autonomous (and where it deliberately is not) |
 | [USAGE.md](USAGE.md) | You are using it day to day: the CLI, the app, hiring agents, planning work |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Something is wrong, or you need to debug a run |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | You are changing the code |
 | [OPERATIONS.md](OPERATIONS.md) | You are tuning cost, concurrency, health or policy |
 | [EVALUATION.md](EVALUATION.md) | You want to understand context, memory, telemetry or the eval suite |
-| [DESIGN.md](DESIGN.md) | You want the full design record (master plus ten focused amendments) |
+| [DESIGN.md](DESIGN.md) | You want the full design record (master plus the focused amendments) |
 
 ---
 
@@ -35,14 +36,17 @@ work together the way a team does.
 | **Skill** | A procedure: markdown plus a typed contract | `code-reviewer` | The Skills library (immutable) |
 | **Agent** | An employee: a named instance bound to skills + a model | `ag_7f3a` / "Sana" | You |
 | **Team** | A group with a lead | "Quality" | You |
-| **Org** | Roster, reporting lines, topology | your company | You |
+| **Org** | Roster, reporting lines, topology | `org_tesla` | You |
+| **Principal** | The person who runs several orgs | `pr_owner` / "you" | You |
+| **Portfolio** | The register: the principal and their orgs | `portfolio.json` | You |
 | **Task** | One unit of work routed to one agent | `task_014` | The orchestrator |
 | **Artifact** | A typed, hashed output | `change`, `prd` | The producing agent |
 | **Handoff** | A contract-checked artifact transfer | `Alice → Sana` | The orchestrator |
 | **Run** | One project execution | `run_2026…` | The engine |
 
 A skill is **capability**; an agent is **headcount**. That split is what makes "the same skill,
-three different people" natural rather than special-cased.
+three different people" natural rather than special-cased — and a **principal** running several
+**orgs** is the same idea one level up: the person is shared, the agents are not.
 
 ## How work is assigned
 
@@ -356,11 +360,55 @@ python3 -m engine.cli plan --goal "Build a booking API with auth and payments"
 
 # See the org you would run it with, and what it is missing.
 python3 -m engine.cli org --goal "Build a booking API with auth and payments"
+
+# What is happening: the headline, the timeline, the gaps and the one next step.
+python3 -m engine.cli activity --project ~/code/my-app
+
+# Who is working on what: every unit of work, its owner, its handoffs and progress.
+python3 -m engine.cli flow --project ~/code/my-app
+
+# What model does everyone run on? And how autonomous is a goal by default?
+python3 -m engine.cli defaults
 ```
 
-That last command is the one to run before any real work: it prints the roster, the policy matrix,
-the plan, the **staffing gaps** (capabilities the plan needs that no agent holds) and the bindings —
-so you know what to hire before a run rather than discovering it mid-graph.
+That penultimate command is the one to run before any real work: it prints the roster, the policy
+matrix, the plan, the **staffing gaps** (capabilities the plan needs that no agent holds) and the
+bindings — so you know what to hire before a run rather than discovering it mid-graph.
+
+**One default, for everyone.** `defaults` is the single answer to *which model do my people run on*:
+the built-in company, every hire you make, and every helper the engine creates for you all inherit it
+unless you bind them to something else. `defaults set --provider P --model M` changes it in one
+command (merging, never replacing — your keys and policy survive), and `defaults autonomy
+--no-auto-gates` sets how autonomous a new goal is.
+
+**A goal is autonomous unless you chose otherwise.** Arming a goal is standing authority to pass the
+gates the *org* can decide and to create the person a missing skill needs — on the default model,
+ephemeral by default, so a plan never parks three nodes in on a roster accident. A **terminal** gate
+(a release, a close, a spend) is never passed: that stays yours. Add `--human-gate` to a goal, or flip
+the switch in the app's Work panel, when you want to be involved.
+
+**Who is working on what.** `flow` is the board: one row per unit of work with its owner, what came in
+from which agent, what went out to whom, and why it stopped if it did. It reads what the engine already
+recorded — the run's bindings, the handoffs, the spawns — so the CLI and the app's **Flow** panel
+cannot disagree.
+
+**The org follows the goal.** The planner classifies a goal and composes the *right* company for it:
+a software build keeps the product-manager → architect → developer pipeline; a strategy goal staffs
+the CEO, a business strategist and an FP&A analyst; a go-to-market goal staffs marketing and growth;
+a research goal staffs a UX researcher. A named capability is an instruction, so *"use the CEO skill
+and bring a market researcher"* puts both in the plan. The chosen shape is printed (`Shape: strategy`)
+and travels with the plan. Before this, a non-software goal silently ran as an engineering build —
+the goal text never reached the planner's keyword table, so the org was wrong and nothing said so.
+
+**Why a run stopped is a first-class fact.** Every run records a `stop_reason` derived from the
+runner's own log — a blocked hand-off (`pm: a hand-off payload was blocked by the edge guardrail — …`),
+a violated contract, an exhausted loop, a cost ceiling — and it is shown by `run`, `status`, `activity`
+and the app. A node's own summary survives onto the checkpoint too, so "blocked" always comes with the
+reason.
+
+`engine.cli activity` is the one to reach for when you do not know what is going on: it reads what the
+engine already wrote and answers *what is it doing now*, *how did it get here*, *why did it stop* and
+*what do I do next* — with the same report the app's **Activity** tab renders.
 
 ## Testing
 
@@ -374,8 +422,10 @@ python3 run_tests.py             # dependency-free, identical result
 python3 run_tests.py -k routing  # filter by name
 ```
 
-1096 tests, all offline: no network, no credentials, no provider required. They use a deterministic
-in-process fake provider, so a failing test is reproducible rather than a coin flip.
+1482 tests, all offline: no network, no credentials, no provider required. They use a deterministic
+in-process fake provider, so a failing test is reproducible rather than a coin flip. (Four
+tests in `test_phase8_authoring.py` need a model with a probed context window and fail without a
+reachable provider; they are the only environment-dependent ones.)
 
 The macOS console has its own suite, in the same spirit and likewise offline:
 
@@ -516,18 +566,34 @@ The app finds the repository by walking up from its own executable until it sees
 `AgentOrg/engine/cli.py`, so it works from a `swift run`, a `--debug` build, and a bundled `.app`
 alike.
 
-One window, seven tabs, each answering exactly one question — a dashboard with no single question is
+One window, ten tabs, each answering exactly one question — a dashboard with no single question is
 sprawl:
 
 | Tab | The question it answers |
 |---|---|
+| **Portfolio** | *Which orgs am I running, and what is each doing?* — the principal and every org, with Run/Stop/Switch |
 | **Org** | *Who do I have, and is the org healthy?* |
 | **People** | *Who can I hire, and what are they on?* — hire, edit (keeping history), retire |
 | **Providers** | *Which models can I reach, and with what?* — add a key/URL/headers, test, fetch models |
+| **Improve** | *What does the system think is wrong with itself?* — proposals, and what it refused |
+| **Activity** | *What is happening, why, and what do I do next?* — the headline, the timeline, the gaps, and the one next step |
 | **Work** | *Where is work stuck?* — the run, its gates, the goal, and any swarm in flight |
 | **Cost** | *What is this costing?* — including the prompt-cache hit rate and what it saved |
 | **Context** | *How full are the agents' contexts?* |
 | **Resources** | *Is the machine coping?* |
+
+**Portfolio** is first because it is the *whole* picture: a person is not one org. It lists the several
+orgs one principal runs — each with its own agents, missions, goals and budget — with the live mission,
+spend and blockers per org, and Run / Stop / Switch on each. The engine keeps a fleet, so one org's run
+does not block another's, bounded by one global concurrency ceiling and a per-org daily budget.
+
+**Activity** answers the question a person actually asks of an autonomous org: *what is it doing?*
+It renders one report the engine derives from the run checkpoint, the trace, the goal, the child
+transcripts and the proposals — the present tense first (a headline like "Waiting on you: …" or
+"Stopped — pm: a hand-off payload was blocked by the edge guardrail"), then progress and unstaffed
+capabilities, then the single next action, then the ordered timeline of how it got there. It badges
+the sidebar when work is waiting on you, and it is the same report `engine.cli activity` prints, so
+the CLI and the app never disagree about what happened.
 
 Two of those tabs close a gap worth naming: the engine was config-driven and the console could only
 *show* the result. **Providers** now adds an endpoint (with a custom header if the gateway needs one),
@@ -585,7 +651,9 @@ that is what you came for:
 The three design amendments behind them —
 [`DESIGN-WORKSPACE.md`](DESIGN-WORKSPACE.md), [`DESIGN-GOAL.md`](DESIGN-GOAL.md),
 [`DESIGN-SUBAGENTS.md`](DESIGN-SUBAGENTS.md) — record the reasoning and the
-trade-offs, including where these choices *weaken* an existing guarantee.
+trade-offs, including where these choices *weaken* an existing guarantee. A fourth,
+[`DESIGN-ACTIVITY.md`](DESIGN-ACTIVITY.md), records the org that matches the goal and
+the one report that answers *what is it doing, why, and what next?*
 
 The engine drives a goal end to end: `run` plans, binds and executes a graph,
 `status` reports where it is, and `decide` / `instruct` are how you resolve a gate
@@ -615,6 +683,9 @@ of it.
 ## Where to go next
 
 - **[USAGE.md](USAGE.md)** — the CLI and app in detail, hiring agents, planning and approving work.
+- **[AUTONOMY-MAP.md](AUTONOMY-MAP.md)** — the end-to-end map: mission → goal → run, skills and their
+  contracts, typed handoffs, hiring and binding, the four parallelism primitives, gates, memory, and
+  the honest list of where it is *not* autonomous.
 - **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — a symptom→cause→fix runbook, and how to debug a run.
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — the module map and the invariants each layer owns.
 - **[OPERATIONS.md](OPERATIONS.md)** — cost, concurrency, health and policy tuning.
