@@ -469,6 +469,56 @@ def test_anthropic_round_trips_mixed_text_and_tool_use():
     assert blocks[1]["input"] == {"a": 1}
 
 
+def test_anthropic_sends_tool_results_as_user_turns_and_merges_consecutive_ones():
+    """Two live-verified defects, in one payload.
+
+    **The Messages API has no `tool` role.** Passing the canonical role through verbatim produced
+    `HTTP 422 ... messages[2].role: unknown variant 'tool'` and killed every tool-using node against
+    any Anthropic-dialect endpoint — the run never got past its first tool call.
+
+    **Every `tool_result` for one assistant turn must arrive in the user turn immediately after it.**
+    The agent loop emits one tool message per call, so a turn that made two calls produced
+    assistant(tool_use a, b) → user(result a) → user(result b), and the API refused it:
+    "`tool_use` ids were found without `tool_result` blocks immediately after". Both were found by
+    running a real goal, not by reading.
+    """
+    provider = _anthropic(StubTransport())
+    assistant = Message(role=Role.ASSISTANT, content=[
+        ContentBlock(type="tool_use", tool_call=ToolCall(id="c1", name="read_file", arguments={})),
+        ContentBlock(type="tool_use", tool_call=ToolCall(id="c2", name="read_file", arguments={})),
+    ])
+    def result(call_id: str) -> Message:
+        return Message(role=Role.TOOL, tool_call_id=call_id, content=[
+            ContentBlock(type="tool_result", text="ok", tool_call_id=call_id)])
+    body = provider._payload(ChatRequest(
+        model="claude",
+        messages=[Message.text_message(Role.USER, "go"), assistant, result("c1"), result("c2"),
+                  Message.text_message(Role.USER, "now summarise")],
+    ))
+    roles = [m["role"] for m in body["messages"]]
+    assert "tool" not in roles, roles
+    # One user turn carrying both results, immediately after the assistant's two tool_use blocks.
+    assert roles == ["user", "assistant", "user", "user"], roles
+    assert [b["tool_use_id"] for b in body["messages"][2]["content"]] == ["c1", "c2"]
+    # An ordinary remark still starts its own turn rather than merging into the results.
+    assert body["messages"][3]["content"] == [{"type": "text", "text": "now summarise"}]
+
+
+def test_anthropic_tool_turn_with_plain_text_still_becomes_a_tool_result_block():
+    """The executor builds both shapes, and a `text` block in a user turn is not an answer to a call."""
+    provider = _anthropic(StubTransport())
+    body = provider._payload(ChatRequest(model="claude", messages=[
+        Message.text_message(Role.USER, "go"),
+        Message(role=Role.TOOL, tool_call_id="c1",
+                content=[ContentBlock(type="text", text="42")]),
+    ]))
+    last = body["messages"][-1]
+    assert last["role"] == "user"
+    assert [b["type"] for b in last["content"]] == ["tool_result"]
+    assert last["content"][0]["tool_use_id"] == "c1"
+    assert last["content"][0]["content"] == "42"
+
+
 def test_anthropic_parses_response_usage_and_stop_reason():
     transport = StubTransport({"v1/messages": {
         "model": "claude-sonnet-4-20250514",

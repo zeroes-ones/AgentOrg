@@ -147,6 +147,19 @@ class AnthropicProvider(Provider):
                     "input": call.arguments,
                 })
 
+        # A canonical `tool` turn may carry its result as plain text with only `tool_call_id` set,
+        # rather than as a pre-built `tool_result` block — the executor builds both shapes. Without
+        # this the result went to the API as an ordinary `text` block in a user turn, which the model
+        # reads as an unrelated remark rather than as the answer to the call it just made.
+        if message.role is Role.TOOL and not any(b["type"] == "tool_result" for b in blocks):
+            blocks.insert(0, {
+                "type": "tool_result",
+                "tool_use_id": message.tool_call_id or "",
+                "content": message.text or "",
+            })
+            if len(blocks) > 1 and blocks[1]["type"] == "text":
+                blocks.pop(1)
+
         if not blocks:
             # Never send an empty content array: the API rejects it, and an empty turn is
             # more honestly represented as an empty string.
@@ -165,7 +178,28 @@ class AnthropicProvider(Provider):
             if role is Role.SYSTEM:
                 # System turns are hoisted; leaving one in the array is an API error.
                 continue
-            messages.append({"role": role.value, "content": self._content_blocks(message)})
+            # **The Messages API has no `tool` role.** Its only roles are `user` and `assistant`,
+            # and a tool's result is a `tool_result` content block *inside a user turn*. Sending the
+            # canonical `tool` role through verbatim produced
+            # `HTTP 422 ... messages[2].role: unknown variant 'tool'`, which killed every tool-using
+            # node against any Anthropic-dialect endpoint — the run never got past its first tool
+            # call. The block builder already emits the right `tool_result` block; only the role was
+            # wrong.
+            wire_role = "user" if role is Role.TOOL else role.value
+            blocks = self._content_blocks(message)
+            # **Every `tool_result` for one assistant turn must arrive in the user turn immediately
+            # after it.** The agent loop emits one tool message per call, so when a turn made two calls
+            # the request carried assistant(tool_use a, b) → user(result a) → user(result b), and the
+            # API refused it: "`tool_use` ids were found without `tool_result` blocks immediately
+            # after: call_…". Merging consecutive tool turns into one user turn is what satisfies the
+            # rule; it only merges result-carrying turns, so an ordinary user remark still starts its
+            # own turn.
+            if (wire_role == "user" and messages and messages[-1]["role"] == "user"
+                    and any(b.get("type") == "tool_result" for b in blocks)
+                    and any(b.get("type") == "tool_result" for b in messages[-1]["content"])):
+                messages[-1]["content"].extend(blocks)
+                continue
+            messages.append({"role": wire_role, "content": blocks})
 
         if not messages:
             raise GatewayError(
