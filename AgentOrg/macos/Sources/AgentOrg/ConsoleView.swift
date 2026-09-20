@@ -518,11 +518,19 @@ struct ConsoleView: View {
         case .now: return controller.spine.needsAPerson ? "needs you now" : "live · next step"
         case .runs: return "past runs · disk"
         case .org: return "people · hiring"
-        // Names the two facts a person comes here for: whether anything is switched on, and how much
-        // of the declared set is behind a tool at all.
-        case .system: return controller.systemEnabled
-            ? "\(controller.systemGrantedCount)/\(controller.systemCapabilities.count) held"
-            : "off · what it reaches"
+        // Describes the destination, like every row above it — it used to read "6/12 held", a bare
+        // ratio with no subject, which a person cannot act on and which sat in the navigation on every
+        // screen. The owner asked three times what "6/12" meant, which is the test this failed: a
+        // number in a menu bar has to say what it counts or it is noise. The count still exists, in
+        // the pane that can explain it ("held by an agent", with the two lists and the roster route).
+        //
+        // What earns a place here instead is the state that *asks* for something: full access lifts
+        // the allowlists and the per-action approval, so it is the one fact about this pane worth
+        // carrying into the navigation. It is also what the pane's own next step tells you to reduce.
+        case .system:
+            if !controller.systemEnabled { return "off · nothing may act" }
+            if controller.systemFullAccess { return "full access on · who may act" }
+            return "machine access · who may act"
         case .setup: return controller.setupGate == .ready ? "model · project" : "finish setup"
         }
     }
