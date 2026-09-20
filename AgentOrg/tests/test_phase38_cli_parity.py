@@ -1042,7 +1042,15 @@ def test_the_cli_and_the_console_discard_through_the_same_operation(run_project)
     assert (sorted(entry["name"] for entry in cli_payload["moved"])
             == sorted(entry["name"] for entry in console_payload["moved"]))
     assert cli_payload["kept"] == console_payload["kept"]
-    assert cli_payload["freed_bytes"] == console_payload["freed_bytes"]
+    # **Shape, not byte-for-byte size.** Parity is "the terminal and the console reach the same
+    # operation and report the same thing", and `freed_bytes` is a property of *this* checkpoint, not of
+    # the route: `park_at_the_gate` writes a fresh checkpoint each call and its JSON carries timestamps,
+    # so the two files are the same name at slightly different sizes. Asserting equal sizes compared two
+    # independently generated documents — it passed locally and failed in CI, which is what a test
+    # asserting the wrong thing does.
+    assert isinstance(cli_payload["freed_bytes"], int) and cli_payload["freed_bytes"] >= 0
+    assert isinstance(console_payload["freed_bytes"], int) and console_payload["freed_bytes"] >= 0
+    assert cli_payload["reason"] == console_payload["reason"]
 
 
 def test_discarding_drops_the_run_the_console_was_holding(run_project):
