@@ -133,7 +133,13 @@ struct AgentOrgApp: App {
     /// call sites below exist to prevent.
     @ViewBuilder
     private var commands: some Commands {
-        CommandGroup(replacing: .newItem) { }
+        // `EmptyView()` is written out rather than leaving the closure empty. An empty body makes the
+        // content type an *inferred* `EmptyView`, and Swift 6.3.3 then fails to resolve the
+        // `CommandsBuilder` overload: "static method 'buildExpression' requires that
+        // 'CommandGroup<EmptyView>' conform to 'View'". Swift 6.4 accepts the empty form, so this only
+        // shows up on the older toolchain — CI runs 6.3.3 and caught it, which is the whole reason the
+        // Swift job exists. Naming the type removes the inference and compiles on both.
+        CommandGroup(replacing: .newItem) { EmptyView() }
         CommandGroup(after: .newItem) {
             Button("Open Project…") {
                 openProjectPicker(controller: controller) { controller.confirmProject() }
