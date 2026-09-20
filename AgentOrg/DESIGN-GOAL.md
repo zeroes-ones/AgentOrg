@@ -58,7 +58,7 @@ The goal is a **versioned projection**, written atomically beside the run state:
   "state": "armed",              // armed | paused | completed | blocked | cleared
   "armed_at": "2026-…Z",
   "armed_by": "owner",           // owner | cli | app
-  "pause_reason": null,          // budget_spend | manual | gate
+  "pause_reason": null,          // budget_spend | manual | gate | restored | run-complete
   "token_budget": 0,             // 0 = OFF (see §5)
   "spend": { "rounds": 0, "tokens": 0, "requests": 0, "cost_usd": 0.0 },
   "history": [ { "at": "…", "kind": "continue|pause|resume|complete|blocked",
@@ -129,7 +129,8 @@ ignored:
 - A Goal only exists when **explicitly armed** — never inferred, never restored
   armed, never armed as a side effect of `run`.
 - It is **paused by any of**: `goal pause`, engine stop, a gate, an unrecoverable
-  provider error, or a set budget being reached.
+  provider error, a set budget being reached, or a round that advanced nothing —
+  `run-complete`, which is a finished graph the engine stops looping over (§9).
 - **Cumulative statistics are always tracked** (`rounds`, `tokens`, `requests`,
   `cost_usd`) and shown live, so "no ceiling" never means "no idea what it is
   costing". The console's **Cost** tab already has the surface.
@@ -182,7 +183,7 @@ stateDiagram-v2
   [*] --> cleared
   cleared --> armed : goal set / goal resume (explicit)
   armed --> armed : continue (quiet) · node done
-  armed --> paused : goal pause · stop · gate · budget_spend · restored
+  armed --> paused : goal pause · stop · gate · budget_spend · restored · run-complete
   paused --> armed : goal resume (grants fresh slice)
   armed --> completed : update_goal(complete)
   armed --> blocked : update_goal(blocked)
@@ -199,7 +200,7 @@ New events (mirrored in the Swift `EventType` so the two cannot drift):
 |---|---|
 | `goal.armed` / `goal.resumed` | the loop is live |
 | `goal.progress` | a quiet round boundary — **not** once per turn |
-| `goal.paused` | with `reason`: `manual` \| `gate` \| `budget_spend` \| `restored` |
+| `goal.paused` | with `reason`: `manual` \| `gate` \| `budget_spend` \| `restored` \| `run-complete` |
 | `goal.completed` / `goal.blocked` | the agent's own verdict |
 | `goal.cleared` | objective removed |
 
@@ -228,6 +229,7 @@ paused goal is exactly that.
 | Goal and run disagree | Work continues against a graph nobody approved | Re-plan is a gate, not a silent rewrite |
 | Stale goal after re-attach | Yesterday's objective drives today's repo | Goal is per-workspace in `.agent_state/`; attach reports an existing one and resumes it only on request |
 | Two goals at once | Ambiguous objective | One goal per workspace; `goal set` replaces with the previous one kept in `history` |
+| Finished graph that never reports | `done` is reached and then never printed: a no-op round every ~0.3s, one runner process each, until the 10,000-round cap | A round that leaves the runner's checkpoint unchanged stops the loop and pauses the goal (`run-complete`), so the cap stays the backstop it is documented as |
 
 ## 10. Trade-offs
 

@@ -661,3 +661,111 @@ def test_the_rework_target_is_the_chain_producer_not_a_verifier(planner):
             # verifier (which is the loop's exit-condition node).
             assert loop["nodes"][-1] != loop["nodes"][0]
     assert verifier_ids  # sanity: there is an agent gate
+
+
+# ── scope: the org must be sized to the work, not only chosen for it ─────────
+#
+# The real run these cover: "create a file src/notes.md containing exactly the single line: hello
+# from agentorg" was staffed with product-manager, system-architect, api-designer, backend-developer
+# and three verifiers. The file was written correctly by the second node... and the third refused to
+# pass: `architect` reported `status: needs_review / verdict: changes_requested` with "no runtime
+# architecture exists for this deterministic static artifact, so the system-architect gates (C4,
+# ADRs, resilience, observability, capacity, tenancy, security) are reported N/A with reasons rather
+# than fabricated", and the run parked there with five nodes pending. Nothing about that node was
+# dishonest — the *staffing* asked a role to do work that does not exist, and a node whose criteria
+# genuinely cannot apply has no way to report success. So the fix is the plan, not the vocabulary.
+
+ONE_FILE_GOAL = ("create a file src/notes.md containing exactly the single line: hello from agentorg")
+
+
+def _one_file_plan(planner, slug: str) -> Plan:
+    """The plan for the goal above, under its own slug — the subject of every scope test here."""
+    return planner.plan(ONE_FILE_GOAL, slug=slug)
+
+
+def test_a_goal_that_states_its_own_deliverable_is_sized_to_the_work(planner):
+    plan = _one_file_plan(planner, "one-file")
+    assert plan.scope == "direct"
+    assert set(plan.skills_used) == {"backend-developer", "code-reviewer"}
+    assert plan.validation.valid, plan.validation.errors
+
+
+def test_the_roles_a_direct_plan_leaves_out_are_named_not_dropped_silently(planner):
+    """An org of two where the shape declares seven is a decision the Owner must be able to audit."""
+    plan = _one_file_plan(planner, "one-file-why")
+    reasons = " ".join(plan.dropped)
+    for omitted in ("product-manager", "system-architect", "api-designer", "qa-engineer",
+                    "security-reviewer"):
+        assert omitted in reasons, f"{omitted} was dropped without a reason"
+    assert "sized the plan to the goal" in plan.summary()
+    assert plan.as_dict()["scope"] == "direct"
+
+
+def test_a_goal_without_a_stated_deliverable_keeps_the_full_org(planner):
+    """The sizing must not shrink a real build: the roles it removes are the ones the goal answered."""
+    plan = planner.plan("Build a booking SaaS MVP with auth and payments", slug="booking-full")
+    assert plan.scope == "build"
+    assert {"product-manager", "system-architect", "backend-developer"} <= set(plan.skills_used)
+
+
+@pytest.mark.parametrize("goal, slug", [
+    # A path with no content: what goes in the file is still a decision.
+    ("add a file src/notes.md", "sized-no-content"),
+    # Two paths: a change set rather than one artifact.
+    ("create src/a.md and src/b.md containing exactly the line hello", "sized-two-files"),
+    # The content is deferred to whoever does the work, however exact the phrasing sounds.
+    ("update README.md and make sure it contains exactly the required sections", "sized-deferred"),
+    # No path at all.
+    ("write the release notes as exactly one line", "sized-no-path"),
+])
+def test_a_goal_that_does_not_state_its_deliverable_keeps_the_chain(planner, goal, slug):
+    plan = planner.plan(goal, slug=slug)
+    assert plan.scope == "build", f"{goal!r} was sized down without stating its deliverable"
+
+
+def test_a_direct_plan_produces_before_it_verifies(planner):
+    """The loop's first pass is the only pass that matters here, and its order decides what the
+    verifier has to look at: a verifier-first pass would judge a file the producer has not written."""
+    plan = _one_file_plan(planner, "one-file-order")
+    loop = plan.loops[0]
+    assert loop["nodes"] == ["developer", "reviewer"]
+    assert loop["exit_when"] == "reviewer.verdict == pass"
+    assert loop["max_iterations"] >= 1
+
+
+def test_a_direct_plan_keeps_every_termination_invariant(planner):
+    plan = _one_file_plan(planner, "one-file-invariants")
+    resolvable = {n["id"] for n in plan.nodes} | {g["id"] for g in plan.gates}
+    assert plan.manifest["start"] in resolvable
+    assert all(end in resolvable for end in plan.manifest["end"])
+    assert all(e["from"] in resolvable and e["to"] in resolvable for e in plan.manifest["edges"])
+    assert any(g.get("kind") == "human" for g in plan.gates)
+    assert any(g.get("kind") == "agent" for g in plan.gates)
+    # The terminal gate must declare evidence, or an unattended goal has nothing to release on.
+    human = next(g for g in plan.gates if g.get("kind") == "human")
+    assert human["requires"]
+
+
+def test_a_direct_goal_that_names_a_specialist_still_gets_one(planner):
+    """Sizing removes the roles the goal left nothing for, not the ones it asks for outright."""
+    plan = planner.plan(
+        "create a file src/notes.md containing exactly the single line: hello. "
+        "Bring a technical writer.", slug="one-file-writer")
+    assert plan.scope == "direct"
+    assert "technical-writer" in plan.skills_used
+    assert plan.validation.valid, plan.validation.errors
+
+
+def test_roles_omitted_by_the_lean_shape_reach_the_plan(source):
+    """`_compose` collected its dropped roles and never returned them, so the Owner saw an omission
+    only when the lean shape had also been rejected — the one path whose label carries the reason."""
+    class RejectOverFive:
+        def __call__(self, manifest):
+            if len(manifest.get("nodes") or []) > 5:
+                return PlanValidation(valid=False, errors=("too complex",))
+            return PlanValidation(valid=True)
+
+    plan = Planner(source, validator=RejectOverFive()).plan("Build a service", slug="lean-dropped")
+    assert "qa-engineer omitted from the lean shape" in plan.dropped
+    assert "security-reviewer omitted from the lean shape" in plan.dropped
+    assert "Omitted (with reason):" in plan.summary()

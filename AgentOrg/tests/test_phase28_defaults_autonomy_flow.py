@@ -825,6 +825,39 @@ def test_the_unattended_run_stops_at_its_round_cap_rather_than_looping_forever(t
         f"the run exceeded its configured round cap: {goal.spend.rounds} rounds")
 
 
+def test_a_round_that_advances_nothing_pauses_the_goal_instead_of_spinning(tmp_path):
+    """The round cap must stay a backstop: a finished graph must not need it to stop.
+
+    Measured on a real unattended run — the one this whole file exists for — `phase: done` with every
+    node `done`: the driver then resumed its finished checkpoint **361 times in under four minutes**,
+    one runner process and one trace event per round, each resume returning `complete` in ~0.3s having
+    run nothing. Every round looked like progress to the loop, so the only thing that ended it was
+    `goal.max_rounds` (10,000) — and the run's own result was never reported.
+
+    The stop is a *pause*, not a completion, and that polarity is the point: only an agent's
+    `update_goal(complete)` may claim the objective was met, so the engine says the honest smaller
+    thing and asks for an explicit `goal resume` if more work is wanted.
+    """
+    from engine.goal import GoalState, Posture
+    from engine.orchestrator import RunPhase
+
+    orch, run, _ws = _drive_to_completion(tmp_path, Posture.UNATTENDED)
+    goal = orch.goal()
+    assert goal is not None
+    assert run.phase is RunPhase.DONE, "the probe graph finishes under an unattended goal"
+    assert goal.state is GoalState.PAUSED, "a finished graph must stop the loop, not spin it"
+    assert goal.pause_reason == "run-complete"
+    # The fixture caps the loop at 3 rounds, so stopping below the cap is what shows the loop ended
+    # *itself*: two rounds is one that discovers the terminal gate (a gate is work, not a stall) and
+    # one that finds nothing left to advance. Before this it spent the full cap and left the goal
+    # armed, which is the state that resumes again on the next command.
+    assert goal.spend.rounds < 3, (
+        f"the loop stopped at its cap rather than at the dead end: {goal.spend.rounds} round(s)")
+    # And the stop is on the record, so "why is this not still running" has an answer.
+    pauses = [e for e in orch.bus.history() if e.type.value == "goal.paused"]
+    assert pauses and pauses[-1].payload["reason"] == "run-complete"
+
+
 # ── the tier cap: a knob that must actually bound something ──────────────────
 
 

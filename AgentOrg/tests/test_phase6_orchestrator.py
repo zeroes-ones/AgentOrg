@@ -768,3 +768,72 @@ def test_a_genuine_no_spend_round_stays_complete(stack):
                             unknown_cost_calls=unknown)
     assert orch._goal.spend.cost_complete is True
     assert orch._goal.spend.cost_usd == 0.0
+
+
+# ── the goal loop must stop when a round advances nothing ────────────────────
+#
+# Measured on a real unattended run (`phase: done`, every node `done`): 361 continuation rounds in
+# under four minutes, 721 runner processes, and a trace file growing by an event per round. Each round
+# resumed a finished checkpoint, came back `complete` in ~0.3s having run nothing, and the loop counted
+# that as progress — so the only thing that ever ended it was `goal.max_rounds` (10,000), the backstop
+# the design calls "not the practical limit". It was the practical limit, and the run's own "done" was
+# never reported. `_runner_state_signature` is what tells the two apart: a round that did work changes
+# the checkpoint, and a round that did nothing cannot.
+
+_TERMINAL_STATE = {
+    "workflow": "gateprobe",
+    "phase": "ready",
+    "nodes": {"dev": {"status": "done", "verdict": "ok"},
+              "release": {"status": "done", "verdict": "approved"}},
+    "artifacts": {"change": "src/app.py"},
+    "budget": {"steps_used": 2, "iterations": {"review-fix-loop": 1}},
+}
+
+
+def test_a_finished_checkpoint_has_a_stable_signature(stack):
+    """The whole check rests on this: bookkeeping a no-op round rewrites must not read as progress."""
+    orch, ws, _ = stack
+    run = _adopted_run(orch, ws)
+    ws.runner_state_path.write_text(json.dumps(_TERMINAL_STATE), encoding="utf-8")
+    first = orch._runner_state_signature(run)
+
+    # What a no-op resume writes: the handoff pointer and a log line, neither of which is work.
+    rewritten = dict(_TERMINAL_STATE)
+    rewritten["log"] = [{"step": 2, "node": None, "action": "resume", "detail": "nothing to do"}]
+    rewritten["handoff"] = {"from": "dev", "to": "release"}
+    rewritten["node"] = "release"
+    ws.runner_state_path.write_text(json.dumps(rewritten), encoding="utf-8")
+    assert orch._runner_state_signature(run) == first
+
+
+def test_a_round_that_ran_a_node_changes_the_signature(stack):
+    """The counterpart: real work must never be mistaken for a dead end."""
+    orch, ws, _ = stack
+    run = _adopted_run(orch, ws)
+    ws.runner_state_path.write_text(json.dumps(_TERMINAL_STATE), encoding="utf-8")
+    first = orch._runner_state_signature(run)
+
+    for change in ({"nodes": {"dev": {"status": "done", "verdict": "ok"},
+                              "release": {"status": "needs_review", "verdict": "awaiting_owner"}}},
+                   {"budget": {"steps_used": 3, "iterations": {"review-fix-loop": 1}}},
+                   {"phase": "execute"},
+                   {"iterations": {"review-fix-loop": 2}}):
+        mutated = json.loads(json.dumps(_TERMINAL_STATE))
+        if "iterations" in change:
+            mutated["budget"]["iterations"] = change["iterations"]
+        else:
+            mutated.update({k: v for k, v in change.items() if k != "budget"})
+            if "budget" in change:
+                mutated["budget"] = change["budget"]
+        ws.runner_state_path.write_text(json.dumps(mutated), encoding="utf-8")
+        assert orch._runner_state_signature(run) != first, f"{change} is progress and must show"
+
+
+def test_a_missing_checkpoint_is_not_the_same_as_a_finished_one(stack):
+    """A run that has not started has no signature, so a missing file can never stop the loop."""
+    orch, ws, _ = stack
+    run = _adopted_run(orch, ws)
+    ws.runner_state_path.unlink(missing_ok=True)
+    assert orch._runner_state_signature(run) == ""
+    ws.runner_state_path.write_text("}", encoding="utf-8")
+    assert orch._runner_state_signature(run) == "", "an unreadable checkpoint is not a signature"

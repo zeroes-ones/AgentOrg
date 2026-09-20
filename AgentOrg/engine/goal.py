@@ -73,7 +73,7 @@ class GoalState(str, Enum):
 
     CLEARED = "cleared"          # no objective; the fresh-workspace state
     ARMED = "armed"              # live: the loop continues after a final
-    PAUSED = "paused"            # stopped, resumable: manual · gate · budget_spend · restored
+    PAUSED = "paused"            # stopped, resumable: manual · gate · budget_spend · restored · run-complete
     COMPLETED = "completed"      # the agent reported the whole objective done
     BLOCKED = "blocked"          # the agent reported a concrete, persistent blocker
 

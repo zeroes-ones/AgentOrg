@@ -537,3 +537,158 @@ error at all.
 before the flag check, so `engine.cli --js<TAB>` completed to *nothing* — the global flags, the thing
 a person most wants completed, were the one thing that could not be. Fixed, and pinned by a test that
 sources the script in a real bash and calls its function.
+
+---
+
+## 13. §13 — sizing the org to the goal, and a goal loop that would not stop (2026-09-20)
+
+**Written:** 2026-09-20, ~15:15 local. Every number below is from a run on this machine, against the
+live provider (`/tmp/cfg-capable.json`: `deepseek-anthropic` / `deepseek-v4-pro`, an Anthropic-dialect
+endpoint, key by env). The last mile of this session was one requirement: **a real autonomous goal run
+must reach `done` with every node complete.** It does now, and two defects stood in the way.
+
+### 13.1 Finding 1: the planner over-staffed by construction
+
+`engine/planner.py` chose the org by **domain** and never by size. `_DOMAIN_SHAPES["software"]` is a
+fixed four-node chain (`product-manager → system-architect → api-designer → backend-developer`) plus
+three verifiers (`code-reviewer`, `qa-engineer`, `security-reviewer`), and a goal only ever *adds*
+specialists through `_GOAL_HINTS` / `_ROLE_HINTS`. So every software goal got seven roles.
+
+Measured, `plan --goal "create a file src/notes.md containing exactly the single line: hello from
+agentorg"`: **7 nodes** — for a file whose entire content the goal already states. (A real project in
+`projects/` shows the same shape at 9 nodes: `bring-all-features-to-rn-to-ios-and-android-apps` was
+staffed `pm, architect, api, developer, macos-developer, mobile-developer, reviewer, qa, security`.)
+
+Over-staffing is not merely wasteful, and this is the part worth remembering: **it manufactures a node
+whose criteria cannot apply.** `architect` on that goal reported its own honest answer —
+`status: needs_review / verdict: changes_requested`, *"no runtime architecture exists for this
+deterministic static artifact, so the system-architect gates (C4, ADRs, resilience, observability,
+capacity, tenancy, security) are reported N/A with reasons rather than fabricated"* — and the run
+parked there with five nodes pending and `requires: (none)`, while `src/notes.md` was already correct
+on disk. The node was not wrong. The staffing was.
+
+**The fix is the plan, not the verdict vocabulary.** `Plan.scope` is new: `build` (the domain's own
+chain and verifiers) or `direct` (the domain's producer plus its first verifier) for a goal that
+*states its own deliverable*. `_single_deliverable` decides it — three narrow conditions, all
+required: a write verb, **exactly one** named path, and an exactness phrase linking them (`"contains
+exactly the required sections"` is rejected as *deferred*, because it hands the content decision
+back). Specialists the goal names outright still join a direct plan; every omitted role is reported on
+`Plan.dropped` with its reason, so a two-node org where the shape declares seven is auditable in
+`plan --goal` output. One graph change went with it: a direct plan's loop runs **producer →
+verifier** (`["developer", "reviewer"]`), because a verifier-first pass would judge a file the
+producer has not written — see §13.3, where that is exactly what the 7-node plan did.
+
+`_compose` also stopped discarding its own `dropped` list. It had collected omissions and returned
+only `type_notes`/`order_notes`, so `Plan.dropped` was empty for a lean shape unless the richer shape
+had *also* been rejected — the one path whose label carries the reason.
+
+**What is deliberately NOT fixed, and why:** the third state the run seemed to call for — a criterion
+reported *not applicable, with a reason*, accepted by the contract but visible at the gate. It is not
+needed to make a real goal finish: with the org sized, no node is left holding criteria that cannot
+apply. Adding it would be a second mechanism for a problem the first one removes, and the guard
+around it (a criterion accepted as unmet only when the node *states* a reason, and that claim shown at
+the gate) is exactly the kind of control that is easy to widen into "uncovered is fine". **If a future
+node still has nothing to satisfy, fix the staffing, not the vocabulary** — and if that is ever
+impossible, the honest change is a *named* third state with a required reason, never a blanket
+acceptance of uncovered criteria.
+
+### 13.2 Finding 2: `done` was reached and then never reported
+
+With an armed unattended goal, the run reached `done` — every node `done`, the terminal gate released
+by the goal's own authority, exit 0 — and then the idle driver in `engine/orchestrator.py::
+_run_with_goal` kept going. Measured: **361 continuation rounds in under four minutes**, 721 runner
+processes, one no-op resume every ~0.3s, each returning `complete` having run nothing, all of it
+bounded only by `goal.max_rounds` (10,000) — the number `DESIGN-GOAL.md` calls *"a backstop, not the
+practical limit."* It was the practical limit. The command never returned, the trace grew by an event
+per round, and the run's own result was never printed.
+
+The loop could not tell the two apart because it judged a round by its *outcome*, and a resume against
+a finished checkpoint reports exactly what a round that did real work reports. It can be read off the
+**checkpoint** instead: `_runner_state_signature` digests the node records, phase, artifacts, reroute
+book and budget counters — the things a node's work changes — and excludes `log`, `handoff`, `node`
+and `_pass_stamps`, which bookkeeping rewrites whether or not work happened. A round that leaves the
+signature unchanged stops the loop, and the goal is **paused with reason `run-complete`**, not
+completed: only an agent's `update_goal(complete)` may claim the objective was met (`DESIGN-GOAL.md`
+§6), so the engine says the honest smaller thing and one `goal resume` is the way to continue. A
+pending gate is excluded from the check — a gate is *work*, a decision to make, and stopping there
+would pause a goal one decision from finishing (which the first version of this check did).
+
+### 13.3 The proof run — `done`, every node complete, verbatim
+
+`goal set "<goal>" --root /tmp/probe-final --slug probe --posture unattended`, then the same command
+as `run`. 2026-09-20 15:09:16 → 15:11:51 (**2m35s**), exit 0, 7 model calls, 3 steps, 21,305 tokens.
+
+```
+Run run_1789934956_probe  (awaiting_approval)
+  workspace : /tmp/probe-final/probe
+  manifest  : probe.yaml
+  plan      : Goal: create a file src/notes.md containing exactly the single line: hello from agentorg
+
+Approved. Executing...
+
+  outcome   : finished
+  steps     : 3
+  phase     : done
+
+  nodes:
+    developer            done           pass  — Created src/notes.md containing exactly the single line 'hello from agentorg' with no trai
+    human-gate           done           awaiting_owner  — human gate 'human-gate' reached; awaiting the Owner. requires reviewer.summary.
+    reviewer             done           pass  — Reviewed the single-line text change at src/notes.md. The content is exactly 'hello from a
+EXIT=0
+```
+
+The plan it ran (2 skill nodes + the terminal gate): `developer (backend-developer, BUILD)` and
+`reviewer (code-reviewer, REVIEW)`, loop `review-fix-loop: developer -> reviewer`, `exit_when
+reviewer.verdict == pass`, terminal `human-gate` requiring `reviewer.summary`. The artifact:
+
+```
+$ xxd /tmp/probe-final/probe/src/notes.md
+00000000: 6865 6c6c 6f20 6672 6f6d 2061 6765 6e74  hello from agent
+00000010: 6f72 67                                  org
+```
+
+19 bytes, byte-exact — no trailing newline. `goal status` afterwards: `state: paused
+(run-complete)`, `2 round(s)`.
+
+**The same goal, three other ways, for scale:**
+
+| Run | Plan | Model calls | Runner spawns | Result |
+|---|---|---|---|---|
+| `probe-before` (pre-change, no armed goal) | 7 nodes | **39** | 2 | killed at 15 min: `pm`/`architect`/`api` done, `reviewer` stuck in contract rework (`R6: 4 open questions exceed the 3 ceiling`), `developer`/`qa`/`security` pending — the reviewers ran *first* in the loop, judging a file the developer had not written |
+| `probe-after` (sized plan, no armed goal) | 2 nodes | 7 | 2 | `developer`/`reviewer` both `done`/`pass` in 91.7s, parked at the terminal gate — **`--posture` on a fresh root does nothing**, because `cmd_run` applies the posture to the goal it *finds*, and there is none; the honest way is `goal set --posture unattended` first |
+| `probe-done` (armed, before the loop fix) | 2 nodes | 6 | **371** | reached `done` in ~90s, then 361 no-op rounds until killed |
+| `probe-final` (armed, both fixes) | 2 nodes | 7 | 4 | **`done`, exit 0, 2m35s** |
+
+### 13.4 Evidence not acted on
+
+- **The terminal-gate release guard reads history, not state.** `_release_terminal_gate` refuses when
+  `run.stop_reason` contains `guardrail`/`contract`/`error`, and `_derive_stop_reason` builds that
+  string from the runner's **log**, which keeps a `contract` entry for ever after a refusal is
+  *repaired* (`probe-before` has one: `api`, `contract-rework-ok`, and the `action: contract` line
+  still in the log). So a run that recovers from any refusal should refuse its own release at the
+  terminal gate. **Not observed** — neither run that reached the gate had a refusal in its history —
+  so it is left alone rather than fixed on suspicion. It is the next thing to check if an unattended
+  run parks at a gate it should have released.
+- **The first round after `host.run` is unsettled.** `_settle(run, outcome)` runs in `execute()` only
+  *after* `_run_with_goal` returns, so the loop's first round sees `run.gate is None` and burns a
+  resume that re-parks. It costs one round and one runner process per unattended run (visible above:
+  4 spawns for a 2-node plan) and it is *pre-existing* — the round arithmetic in
+  `tests/test_phase28_defaults_autonomy_flow.py` is built on it. Fixing it means settling twice, which
+  double-emits `run.end`; deliberately not done here.
+
+### 13.5 Tests and lint
+
+- `python3 run_tests.py tests/test_phase3_planner.py tests/test_phase6_executor.py
+  tests/test_phase6_orchestrator.py tests/test_phase35_parallel_nodes.py -q` — **before 234 passed /
+  0 failed** (pristine `HEAD` via `git archive` into `/tmp`), **after 248 / 0**.
+- Also green after the change: `test_phase28_defaults_autonomy_flow.py` (64 → 65, the new end-to-end
+  loop test), `test_phase41_autonomous_recovery.py` (31), `test_phase17_goal.py`,
+  `test_phase48_chain_composition.py`, `test_phase4_cli.py` (130 together).
+- New regression tests: direct-scope sizing + its four "must NOT size down" cases + a named
+  specialist still joining (7 in `test_phase3_planner.py`); `_runner_state_signature`'s stability,
+  its sensitivity to real work, and that a missing checkpoint is not a signature (3 in
+  `test_phase6_orchestrator.py`); one end-to-end assertion that a finished graph pauses the goal with
+  `run-complete` instead of spending its round cap (`test_phase28_defaults_autonomy_flow.py`).
+  `Plan`'s unused import in the planner test file is now used, so that file is ruff-clean.
+- `ruff check` on every file touched: no new findings (orchestrator 11 → 11, both test files 6 → 6,
+  planner and its test 0).

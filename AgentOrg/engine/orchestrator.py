@@ -1046,6 +1046,8 @@ gated tier rather than the least"
           - the agent's own `update_goal(complete|blocked)` verdict,
           - a human/policy gate (the run parks; a Goal respects gates),
           - a configured budget being reached (pauses with reason `budget_spend`),
+          - a round that advanced nothing (see `_runner_state_signature`; pauses with reason
+            `run-complete`),
           - the run failing or being killed,
           - the goal being paused/cleared underneath us.
         """
@@ -1108,10 +1110,44 @@ gated tier rather than the least"
             self._emit(EventType.GOAL_PROGRESS, {"objective": goal.objective, "round": round_index,
                                                  "spend": goal.spend.as_dict(),
                                                  "autonomous": not policy.human_gate})
+            # What the graph looked like before this round, so the round can be judged by whether it
+            # *moved* anything rather than by whether it exited cleanly. A resume against a finished
+            # checkpoint returns `complete` in a fraction of a second having done nothing, and the
+            # driver used to treat that as progress and resume again — measured: 361 rounds in under
+            # four minutes, 721 runner processes, one no-op resume every ~0.3s, all of it bounded only
+            # by `goal.max_rounds` (10,000), which the design calls "a backstop, not the practical
+            # limit". It was the practical limit, and it is the one outcome an unattended run must not
+            # produce: `done` that never reports and a machine that will not stop working.
+            before = self._runner_state_signature(run)
             outcome = self._host.resume_run(
                 manifest_path=run.manifest_path, run_id=run.run_id, workflow=run.slug,
                 project=run.slug, goal_active=True, extra_args=extra)
             self._settle(run, outcome)
+            # A pending gate is *work*: a decision someone has to make. A round that ends at one has
+            # not stalled, and stopping here would pause a goal that is one decision from finishing —
+            # which is exactly what happened the first time this check was written, because the round
+            # that discovers the terminal gate is also a round whose checkpoint looks unchanged. The
+            # wait is read from the settled run, so it is the same reading the next round's gate
+            # branch acts on (auto-pass for an unattended goal, a pause for the Owner).
+            waiting = run.gate is not None or run.phase in (RunPhase.AWAITING_GATE,
+                                                            RunPhase.AWAITING_HUMAN)
+            if not waiting and self._runner_state_signature(run) == before:
+                # A round that changed nothing has nothing left to advance. The goal is *paused*
+                # rather than completed, and that polarity is the whole reason this is safe: only an
+                # agent's `update_goal(complete)` may claim the objective was met (DESIGN-GOAL §6),
+                # so the engine says the honest smaller thing — the approved graph is finished and no
+                # node has work left — and asks for an explicit resume if more is wanted. A paused
+                # goal cannot spin, and `goal resume` is one command away.
+                goal.pause(reason="run-complete")
+                goal.save(run.workspace)
+                self._emit(EventType.GOAL_PAUSED, {"objective": goal.objective,
+                                                   "reason": "run-complete",
+                                                   "spend": goal.spend.as_dict()})
+                self.diagnostics.info(
+                    "goal.run_complete",
+                    message=(f"round {round_index} advanced nothing: every node is terminal, so the "
+                             "goal is paused rather than resumed again"))
+                return outcome
         return outcome
 
     def _auto_pass(self, run: Run, policy: Any) -> bool:
@@ -1452,9 +1488,55 @@ gated tier rather than the least"
         The token budget is opt-in (0 = off). This is the unconditional bound that keeps a bug in the
         loop — a gate that never settles, a decision never written — from spinning forever. It is high
         enough not to be the practical limit and low enough to be a backstop.
+
+        It is a backstop *only* because a round that advances nothing now ends the loop itself
+        (`_runner_state_signature`). Measured before that check existed: 361 no-op rounds in under four
+        minutes, each spawning a runner process, all of them bounded by this number alone — so for a
+        finished graph this was not the backstop, it was the practical limit, and the "done" the run
+        had reached was never reported.
         """
         raw = getattr(getattr(self.config, "goal", None), "max_rounds", None)
         return max(1, int(raw)) if raw else 10_000
+
+    def _runner_state_signature(self, run: Run) -> str:
+        """A digest of what a *round* can advance, so a round that advanced nothing is visible.
+
+        The idle driver decides whether to continue by resuming the run and looking at what came
+        back. A resume against a finished checkpoint is *indistinguishable from progress* by its exit
+        status: the runner returns `complete` in ~0.3s having run nothing, which is exactly what a
+        round that did real work also reports. So "did this round do anything" cannot be read off the
+        outcome, and it cannot be read off the clock either (a slow no-op and a fast node are the same
+        shape of report).
+
+        It can be read off the checkpoint. This is the state a node's work changes and nothing else
+        does — the node records, the phase, the artifact index, the reroute book. `log`, `handoff`,
+        `node` and `_pass_stamps` are deliberately excluded: they are written by bookkeeping that runs
+        whether or not work happened, and including them would make every round look like progress,
+        which is the defect this exists to catch.
+
+        Returns `""` when there is no readable checkpoint, which never equals a real signature — a
+        missing state file is a run that has not started, not one that finished, and treating it as
+        "nothing changed" would stop a loop that never began.
+        """
+        state_path = getattr(run.workspace, "runner_state_path", None)
+        if state_path is None or not Path(state_path).is_file():
+            return ""
+        try:
+            state = json.loads(Path(state_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ""
+        if not isinstance(state, dict):
+            return ""
+        budget = state.get("budget") if isinstance(state.get("budget"), dict) else {}
+        material = {
+            "nodes": state.get("nodes"),
+            "phase": state.get("phase"),
+            "artifacts": state.get("artifacts"),
+            "reroutes": state.get("reroutes"),
+            "steps_used": budget.get("steps_used"),
+            "iterations": budget.get("iterations"),
+        }
+        return json.dumps(material, sort_keys=True, default=str)
 
     # ── the goal API ────────────────────────────────────────────────────────
 

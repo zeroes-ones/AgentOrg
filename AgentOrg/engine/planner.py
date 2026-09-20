@@ -32,6 +32,15 @@ DESIGN
   allowed but reported on `Plan.type_notes`, because artifact declarations describe a skill's typical
   use rather than a type system. The *order* of the chain is the library's `chain:` graph when the
   selected skills form a DAG, and the hand-written order with a recorded reason when they do not.
+- **The org is sized to the goal, not only chosen for it.** The domain decides *who* the work is
+  for; the scope decides *how much* of that org the work needs (`Plan.scope`). A goal that states
+  its own deliverable — one named file whose exact content the goal itself gives — has already made
+  the decisions the discovery and design roles exist to make, so it is planned as a producer plus
+  one verifier instead of the full build chain. Over-staffing is not harmless: it manufactures nodes
+  whose criteria genuinely do not apply, and a real run stopped on exactly that (`architect`:
+  "no runtime architecture exists for this deterministic static artifact, so the system-architect
+  gates are reported N/A with reasons rather than fabricated") while the file it was asked for was
+  already correct on disk.
 
 Usage:
     planner = Planner(source)
@@ -205,6 +214,71 @@ _DOMAIN_NAMES: dict[str, str] = {
     "analytics": "data",
 }
 
+# ── scope: how much org the goal's work actually needs ───────────────────────
+#
+# The tables above answer "who is this work for". This one answers "how much of that company does
+# it need", and it is deliberately a *narrow* test rather than a scale score.
+#
+# The software chain's roles each exist to decide something the goal left open: `product-manager`
+# decides what to build, `system-architect` how it is shaped, `api-designer` how it is called. A goal
+# that names the file *and* its bytes has already made those decisions, and the roles it is staffed
+# with have nothing to produce — a real run showed the cost: `architect` returned
+# `status: needs_review / verdict: changes_requested` with "no runtime architecture exists for this
+# deterministic static artifact, so the system-architect gates … are reported N/A with reasons rather
+# than fabricated", and the run parked there with the requested file already written correctly. The
+# node was not wrong; the staffing was. A node whose criteria genuinely cannot apply has no honest
+# way to pass, so a plan that staffs one guarantees a stop.
+#
+# A goal is a *single deliverable* only when all three hold, and each is the reason the others are
+# not enough:
+#   - a write verb — the goal asks for a change to be made, not for a thing to be considered;
+#   - **exactly one** named path — "refactor src/auth.py" is real engineering that may need a design
+#     pass, and a goal naming several files is a change set rather than one artifact;
+#   - an exactness phrase linking them — "add a file src/notes.md" says where but not what, so what
+#     to put in it is still a decision someone has to make.
+_DIRECT_PATH_RE = re.compile(r"(?:[\w.-]+/)*[\w-]+\.[A-Za-z0-9]{1,6}\b")
+_DIRECT_WRITE_RE = re.compile(
+    r"\b(?:create|write|add|make|save|put|place|generate|append|overwrite|produce)\b", re.IGNORECASE)
+# The content half: the goal states the bytes itself — as an exactness phrase, or as a quoted
+# literal.
+_DIRECT_CONTENT_RE = re.compile(
+    r"(?:containing|contains|holding|with the (?:exact )?contents?\b|whose contents? (?:is|are)\b)"
+    r"[^.]*?(?:exactly|verbatim|byte[- ]for[- ]byte|the single line|this (?:exact )?(?:text|line|"
+    r"content)|[\"'][^\"'\n]{1,120}[\"'])",
+    re.IGNORECASE)
+# …and the goal must not hand the decision back. "contains exactly the required sections" reads as
+# an exactness phrase while leaving *which* sections to whoever does the work, so it is a normal
+# documentation task, not a stated deliverable. These are the words that defer the content to the
+# reader; the list is short on purpose, because a longer one starts refusing good goals.
+_DIRECT_DEFERRED_RE = re.compile(
+    r"\b(?:required|necessary|appropriate|relevant|suitable|as needed|as required|according to|"
+    r"based on|whatever)\b", re.IGNORECASE)
+
+
+def _single_deliverable(goal: str) -> str:
+    """Why this goal needs only a producer and a verifier, or ``""`` when it needs the full org.
+
+    Returns the *reason* rather than a boolean because the reason is what the Owner is shown: a plan
+    that quietly staffs two people where they expected nine has to say why, and the same string goes
+    into `Plan.notes` and into every dropped role's entry.
+
+    Measured on the goal this was written for — "create a file src/notes.md containing exactly the
+    single line: hello from agentorg" — which the planner staffed with seven roles and the run then
+    stopped on the second of them.
+    """
+    if not _DIRECT_WRITE_RE.search(goal):
+        return ""
+    paths = _DIRECT_PATH_RE.findall(goal)
+    if len(paths) != 1:
+        return ""
+    if not _DIRECT_CONTENT_RE.search(goal):
+        return ""
+    if _DIRECT_DEFERRED_RE.search(goal):
+        return ""
+    return (f"the goal states its own deliverable ({paths[0]} and its exact content), so there is "
+            "nothing for discovery or design to decide")
+
+
 # Goal keywords that select specialist skills in addition to a chosen shape. Each entry
 # is (pattern, skill name). Ordered so the first match wins per skill.
 #
@@ -303,6 +377,11 @@ class Plan:
     #: Surfaced because "why this org?" is the first question an Owner asks of a plan, and the
     #: answer must not be something they have to infer from the node list.
     shape: str = "software"
+    #: How much of that org the work needs: `build` (the domain's own chain and verifiers) or
+    #: `direct` (a producer and one verifier, for a goal that states its own deliverable). The
+    #: companion of `shape` for the same reason — the Owner asked for one file and must be able to
+    #: see that the plan is two nodes because the goal already decided the rest, not by accident.
+    scope: str = "build"
     #: Skills the plan needs that the roster does not staff, when a roster was supplied.
     #: Each entry names the skill, why it is a gap, and the exact hire that closes it.
     staffing: tuple[dict[str, Any], ...] = ()
@@ -343,6 +422,10 @@ class Plan:
             f"Shape: {self.shape}"
             + ("  (the goal selected a non-engineering org)"
                if self.shape != "software" else ""),
+        ]
+        if self.scope != "build":
+            lines.append(f"Scope: {self.scope}  (sized to the goal: it states its own deliverable)")
+        lines += [
             "",
             "Sequence:",
         ]
@@ -423,6 +506,7 @@ class Plan:
             "type_notes": list(self.type_notes),
             "order_notes": list(self.order_notes),
             "shape": self.shape,
+            "scope": self.scope,
             "staffing": [dict(gap) for gap in self.staffing],
             "graph_review": dict(self.graph_review or {}),
         }
@@ -469,6 +553,13 @@ class Planner:
         still yields a runnable graph, and falls back to a minimal skeleton rather than
         failing outright. Every returned plan has passed validation.
 
+        The domain and the *scope* are resolved before any candidate is composed: the domain
+        decides who the work is for, the scope decides how much of that org it needs, and a goal
+        that states its own deliverable (see `_single_deliverable`) is tried at the size its work
+        actually is — one producer and one verifier — **before** the full company. Order matters
+        here: the first candidate that validates is the plan that runs, so a smaller honest shape
+        has to be offered first rather than as a fallback.
+
         Raises
         ------
         PlanError
@@ -482,23 +573,38 @@ class Planner:
         # software pipeline. This is the fix for "a CEO-and-market goal ran as product-manager →
         # architect → backend-developer".
         domain = self._classify_domain(goal)
-        selected = self._select_skills(goal, domain)
+        # And size it: a goal whose deliverable is fully stated needs a producer and a verifier,
+        # not a company. `direct_reason` is both the trigger and the wording the Owner is shown.
+        direct_reason = _single_deliverable(goal)
+        scope = "direct" if direct_reason else "build"
 
-        candidates = [
-            ("full", self._compose(project, goal, selected, domain, max_iterations, max_steps,
-                                   include_parallel=True, include_all_verifiers=True)),
-            ("lean", self._compose(project, goal, selected, domain, max_iterations, max_steps,
-                                   include_parallel=False, include_all_verifiers=False)),
-            ("minimal", (self._minimal(project, goal, max_iterations), {})),
-        ]
+        # Richest first, except for a direct goal — whose own shape is the smallest that can still
+        # run. The fallbacks stay in place for both: a direct shape that somehow fails validation is
+        # still better than refusing the goal.
+        labels = (["direct"] if scope == "direct" else []) + ["full", "lean", "minimal"]
 
         dropped: list[str] = []
-        for label, (manifest, carried) in candidates:
+        for label in labels:
+            if label == "minimal":
+                manifest, carried = self._minimal(project, goal, max_iterations), {}
+            else:
+                manifest, carried = self._compose(
+                    project, goal,
+                    self._select_skills(goal, domain, direct=(label == "direct")),
+                    domain, max_iterations, max_steps,
+                    # `lean` keeps the first verifier only: enough to gate on, cheap to run.
+                    include_parallel=(label == "full"),
+                    include_all_verifiers=(label == "full"),
+                    direct=(label == "direct"))
             validation = self.validate(manifest)
             if validation.valid:
                 notes = [] if label == "full" else [
                     f"used the {label} shape because the richer shape did not validate"
                 ]
+                if label == "direct":
+                    notes = [f"sized the plan to the goal: {direct_reason}; the org is one producer "
+                             "and one verifier"]
+                    dropped += self._roles_omitted_by_direct(domain, manifest)
                 if domain != "software":
                     notes = [*notes, f"classified the goal as a {domain} goal, not a software build"]
                 return Plan(
@@ -511,10 +617,11 @@ class Planner:
                         if node.get("skill")
                     ),
                     notes=tuple(notes),
-                    dropped=tuple(dropped),
+                    dropped=tuple([*dropped, *(carried.get("dropped") or ())]),
                     type_notes=tuple(carried.get("type_notes") or ()),
                     order_notes=tuple(carried.get("order_notes") or ()),
                     shape=domain,
+                    scope=scope if label == "direct" else "build",
                     staffing=self._staffing_gaps(manifest),
                     graph_review=self._graph_review(manifest),
                 )
@@ -551,14 +658,28 @@ class Planner:
                     return domain
         return "software"
 
-    def _select_skills(self, goal: str, domain: str) -> list[tuple[str, str, str]]:
+    def _select_skills(self, goal: str, domain: str, *, direct: bool = False
+                       ) -> list[tuple[str, str, str]]:
         """Choose the company for a goal: the domain's chain, its verifiers, and goal-matched extras.
 
         A skill that is not in the library, or whose contract cannot be loaded, is skipped —
         the planner must never emit an edge to a node whose contract it could not read.
+
+        `direct` sizes the org to the work: the chain starts from the domain's own *producer* — the
+        node the rework loop already hands findings to, i.e. the last one in the shape's build chain —
+        and the verifier set is the domain's first verifier instead of all of them. Everything else is
+        unchanged, deliberately: the goal's own hints still extend the plan, so a direct goal that
+        also names a specialist ("create notes.md … bring a technical writer") is still staffed with
+        one. Only the roles the goal left nothing for are dropped, and `_roles_omitted_by_direct`
+        reports each of them by name.
         """
         shape = _DOMAIN_SHAPES.get(domain) or _DOMAIN_SHAPES["software"]
-        selected: list[tuple[str, str, str]] = list(shape["build"])
+        if direct:
+            selected: list[tuple[str, str, str]] = [shape["build"][-1]]
+            verifiers = shape["verify"][:1]
+        else:
+            selected = list(shape["build"])
+            verifiers = shape["verify"]
         already = {skill for _id, skill, _phase in selected}
         lowered = goal.lower()
         # Technical/functional specialists extend the build chain. They never *replace* the domain's
@@ -592,14 +713,39 @@ class Planner:
             selected.append((_node_id_for(skill), skill, _phase_for(skill)))
             already.add(skill)
         # Verifiers go last so the chain's final node is the producing node, which is what the
-        # rework loop hands back to.
-        for node_id, skill, phase in shape["verify"]:
+        # rework loop hands back to. `verifiers` is the whole declared set for a build goal and the
+        # first one only for a direct goal — see the docstring.
+        for node_id, skill, phase in verifiers:
             if skill in already:
                 continue
             if self._load(skill) is not None:
                 selected.append((node_id, skill, phase))
                 already.add(skill)
         return selected
+
+    def _roles_omitted_by_direct(self, domain: str, manifest: dict[str, Any]) -> list[str]:
+        """Every role the direct scope left out, with the reason — nothing is dropped silently.
+
+        A plan that staffs two people where the domain's shape declares nine has to say which seven
+        it removed and why, or the Owner is looking at an org they cannot audit. Each entry names the
+        role *and* the phase it is missing from, because "product-manager omitted" and "security-reviewer
+        omitted" are different kinds of omission: the first is a decision nobody had to make, the
+        second is a check that will not happen.
+        """
+        shape = _DOMAIN_SHAPES.get(domain) or _DOMAIN_SHAPES["software"]
+        chosen = {str(node.get("skill")) for node in manifest.get("nodes") or []}
+        dropped: list[str] = []
+        for _node_id, skill, phase in shape["build"]:
+            if skill in chosen:
+                continue
+            dropped.append(f"{skill} ({phase}) omitted from the direct scope: the goal states its "
+                           "own deliverable, so there is nothing to discover or design")
+        for _node_id, skill, phase in shape["verify"][1:]:
+            if skill in chosen:
+                continue
+            dropped.append(f"{skill} ({phase}) omitted from the direct scope: one verifier covers a "
+                           "deliverable whose content the goal already states exactly")
+        return dropped
 
     def _named_authored(self, lowered_goal: str) -> list[str]:
         """Authored skill names the goal names outright, in a stable order.
@@ -890,19 +1036,24 @@ class Planner:
     def _compose(self, slug: str, goal: str, selected: list[tuple[str, str, str]], domain: str,
                  max_iterations: int, max_steps: int | None, *,
                  include_parallel: bool, include_all_verifiers: bool,
-                 ) -> tuple[dict[str, Any], dict[str, tuple[str, ...]]]:
+                 direct: bool = False,
+                 ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Build a manifest from the selected skills.
 
-        The graph is: sequential phases, then a parallel verification fan-out, then a bounded
-        rework loop whose exhaustion reaches a terminal human gate. That shape is what makes
-        "work until done" terminate rather than spin, and it is the same shape for every domain —
-        only the *people* differ, because the invariants (terminate, gate, bounded loop) are
-        properties of the graph rather than of the work.
+        The graph is: sequential phases, then a verification fan-out, then a bounded rework loop whose
+        exhaustion reaches a terminal human gate. That shape is what makes "work until done" terminate
+        rather than spin, and it is the same shape for every domain and every scope — only the *people*
+        differ, because the invariants (terminate, gate, bounded loop) are properties of the graph
+        rather than of the work. (A direct plan has one verifier, so its fan-out is a fan-out of one
+        and the `parallel` block is not emitted.)
 
-        `domain` selects the verifier set and the description. Returns ``(manifest, carried)``, where
-        `carried` holds the type mismatches and the chain-order note so `plan()` can put them on the
-        `Plan` — a return value rather than an instance attribute, because the attribute form lost
-        them.
+        `domain` selects the verifier set and the description. `direct` says the goal states its own
+        deliverable, which changes one further thing: the order of the loop's members, because a direct
+        plan's only chain node *is* its producer (see the loop below).
+
+        Returns ``(manifest, carried)``, where `carried` holds the dropped roles, the type mismatches
+        and the chain-order note so `plan()` can put them on the `Plan` — a return value rather than
+        an instance attribute, because the attribute form lost them.
         """
         shape = _DOMAIN_SHAPES.get(domain) or _DOMAIN_SHAPES["software"]
         verifier_skills = {skill for _id, skill, _phase in shape["verify"]}
@@ -1033,6 +1184,15 @@ class Planner:
         verdict_node = review_nodes[0]
         gate_id = "human-gate"
         agent_gate_id = "reroute-gate"
+        # The loop's member order, and why the producer's position in it is not cosmetic: entering a
+        # loop runs a full pass over the declared order, so the order decides what the verifiers have
+        # to look at on the pass that matters. Verifiers first is right for a build chain, whose
+        # design nodes have already produced something by the time the loop is entered (the rework is
+        # then "judge, then fix"). It is wrong for a direct plan: its only chain node *is* the
+        # producer, so a verifier-first pass judges a workspace the producer has not written to yet —
+        # a whole pass spent on nothing, and a verdict reported about work that does not exist. There
+        # the pass is produce-then-verify, which is also the order that lets a single pass converge.
+        loop_nodes = [developer, *review_nodes] if direct else [*review_nodes, developer]
         # A bounded-reroute **agent gate** sits between the loop and the human. When automation
         # exhausts its iterations, the runner hands the gate the untried channels and asks which one
         # should lead a *fresh* pass — a decision the org can make itself, bounded by `max_reroutes`,
@@ -1043,7 +1203,7 @@ class Planner:
             "id": agent_gate_id,
             "type": "gate",
             "kind": "agent",
-            "pool": [*review_nodes, developer],
+            "pool": list(loop_nodes),
             "max_reroutes": 2,
             "escalate_to": gate_id,
             "description": (
@@ -1073,7 +1233,7 @@ class Planner:
             "edges": edges,
             "loops": [{
                 "id": "review-fix-loop",
-                "nodes": [*review_nodes, developer],
+                "nodes": list(loop_nodes),
                 "exit_when": f"{verdict_node}.verdict == pass",
                 "max_iterations": max(1, int(max_iterations)),
                 # Escalate to the *agent* gate, which decides a bounded reroute and only then
@@ -1096,11 +1256,16 @@ class Planner:
         if max_steps is not None:
             manifest["budget"] = {"max_steps": int(max_steps)}
 
-        # Both dropped phases and allowed type mismatches are information the Owner needs, so they
-        # are returned to `plan()` rather than stashed in an instance attribute nobody reads. The
+        # Dropped roles and allowed type mismatches are both information the Owner needs, so they are
+        # returned to `plan()` rather than stashed in an instance attribute nobody reads. The
         # attribute form was the defect: `_last_dropped` collected seven real mismatches on an
         # ordinary plan while `Plan.dropped` stayed empty, because the two were different lists.
-        return manifest, {"type_notes": tuple(type_notes), "order_notes": order_notes}
+        # `dropped` was the half that stayed broken: it was collected here and never returned, so a
+        # role this function threw out ("omitted from the lean shape", "contract could not be loaded")
+        # reached the Owner only if the lean shape had also been *rejected* — the one path where the
+        # label itself carries the reason.
+        return manifest, {"type_notes": tuple(type_notes), "order_notes": order_notes,
+                          "dropped": tuple(dropped)}
 
     def _minimal(self, slug: str, goal: str, max_iterations: int) -> dict[str, Any]:
         """The smallest runnable graph: one worker, one reviewer, one bounded loop, one gate.
