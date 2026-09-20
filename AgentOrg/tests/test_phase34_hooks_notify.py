@@ -204,19 +204,26 @@ def test_a_hanging_hook_leaves_no_daemon_behind(tmp_path):
     """The kill takes the whole process group, so a timed-out hook is not still running afterwards.
 
     A shell command starts a shell; killing only the shell leaves the real command working against
-    the repository it was pointed at, invisibly, for the rest of the machine's uptime. The sleep here
-    is deliberately *shorter than the hook's own work*: if the group were not killed, the marker would
-    appear within the grace period.
+    the repository it was pointed at, invisibly, for the rest of the machine's uptime.
+
+    **The durations are chosen so the race is not the test.** The hook must outlive its timeout — that
+    is what makes it hang — but it must also *finish* inside the wait, or a surviving descendant would
+    go undetected. The old numbers (`sleep 1` under `timeout_s=1`, waited 4s) put the `touch` at almost
+    exactly the kill boundary, so a survivor and a scheduling hiccup looked identical; CI flaked on it
+    twice, passing in one run and failing in the next. Three seconds of work under a one-second timeout,
+    waited six, leaves ~2s of tolerance for the kill to land while still failing loudly if it never
+    does. Nothing is weakened: a descendant that survives the timeout still writes its marker, and the
+    wait is long enough to see it.
     """
     marker = tmp_path / "still-alive"
     runner = HookRunner(
-        Section(HooksConfig(events={"run.end": f"sleep 1; touch {marker}"}, timeout_s=1)),
+        Section(HooksConfig(events={"run.end": f"sleep 3; touch {marker}"}, timeout_s=1)),
         run_id="run_1", state_dir=tmp_path)
     outcomes = runner.dispatch(hook_event())
     assert outcomes[0].status == "timeout"
 
-    # Wait past the point where the *surviving* command would have written its marker.
-    assert not wait_for(marker.exists, timeout_s=4.0), \
+    # Wait past the point where the *surviving* command would have written its marker (~3s).
+    assert not wait_for(marker.exists, timeout_s=6.0), \
         "the descendant of a killed hook must not survive the timeout"
 
 
