@@ -246,6 +246,10 @@ class NodeExecutor:
       *different* artifacts do not interact and two writers to the *same* one serialise.
     - `ctx.journal` — `EffectJournal` reserves under its own lock before the effect runs, so two
       threads cannot both be told to apply the same effect.
+    - `org.runtime(id)` — each agent's slot count is claimed through
+      `AgentRuntime.try_begin`, which decides and claims under that runtime's own lock. Nothing here
+      reads `available()` and then begins: that pair is what let two concurrent nodes claim one agent
+      (see `_claim_slot`).
     """
 
     def __init__(self, context: ExecutorContext) -> None:
@@ -762,7 +766,10 @@ class NodeExecutor:
                                    attempt=attempt, bundle=bundle, binding=binding,
                                    is_reviewer=is_reviewer, inputs=inputs, findings=findings,
                                    agent_id=binding.primary, pooled=pooled)
-            agent_id = binding.primary
+            # Read from the result, not from the binding: the claim may have handed the work to
+            # another holder when the bound one was at its limit, and the exit event and the crossing
+            # handoff must name the agent that actually did the work rather than the preferred one.
+            agent_id = str((result.get("_agent") or {}).get("agent_id") or binding.primary)
 
         # Emitted before the crossing, so the exit precedes the handoff the node produced — the order
         # a reader expects, and the order the timeline renders.
@@ -1554,7 +1561,40 @@ class NodeExecutor:
         `instruction_override` replaces the built node instruction. Fan-out uses it to hand each
         subagent *its own* expanded prompt: the node-level instruction describes the job ("review the
         change"), which is the wrong thing to give twenty subagents each reviewing a different file.
+
+        This is where the agent's in-flight slot is taken and released, because it is the one place
+        every unit of agent work passes through: a single node, a fan-out's item, a swarm's voter.
+        The release is on *every* exit path — including the exception path — because a slot that is
+        never given back leaves an agent looking busy forever, and an agent that looks busy is one
+        the binder stops choosing.
         """
+        chosen_id, runtime = self._claim_slot(node_id=node_id, binding=binding, preferred=agent_id)
+        try:
+            result = self._run_one_claimed(
+                node_id=node_id, node=node, skill=skill, state=state, attempt=attempt,
+                bundle=bundle, binding=binding, is_reviewer=is_reviewer, inputs=inputs,
+                findings=findings, agent_id=chosen_id, pooled=pooled,
+                instruction_override=instruction_override)
+        except BaseException as exc:  # noqa: BLE001 - the release must run, the raise must not be lost
+            # BaseException, not Exception: an abort (Ctrl-C, a killed worker, a system exit) is an
+            # exit path too, and leaving the slot held through one is how a run that was interrupted
+            # wedges the org it was resumed into.
+            runtime.finish(failed=True, error=f"{type(exc).__name__}: {exc}"[:300])
+            raise
+        # `failed` means "this agent did not deliver this node", which is what the health record's
+        # completion rate is asking. A node that reported done did deliver; anything else — including
+        # a needs_review the agent itself declared — did not, and the status is recorded as the error
+        # so the roster view says why rather than just counting down.
+        status = str(result.get("status") or "")
+        runtime.finish(failed=(status != "done"), error=None if status == "done" else status)
+        return result
+
+    def _run_one_claimed(self, *, node_id: str, node: dict[str, Any], skill: str,
+                         state: dict[str, Any], attempt: int, bundle: Any, binding: Any,
+                         is_reviewer: bool, inputs: dict[str, Any],
+                         findings: list[dict[str, Any]], agent_id: str, pooled: Any = None,
+                         instruction_override: str | None = None) -> dict[str, Any]:
+        """One node's work, with a concurrency slot already held for `agent_id`."""
         agent = self.org.get(agent_id)
 
         self._log("node.bind", node_id=node_id, agent_id=agent.id,
@@ -1574,6 +1614,10 @@ class NodeExecutor:
         rotated_session = prepared.get("session")
         if rotated_session is not None and rotated_session is not session:
             session = rotated_session
+        # Recorded here rather than at the claim, because the session belongs to the agent that *won*
+        # the slot and cannot be built until that is known — and recorded after the rotation check so
+        # the roster view names the live session rather than the one that was just sealed.
+        self.org.runtime(agent.id).note_session(session.session_id)
 
         prompt = self.builder.node_prompt(
             bundle,
@@ -1715,7 +1759,14 @@ class NodeExecutor:
             # A malformed fan-out is a manifest defect, and it is refused *before* any call is made.
             raise ExecutionError(f"node {node_id!r} declares an invalid fan-out: {exc}") from exc
 
-        voters = list(binding.agents) or [binding.primary]
+        # The pool the items are spread over. For a load-balanced binding that is every eligible
+        # holder, not only the agent the node bound to: items are independent work, and stacking them
+        # all on one agent while its capable siblings sat idle was the visible half of the missing
+        # single-flight (the round-robin here suggests an agent; `_claim_slot` confirms the suggestion
+        # is genuinely free and moves to another candidate when it is not). A pinned or round-robin
+        # binding names its own agents and offers no pool — those policies *are* the distribution
+        # rule, and a claim must not quietly overrule what the manifest asked for.
+        voters = list(binding.candidates) or list(binding.agents) or [binding.primary]
         self._log("fanout.start", node_id=node_id,
                   detail={"items": len(plan), "agents": voters, "max_parallel": max_parallel})
 
@@ -2005,6 +2056,61 @@ class NodeExecutor:
         except BindingError as exc:
             raise ExecutionError(f"cannot bind node {node_id!r}: {exc}") from exc
 
+    # ── the single-flight claim ─────────────────────────────────────────────
+
+    def _claim_slot(self, *, node_id: str, binding: Any, preferred: str) -> tuple[str, Any]:
+        """Take one agent's concurrency slot for this work and name the agent it landed on.
+
+        **The defect this closes.** `Org.lock_for` described itself as "the mechanism behind
+        single-flight" and had no caller; `AgentRuntime.begin`/`finish` had no caller either, so
+        `state` stayed IDLE for the whole life of a process and `available()` therefore answered
+        "free" for every agent, always. Binding's load-balanced ordering could not see work that was
+        never recorded, so a parallel group's members and a fan-out's items were routinely bound to
+        one agent — and two nodes on one agent then shared one `Session`, interleaving two
+        transcripts in a window that was sized and compacted for one.
+
+        **Why the check and the claim are one call.** `AgentRuntime.try_begin` decides and claims
+        under the runtime's own lock. A caller that read `available()` and then called `begin` has a
+        window between the two — and parallel group members and fan-out items really do bind from
+        several threads (`engine/parallel.py`, `engine/fanout.py`), so that window is exactly where
+        both of them see the same free slot. Reserving separately from deciding is the bug, not an
+        optimisation of it.
+
+        `binding.candidates` is the pool to fall back through, best-first: the node bound to a
+        preference, and this hands the work to the next holder when that preference is already busy
+        by the time the node starts.
+
+        **Why it never refuses.** If every capable agent is at its limit, refusing to bind turns a
+        run that works today into a stopped one, which is far worse than two nodes sharing an agent.
+        So the honest outcome is chosen deliberately: the work runs, on the least-loaded candidate,
+        and the overload is taken as a *real* claim (`begin`, unconditional) and logged — the count
+        goes past the limit and comes back down as work finishes, so the next binder sees the truth
+        and prefers somebody else. Nothing waits: a plan of N nodes on one skill held by one agent
+        still completes, exactly as it did before this change.
+        """
+        pool = [preferred]
+        for candidate in binding.candidates or ():
+            if candidate not in pool:
+                pool.append(candidate)
+        # The run is the task an agent is working on: it is the unit a person reasons about ("Alice
+        # is on the booking run"), and it is stable for the whole life of this claim.
+        task_id = str(self.ctx.run_id or node_id)
+        for agent_id in pool:
+            runtime = self.org.runtime(agent_id)
+            if runtime.try_begin(task_id=task_id, node_id=node_id):
+                return agent_id, runtime
+
+        agent_id = min(pool, key=lambda a: (self.org.runtime(a).pressure(), pool.index(a)))
+        runtime = self.org.runtime(agent_id)
+        runtime.begin(task_id=task_id, node_id=node_id)
+        self._log("node.over_subscribed", level="warning", node_id=node_id, agent_id=agent_id,
+                  message=(f"every agent holding {binding.skill!r} is at its concurrency limit "
+                           f"({len(pool)} candidate(s)); running on the least loaded rather than "
+                           f"refusing the node"),
+                  detail={"candidates": list(pool),
+                          "pressure": {a: round(self.org.runtime(a).pressure(), 2) for a in pool}})
+        return agent_id, runtime
+
     def _producer_for(self, node_id: str, node: dict[str, Any]) -> str | None:
         """Which agent produced the artifact this reviewer would judge.
 
@@ -2045,8 +2151,11 @@ class NodeExecutor:
     def _session_for(self, agent: Any, node_id: str, bundle: SkillBundle) -> Session:
         """The agent's session for this node, created on first use.
 
-        Per-agent, not per-node: the agent is the thing whose attention is being managed, and a node
-        that spans many sessions must not lose its window sizing between them.
+        Keyed per (agent, node), which is the granularity the attention accounting is sized for: one
+        node's work on one agent gets one transcript however many attempts it takes, and a *different*
+        node on the same agent gets its own. A fan-out's items deliberately share one node id, so
+        items that land on the same agent still share a session — a real collision rather than a
+        design, and exactly why items are spread across holders before that happens (`_claim_slot`).
         """
         key = f"{agent.id}:{node_id}"
         with self.ctx.lock:

@@ -32,6 +32,7 @@ Usage:
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -354,13 +355,30 @@ class AgentRuntime:
     Kept separate from :class:`AgentSpec` so the *definition* can be persisted and diffed
     while the *state* changes constantly. Conflating them would mean writing the roster file
     on every heartbeat.
+
+    **Occupancy is counted, not inferred from `state`.** `state` is single-valued, so it cannot
+    express "two of this agent's three slots are held" — and it was *never set at all*, because
+    nothing called `begin`, so `available()` answered "free" for an agent that was mid-node. The
+    count below is the truth binding reads; `state` is what the roster view shows.
     """
 
     agent_id: str
+    #: How many units of work this agent may hold at once, copied from `AgentSpec.max_concurrency`
+    #: by :class:`~engine.org.roster.Org`. Single-flight means *no more than this*, not "exactly
+    #: one": the default is 1, so an ordinary agent is one-node-at-a-time, while an agent hired as
+    #: "may run three at once" is held to three.
+    capacity: int = 1
     state: AgentState = AgentState.IDLE
     current_task: str | None = None
     current_node: str | None = None
     current_session: str | None = None
+    #: Units of work currently held by a caller. Incremented once per `begin`/`try_begin` and
+    #: released once per `finish`, so the pair must bracket the work exactly.
+    inflight: int = 0
+    #: Guards `state`, `current_*` and `inflight`. Per-runtime rather than per-org because the
+    #: decision this protects — "is a slot free, and is it now mine?" — is about one agent, and a
+    #: global lock would serialise every binding in the run for a property that never spans agents.
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
     # Delegation chain: the agents that led here, oldest first.
     chain: list[str] = field(default_factory=list)
     # Rolling health signals, filled by health.py.
@@ -375,33 +393,115 @@ class AgentRuntime:
     last_error: str | None = None
 
     def busy(self) -> bool:
-        """True when the agent is occupied — the single-flight check uses this."""
-        return self.state in (AgentState.WORKING, AgentState.BLOCKED)
+        """True when the agent holds work or is parked — the single-flight check uses this."""
+        with self._lock:
+            return self.inflight > 0 or self.state is AgentState.BLOCKED
 
     def available(self) -> bool:
-        """True when the agent may take new work."""
-        return self.state in (AgentState.IDLE,)
+        """True when the agent has a free slot and is not parked, gone or quarantined.
+
+        Read by the binder's ordering, by routing and by delegation, which is why it answers with
+        the *count*: an agent at its limit is not available however cheerful its `state` looks.
+        """
+        with self._lock:
+            if self.state in (AgentState.BLOCKED, AgentState.QUARANTINED, AgentState.TERMINATED):
+                return False
+            return self.inflight < self.capacity
+
+    def pressure(self) -> float:
+        """Held slots as a fraction of the limit — the tie-break when every candidate is full.
+
+        Capacity-normalised rather than raw, so a two-slot agent holding two slots loses to a
+        four-slot agent holding two: the question is which one is closest to its own limit.
+        """
+        with self._lock:
+            return self.inflight / self.capacity if self.capacity else 0.0
+
+    def try_begin(self, *, task_id: str, node_id: str, session_id: str | None = None) -> bool:
+        """Take a slot for this work, but only if one is free, and report whether it was taken.
+
+        THE ONE ATOMIC STEP. The check and the claim are the same call under the same lock because
+        a caller that asked `available()` and then called `begin` has a window in which a sibling —
+        a parallel group's other member, or a second fan-out item — sees the same free slot and
+        takes it too. That is precisely how two nodes were bound to one agent and then shared a
+        session, so the window is closed here rather than trusted not to open.
+        """
+        with self._lock:
+            if self.state in (AgentState.QUARANTINED, AgentState.TERMINATED):
+                return False
+            if self.inflight >= self.capacity:
+                return False
+            self.inflight += 1
+            self._mark_working(task_id, node_id, session_id)
+            return True
 
     def begin(self, *, task_id: str, node_id: str, session_id: str | None = None) -> None:
-        """Mark the agent as working on a task."""
+        """Take a slot and mark the agent working, whatever the count already says.
+
+        The unconditional claim, for the one path that must not refuse: when every capable agent is
+        at its limit, the executor runs the node anyway rather than stopping a run that works today.
+        Refusing here would leave that work holding no slot at all, so the agent would look free
+        while it worked — the defect this class exists to fix, wearing a different hat. The overload
+        is therefore *recorded* (the count goes past the limit, and falls back as work finishes)
+        rather than hidden.
+        """
+        with self._lock:
+            self.inflight += 1
+            self._mark_working(task_id, node_id, session_id)
+
+    def _mark_working(self, task_id: str, node_id: str, session_id: str | None) -> None:
+        """Set the descriptive half of a claim. Callers hold `_lock`."""
         self.state = AgentState.WORKING
         self.current_task = task_id
         self.current_node = node_id
         self.current_session = session_id
         self.last_active = _iso_now()
 
+    def note_session(self, session_id: str) -> None:
+        """Record which session the held work is using.
+
+        Separate from `begin` because the session cannot exist before the claim it belongs to: the
+        session is keyed on the agent that *won* the slot, and which agent that is is what the claim
+        decides. A display field, not a claim — the roster view says which transcript an agent is
+        working in, and nothing makes a decision from it.
+        """
+        with self._lock:
+            self.current_session = session_id
+
+    def set_capacity(self, capacity: int) -> None:
+        """Re-read the limit from the spec that owns it.
+
+        The agent's `max_concurrency` can be edited while the org is live (`people.update_agent`),
+        and the spec — not this copy — is the source of truth. Lowering the limit under work that is
+        already running is allowed and safe: the count simply stays above it until that work
+        finishes, `available()` answers False meanwhile, and `finish` brings it back down.
+        """
+        with self._lock:
+            self.capacity = max(1, int(capacity))
+
     def finish(self, *, failed: bool = False, error: str | None = None) -> None:
-        """Mark the agent idle and record the outcome for the health signals."""
-        self.state = AgentState.IDLE
-        self.current_task = None
-        self.current_node = None
-        self.current_session = None
-        self.last_active = _iso_now()
-        if failed:
-            self.tasks_failed += 1
-            self.last_error = error
-        else:
-            self.tasks_completed += 1
+        """Release the slot this unit of work took, and record the outcome for the health signals.
+
+        The agent becomes idle only when the *last* held unit finishes: with a limit of three, the
+        first of three to complete must not report a free agent that is still working.
+        """
+        with self._lock:
+            self.inflight = max(0, self.inflight - 1)
+            if self.inflight == 0:
+                # Not TERMINATED or QUARANTINED: a roster edited mid-run must not be undone by a
+                # node that happens to finish afterwards, which would put a retired agent back in
+                # the pool the health engine removed it from.
+                if self.state not in (AgentState.TERMINATED, AgentState.QUARANTINED):
+                    self.state = AgentState.IDLE
+                self.current_task = None
+                self.current_node = None
+                self.current_session = None
+            self.last_active = _iso_now()
+            if failed:
+                self.tasks_failed += 1
+                self.last_error = error
+            else:
+                self.tasks_completed += 1
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -410,6 +510,8 @@ class AgentRuntime:
             "current_task": self.current_task,
             "current_node": self.current_node,
             "current_session": self.current_session,
+            "capacity": self.capacity,
+            "inflight": self.inflight,
             "chain": list(self.chain),
             "tasks_completed": self.tasks_completed,
             "tasks_failed": self.tasks_failed,

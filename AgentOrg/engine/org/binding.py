@@ -17,7 +17,13 @@ structural refusals live:
 DESIGN
 ------
 - **Four policies**, because one is not enough: `pinned` (a fixed agent), `round-robin`
-  (spread work), `load-balanced` (prefer the idle), and `swarm` (all of them, for a quorum).
+  (spread work), `load-balanced` (prefer a holder with a free concurrency slot), and `swarm`
+  (all of them, for a quorum).
+- **Availability is a count, not a guess.** A holder is a candidate while it has a slot left under
+  its own `max_concurrency`, and the binding carries the whole eligible pool so the executor can
+  claim a *real* slot from it when the node starts. The choice here is a preference; the claim is
+  what makes it binding, and the two are split because this module also binds a manifest for
+  display, where nothing runs and nothing may be consumed.
 - **Determinism is a feature.** Selection is stable for the same inputs, so a replayed run
   routes identically and a bug is reproducible.
 - **Quarantined agents are never selected.** The health engine removes them from the pool, and
@@ -91,6 +97,15 @@ class NodeBinding:
     # Why this selection, recorded so "why did this node run as that agent?" is answerable.
     reason: str = ""
     excluded: tuple[str, ...] = ()
+    #: Every eligible holder, best-first, for the policies where a substitution is legitimate.
+    #:
+    #: `agents[0]` is the choice; this is the fallback pool behind it, in the order that should be
+    #: tried, and the executor claims a slot along it when the chosen agent turns out to be at its
+    #: limit by the time the node starts. Binding cannot make that claim itself — `plan_bindings`
+    #: binds a whole manifest at plan time, and a preview that consumed capacity would leave the
+    #: agents it named looking busy before any work existed. Empty for `pinned` and `round-robin`,
+    #: whose selection *is* the distribution policy and must not be second-guessed.
+    candidates: tuple[str, ...] = ()
 
     @property
     def primary(self) -> str:
@@ -133,7 +148,7 @@ class Binder:
     Parameters
     ----------
     org:
-        The roster. Lookups go through it so state (idle, quarantined) is respected.
+        The roster. Lookups go through it so live state (free slots, quarantined) is respected.
     """
 
     org: Org
@@ -261,7 +276,18 @@ class Binder:
 
     def _bind_load_balanced(self, node_id: str, skill: str, eligible: list[AgentSpec],
                             excluded: tuple[str, ...]) -> NodeBinding:
-        """Prefer an idle agent, then the most capable, then the name — deterministically."""
+        """Prefer a holder with a free slot, then the most capable, then the name.
+
+        WHY the free slot is read from `AgentRuntime.available()` and not from `state`: availability
+        is a *count* of held slots against the agent's own `max_concurrency`, because single-flight
+        means "no more than the agent may run at once". An agent permitted two tasks is still a
+        candidate while it works on one of them; an agent at its limit is not, however many capable
+        siblings the roster has.
+
+        This is a *preference*, not a reservation. The claim is taken by the executor when the node
+        starts, along `candidates` — see `NodeBinding.candidates` for why the decision cannot be made
+        at plan time, when a manifest is bound for display and nothing runs.
+        """
         def key(spec: AgentSpec) -> tuple[int, int, str]:
             runtime = self.org.runtime(spec.id)
             busy = 0 if runtime.available() else 1
@@ -270,14 +296,25 @@ class Binder:
         ordered = sorted(eligible, key=key)
         chosen = ordered[0]
         idle = sum(1 for a in eligible if self.org.runtime(a.id).available())
+        # The limit travels in the reason because "why is nobody free?" is the question this reason
+        # exists to answer, and "0 of 3 have a free slot" says it without opening the roster.
+        def slot_line(spec: AgentSpec) -> str:
+            # `capacity` from the runtime rather than `max_concurrency` from the spec: the runtime's
+            # copy was just refreshed from the spec by `org.runtime`, and the reason should quote the
+            # limit that is actually in force, not the one the roster happens to carry.
+            runtime = self.org.runtime(spec.id)
+            return f"{spec.name} {runtime.inflight}/{runtime.capacity}"
+
+        limits = ", ".join(slot_line(a) for a in ordered)
         return NodeBinding(
             node_id=node_id, skill=skill, agents=[chosen.id],
             policy=BindingPolicy.LOAD_BALANCED,
             reason=(
-                f"{chosen.name} chosen: {idle} of {len(eligible)} idle, "
-                f"level {chosen.level.label}"
+                f"{chosen.name} chosen: {idle} of {len(eligible)} with a free slot, "
+                f"level {chosen.level.label} [{limits}]"
             ),
             excluded=excluded,
+            candidates=tuple(a.id for a in ordered),
         )
 
     def _bind_swarm(self, node_id: str, skill: str, eligible: list[AgentSpec],
@@ -289,6 +326,9 @@ class Binder:
             policy=BindingPolicy.SWARM,
             reason=f"swarm of {len(ordered)}; quorum {max(1, len(ordered) // 2 + 1)}",
             excluded=excluded,
+            # The voters are the pool: a voter whose agent is at its limit may be run by another
+            # holder, which weakens nothing — the vote is counted per agent, not per slot.
+            candidates=tuple(a.id for a in ordered),
         )
 
     # ── the independence refusal ────────────────────────────────────────────

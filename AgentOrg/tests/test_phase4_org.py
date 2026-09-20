@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pathlib
 import sys
+import threading
 import time
 
 import pytest
@@ -744,6 +745,152 @@ def test_swarm_quorum_is_a_strict_majority():
         binding = NodeBinding(node_id="n", skill="s", agents=[f"a{i}" for i in range(count)],
                               policy=BindingPolicy.SWARM)
         assert binding.quorum() == expected
+
+
+# ── single-flight: an agent's own concurrency limit ──────────────────────────
+#
+# `Org.lock_for` called itself "the mechanism behind single-flight" while nothing held it, and
+# `AgentRuntime.begin` had no caller either — so `state` stayed IDLE for the life of a process and
+# `available()` answered "free" for an agent that was mid-node. These pin the mechanism that replaced
+# it: a counted claim on the runtime, limited by the agent's own `max_concurrency`.
+
+
+def test_a_claim_is_limited_by_the_agents_own_concurrency(org):
+    """The limit is `max_concurrency` — three slots admit three claims, and refuse the fourth."""
+    holder = org.candidates_for("backend-developer")[0]
+    holder.max_concurrency = 3
+    runtime = org.runtime(holder.id)
+
+    assert runtime.capacity == 3, "the spec is the source of truth for the limit"
+    taken = [runtime.try_begin(task_id="t", node_id=f"n{i}") for i in range(4)]
+
+    assert taken == [True, True, True, False], "the fourth claim must be refused, not queued"
+    assert runtime.inflight == 3
+    assert not runtime.available(), "an agent at its limit is not available"
+    assert runtime.busy()
+
+
+def test_finishing_one_of_several_slots_keeps_the_agent_working(org):
+    """The second task is still running, so the first one's finish must not report the agent gone.
+
+    Note what is *not* asserted: with a limit of two, one held slot leaves the agent available *and*
+    busy. "Has a free slot" and "is occupied" are different questions, and conflating them would make
+    this test assert the opposite of the design.
+    """
+    holder = org.candidates_for("backend-developer")[0]
+    holder.max_concurrency = 2
+    runtime = org.runtime(holder.id)
+    runtime.try_begin(task_id="t", node_id="n1")
+    runtime.try_begin(task_id="t", node_id="n2")
+
+    runtime.finish()
+    assert runtime.inflight == 1 and runtime.state is AgentState.WORKING
+    assert runtime.busy() and runtime.available()
+
+    runtime.finish(failed=True, error="boom")
+    assert runtime.inflight == 0 and runtime.available() and runtime.state is AgentState.IDLE
+    assert runtime.tasks_failed == 1 and runtime.last_error == "boom"
+
+
+def test_the_decision_and_the_claim_cannot_be_separated(org):
+    """A thread that asks `available()` and then claims is how two nodes both see one free slot."""
+    holder = org.candidates_for("backend-developer")[0]
+    holder.max_concurrency = 2
+    runtime = org.runtime(holder.id)
+    gate = threading.Barrier(8)
+    lock = threading.Lock()
+    taken: list[bool] = []
+
+    def claim(index: int) -> None:
+        gate.wait(timeout=5)
+        result = runtime.try_begin(task_id="t", node_id=f"n{index}")
+        with lock:
+            taken.append(result)
+
+    threads = [threading.Thread(target=claim, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert len(taken) == 8, "every thread must report its claim attempt"
+    assert sum(taken) == 2, (
+        f"{sum(taken)} of 8 threads were admitted to 2 slots: {taken} — checking and claiming "
+        "separately lets several of them read the same free slot"
+    )
+
+
+def test_an_edit_to_the_specs_limit_reaches_the_runtime(org):
+    """`people.update_agent` can change `max_concurrency`; a stale copy would freeze the old limit."""
+    holder = org.candidates_for("backend-developer")[0]
+    assert org.runtime(holder.id).capacity == 1
+
+    holder.max_concurrency = 4
+
+    assert org.runtime(holder.id).capacity == 4, "the spec is the source of truth, re-read on access"
+
+
+def test_load_balanced_binding_prefers_a_holder_with_a_free_slot(org):
+    """Two holders, one at its limit: the free one is chosen even though the other is more capable."""
+    from engine.org.roster import DEFAULT_TEMPLATES
+
+    busy = org.candidates_for("backend-developer")[0]
+    busy.level = AgentLevel.PRINCIPAL          # more capable, so a level-first order would pick it
+    template = next(t for t in DEFAULT_TEMPLATES if t.title == "Backend Developer")
+    other = org.hire_from(template, name="Bob", provider="ollama",
+                          model="qwen2.5-coder:7b", context_window=32768)
+    org.runtime(busy.id).try_begin(task_id="t", node_id="n1")
+
+    binding = Binder(org).bind({"id": "n", "skill": "backend-developer"})
+
+    assert binding.primary == other.id, "an agent at its limit must not be chosen while one is free"
+    assert "free slot" in binding.reason, binding.reason
+
+
+def test_a_load_balanced_binding_carries_the_pool_behind_its_choice(org):
+    """The claim is taken when the node runs, so the binding must hand the executor its alternatives.
+
+    Binding cannot claim the slot itself: `plan_bindings` binds a whole manifest for display, and a
+    preview that consumed capacity would leave agents looking busy before any work existed.
+    """
+    from engine.org.roster import DEFAULT_TEMPLATES
+
+    template = next(t for t in DEFAULT_TEMPLATES if t.title == "Backend Developer")
+    org.hire_from(template, name="Bob", provider="ollama",
+                  model="qwen2.5-coder:7b", context_window=32768)
+    eligible = org.candidates_for("backend-developer")
+
+    binding = Binder(org).bind({"id": "n", "skill": "backend-developer"})
+
+    assert set(binding.candidates) == {a.id for a in eligible}, "the whole pool, best-first"
+    assert binding.primary == binding.candidates[0], "and the choice is its first entry"
+    assert all(org.runtime(a.id).inflight == 0 for a in eligible), \
+        "binding for display must not consume a slot"
+
+
+def test_pinned_and_round_robin_bindings_offer_no_pool(org):
+    """Those policies *are* the distribution rule, so a claim must not overrule them."""
+    from engine.org.roster import DEFAULT_TEMPLATES
+
+    template = next(t for t in DEFAULT_TEMPLATES if t.title == "Backend Developer")
+    org.hire_from(template, name="Bob", provider="ollama",
+                  model="qwen2.5-coder:7b", context_window=32768)
+    holder = org.candidates_for("backend-developer")[0]
+
+    pinned = Binder(org).bind({"id": "n", "skill": "backend-developer"},
+                              policy=BindingPolicy.PINNED, pinned=holder.id)
+    rotated = Binder(org).bind({"id": "n", "skill": "backend-developer"},
+                               policy=BindingPolicy.ROUND_ROBIN)
+
+    assert pinned.candidates == () and rotated.candidates == ()
+    assert pinned.primary == holder.id
+
+
+def test_the_swarm_pool_is_its_own_voters(org):
+    """A voter whose agent is at its limit may be run by another holder; the vote is per agent."""
+    binding = Binder(org).bind({"id": "n", "skill": "code-reviewer"},
+                               policy=BindingPolicy.SWARM)
+    assert binding.candidates == tuple(binding.agents)
 
 
 def test_independence_refuses_self_review(org):

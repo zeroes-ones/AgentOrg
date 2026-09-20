@@ -312,8 +312,13 @@ class Scheduler:
         if len(self._running) >= self.ceiling:
             return False
         if self._agent_inflight.get(ticket.agent_id):
-            # Single-flight: one agent, one task. A second concurrent task would interleave its
-            # context and corrupt both.
+            # One ticket per agent here, which is *stricter* than the engine now enforces: an agent's
+            # real limit is `AgentSpec.max_concurrency`, claimed by `AgentRuntime.try_begin` around a
+            # node's work, and a holder permitted three tasks genuinely runs three. This dict is
+            # run-level admission, not binding, so it has no roster to read that limit from — wiring
+            # this class in would throttle such an agent to one ticket. Nothing in the engine
+            # constructs a `Scheduler` today; whoever wires one up must decide whether that
+            # throttling is wanted.
             return False
         limit = self._provider_limits.get(ticket.provider)
         if limit is not None and self._provider_inflight.get(ticket.provider, 0) >= limit:

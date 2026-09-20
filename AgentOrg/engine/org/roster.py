@@ -53,6 +53,17 @@ def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + f".{int(time.time() * 1000) % 1000:03d}Z"
 
 
+def _runtime_for(spec: AgentSpec) -> AgentRuntime:
+    """A fresh runtime sized to the agent's own concurrency limit.
+
+    One place builds runtime objects, so a limit can never be copied at one site and forgotten at
+    another. The spec remains the source of truth for the number — `people.update_agent` can change
+    `max_concurrency` on a live agent — which is why :meth:`Org.runtime`, the accessor every
+    capacity-sensitive caller goes through, refreshes the copy.
+    """
+    return AgentRuntime(agent_id=spec.id, capacity=max(1, int(spec.max_concurrency or 1)))
+
+
 class OrgError(RuntimeError):
     """Raised on an invalid roster operation."""
 
@@ -239,7 +250,7 @@ class Org:
                     "Names must be unique so the roster and logs are unambiguous."
                 )
             self.agents[spec.id] = spec
-            self.runtimes[spec.id] = AgentRuntime(agent_id=spec.id)
+            self.runtimes[spec.id] = _runtime_for(spec)
             if team:
                 self.assign_team(spec.id, team)
             elif spec.team:
@@ -281,7 +292,7 @@ class Org:
 
             reports = self.direct_reports(agent_id)
             working = [r for r in reports
-                       if self.runtimes.get(r.id, AgentRuntime(r.id)).busy()]
+                       if self.runtimes.get(r.id, _runtime_for(r)).busy()]
             if working:
                 names = ", ".join(f"{r.name} ({r.id})" for r in working)
                 raise OrgError(
@@ -377,19 +388,38 @@ class Org:
         return None
 
     def runtime(self, agent_id: str) -> AgentRuntime:
-        """Live state for an agent, created on first access."""
+        """Live state for an agent, created on first access.
+
+        **The accessor every capacity-sensitive caller goes through**, and therefore the place that
+        keeps the concurrency limit honest: `people.update_agent` can change an agent's
+        `max_concurrency`, and a runtime still carrying the old number would silently hold the agent
+        to a limit the roster no longer states. The spec is the source of truth; the copy on the
+        runtime is what binding reads, refreshed here. The few sites that read `self.runtimes`
+        directly (`candidates_for`, `span_of_control`) only look at `state`, not the limit.
+        """
         with self._guard:
+            spec = self.agents.get(agent_id)
             runtime = self.runtimes.get(agent_id)
             if runtime is None:
-                runtime = AgentRuntime(agent_id=agent_id)
+                # A runtime for an id the roster does not hold is legitimate — a caller may look
+                # state up before the spec exists — and gets the default limit of one.
+                runtime = _runtime_for(spec) if spec is not None else AgentRuntime(agent_id=agent_id)
                 self.runtimes[agent_id] = runtime
+            elif spec is not None:
+                limit = max(1, int(spec.max_concurrency or 1))
+                if runtime.capacity != limit:
+                    runtime.set_capacity(limit)
             return runtime
 
     def lock_for(self, agent_id: str) -> threading.RLock:
         """A per-agent lock, so a caller can serialise work for one agent.
 
-        This is the mechanism behind single-flight: the scheduler holds this while an agent is
-        working, so it cannot be handed a second task concurrently.
+        **Not** the mechanism behind single-flight, whatever this docstring used to claim: a lock
+        can express "one at a time" but not "no more than the agent's limit", which is what
+        `AgentSpec.max_concurrency` means. Single-flight is the runtime's slot claim —
+        `AgentRuntime.try_begin`/`begin`/`finish` — held by the executor around a node's work. This
+        remains available for a caller that needs to serialise a *pair of steps* on one agent, and
+        nothing in the engine holds it today, so it neither enforces nor implies the limit.
         """
         with self._guard:
             lock = self._locks.get(agent_id)
@@ -426,6 +456,10 @@ class Org:
 
         def sort_key(spec: AgentSpec) -> tuple[int, int, str]:
             runtime = self.runtimes.get(spec.id)
+            # Load is "holds work", and it is deliberately the *boolean*: this ordering is a
+            # preference among holders, and the exact count is what the binder reads when it
+            # decides between two agents. Sorting by the raw count here would make the order depend
+            # on a number that changes under the caller.
             load = 1 if (runtime is not None and runtime.busy()) else 0
             return (-int(spec.level), load, spec.name)
 
@@ -433,7 +467,11 @@ class Org:
         return out
 
     def available_for(self, skill: str) -> list[AgentSpec]:
-        """Agents holding a skill that are idle right now."""
+        """Agents holding a skill that have a free concurrency slot right now.
+
+        "Free slot" rather than "idle", because an agent permitted three tasks at once is available
+        while it works on two of them.
+        """
         return [spec for spec in self.candidates_for(skill)
                 if self.runtime(spec.id).available()]
 
@@ -451,7 +489,7 @@ class Org:
         """
         return sum(
             1 for report in self.direct_reports(agent_id)
-            if self.runtimes.get(report.id, AgentRuntime(report.id)).state
+            if self.runtimes.get(report.id, _runtime_for(report)).state
             not in (AgentState.TERMINATED, AgentState.QUARANTINED)
         )
 
@@ -539,7 +577,7 @@ class Org:
                 skipped.append(f"{raw.get('name') or raw.get('id')}: {exc}")
                 continue
             org.agents[spec.id] = spec
-            org.runtimes[spec.id] = AgentRuntime(agent_id=spec.id)
+            org.runtimes[spec.id] = _runtime_for(spec)
         for raw in data.get("teams") or []:
             if isinstance(raw, dict):
                 team = Team.from_dict(raw)
@@ -666,7 +704,7 @@ def default_company(*, provider: str, model: str, context_window: int,
     )
     # A human agent carries no model, so the AI-specific validation is skipped for it.
     org.agents[owner.id] = owner
-    org.runtimes[owner.id] = AgentRuntime(agent_id=owner.id)
+    org.runtimes[owner.id] = _runtime_for(owner)
 
     names = {
         "Product Manager": "Priya",
@@ -691,7 +729,7 @@ def default_company(*, provider: str, model: str, context_window: int,
             budget=Budget(),
         )
         org.agents[spec.id] = spec
-        org.runtimes[spec.id] = AgentRuntime(agent_id=spec.id)
+        org.runtimes[spec.id] = _runtime_for(spec)
         org.assign_team(spec.id, template.team, lead=(template.role == "reviewer"
                                                       and template.title == "Code Reviewer"))
 

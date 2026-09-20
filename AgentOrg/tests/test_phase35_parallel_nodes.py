@@ -43,7 +43,7 @@ from engine.executor import ExecutorContext, NodeExecutor
 from engine.fanout import ConcurrentSlot, plan_fanout, run_fanout, run_wave
 from engine.gateway import Gateway
 from engine.library import resolve
-from engine.org import default_company
+from engine.org import AgentSpec, AgentState, default_company
 from engine.parallel import (
     ParallelError, find_group, group_ceiling, plan_group, run_group, shared_gate,
 )
@@ -148,11 +148,11 @@ def group_manifest(*, concurrent: bool, members=("a", "b"), join: str = "all") -
     }
 
 
-def make_executor(config, source, manifest: dict, *, pins=None):
+def make_executor(config, source, manifest: dict, *, pins=None, org=None, provider=None):
     workspace = pathlib.Path(tempfile.mkdtemp())
     (workspace / "wf.yaml").write_text(emit_safe_yaml(manifest))
-    provider = ProbeProvider(source, provider_id="fake")
-    org = default_company(provider="fake", model="m", context_window=32768)
+    provider = provider or ProbeProvider(source, provider_id="fake")
+    org = org or default_company(provider="fake", model="m", context_window=32768)
     context = ExecutorContext(
         org=org, gateway=Gateway(config, {"fake": provider}, estimator=TokenEstimator()),
         skills=source, workspace=workspace, config=config, run_id="r", workflow="wf",
@@ -733,3 +733,329 @@ def test_the_runner_is_not_modified():
         "the shared runner must not have grown thread dispatch; the engine-side half is the fix"
     assert "execute_node(nid, self.state, ctx)" in text, \
         "the runner must still dispatch one node at a time"
+
+
+# ── single-flight: a busy agent is visible to binding ────────────────────────
+#
+# The defect these pin: `Org.lock_for` called itself "the mechanism behind single-flight" and had no
+# caller, and `AgentRuntime.begin`/`finish` had none either — so `state` never left IDLE, `available()`
+# answered "free" for every agent always, and the load-balanced binder therefore read a roster in which
+# nobody was ever working. Two nodes needing one skill (a fan-out's items, a parallel group's members)
+# were bound to the same agent and then shared one `Session`, interleaving two transcripts in a window
+# that was sized and compacted for one.
+#
+# The claim is taken by the executor when the node starts, under the runtime's own lock, along the
+# binding's pool of alternatives. These tests observe the consequence rather than the mechanism: which
+# agent each node actually ran as, read from the executor's own record.
+
+
+def two_holder_org(*, skill: str = "code-reviewer", capacity: int = 1):
+    """The default company plus a second agent holding one skill.
+
+    The default company hires exactly one agent per skill, which is the *safe* shape: with one holder
+    there is nobody to distribute to, and two nodes would share it whatever binding does. The property
+    under test needs two holders, so the second one is the point of the fixture rather than a
+    convenience — and it is hired directly rather than from a template so its level (and therefore the
+    binder's tie-break) matches the first holder's, leaving availability as the only difference.
+    """
+    org = default_company(provider="fake", model="m", context_window=32768)
+    first = next(a for a in org.agents.values() if skill in a.skills)
+    first.max_concurrency = capacity
+    org.hire(AgentSpec(
+        id="ag_second_holder", name="Second Holder", title="Code Reviewer", skills=[skill],
+        provider="fake", model="m", context_window=32768, role="reviewer",
+        level=first.level, max_concurrency=capacity))
+    return org, first
+
+
+def slot_watch_provider(source, *, org, parties: int):
+    """A probe that records every holder's slot count as each call starts.
+
+    The claim is invisible once a node returns — the count is back to zero — so "N were admitted and
+    not N+1" can only be observed *while the work is in flight*. Each call snapshots the roster at
+    entry, and the barrier holds all `parties` calls inside at once so at least one snapshot is taken
+    with every claim held.
+    """
+    class SlotWatch(ProbeProvider):
+        def __init__(self, src):
+            super().__init__(src, provider_id="fake")
+            self.gate = threading.Barrier(parties, timeout=15)
+            self.rows: list[dict[str, int]] = []
+
+        def complete(self, request):
+            with self._lock:
+                self.rows.append({a.id: org.runtime(a.id).inflight
+                                  for a in org.agents.values() if a.is_ai})
+            try:
+                self.gate.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return super().complete(request)
+
+    return SlotWatch(source)
+
+
+def rendezvous_provider(source, *, parties: int = 2):
+    """A probe whose calls block until `parties` of them are in flight together.
+
+    Overlap has to be *observed*, not hoped for: a test that starts two threads and then asserts they
+    did not share an agent passes on a machine that ran them one after the other, whichever way the
+    implementation is written. Holding both calls inside the provider until the other arrives makes
+    "these two were genuinely concurrent" a fact of the test.
+    """
+    class Rendezvous(ProbeProvider):
+        def __init__(self, src):
+            super().__init__(src, provider_id="fake")
+            self.gate = threading.Barrier(parties, timeout=15)
+
+        def complete(self, request):
+            # A broken barrier is left to pass through rather than raised: an extra call (a trailer
+            # repair, say) would otherwise turn a wrong *answer* into a hung test.
+            try:
+                self.gate.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return super().complete(request)
+
+    return Rendezvous(source)
+
+
+def exploding_provider(source):
+    """A provider that fails every call, so a node's exit path is an exception, not a result."""
+    class Exploding(ProbeProvider):
+        def complete(self, request):
+            raise RuntimeError("the provider fell over")
+
+    return Exploding(source, provider_id="fake")
+
+
+def one_skill_manifest(*, count: int = 2, skill: str = "code-reviewer") -> dict:
+    """`count` review nodes needing the same skill, with no edge between them.
+
+    No `parallel:` block on purpose: the group is the *other* way to overlap these nodes, and it
+    refuses members that share a skill. Overlapping them here is the caller's doing — two threads
+    calling `execute_node` — which is also what a group's members do.
+    """
+    nodes = [{"id": f"n{i}", "skill": skill, "inputs": [], "outputs": [f"report-{i}"]}
+             for i in range(count)]
+    return {"name": "wf", "version": "1.0.0", "start": "n0", "nodes": nodes, "edges": []}
+
+
+def run_concurrently(callables: list, *, timeout_s: float = 30.0) -> list:
+    """Run each callable in its own thread and return what they raised (None where they did not).
+
+    A timeout that is *reported* rather than hung on: the property this suite is most afraid of is a
+    claim that never releases, which shows up as a join that does not return.
+    """
+    errors: list = [None] * len(callables)
+
+    def _one(index: int, fn) -> None:
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - reported to the test, not swallowed
+            errors[index] = exc
+
+    threads = [threading.Thread(target=_one, args=(i, fn)) for i, fn in enumerate(callables)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=timeout_s)
+    assert not any(thread.is_alive() for thread in threads), \
+        "a node never returned: the claim is holding a slot nothing will release"
+    return errors
+
+
+def test_two_concurrent_nodes_on_one_skill_bind_to_two_agents(config, source):
+    """THE load-bearing test: two holders, two concurrent nodes, two agents.
+
+    Without the claim both binds read the same roster — nobody was ever recorded as working — and both
+    nodes landed on the first holder, sharing one session. With it, the first node claims the holder it
+    bound to and the second finds it at its limit and takes the next candidate from the pool.
+    """
+    org, first = two_holder_org()
+    executor, _provider = make_executor(config, source, one_skill_manifest(count=2),
+                                        org=org, provider=rendezvous_provider(source))
+    state = ready_state(source, pending=("n0", "n1"))
+
+    errors = run_concurrently([
+        lambda: executor.execute_node("n0", state, {}),
+        lambda: executor.execute_node("n1", state, {}),
+    ])
+
+    assert not any(errors), f"a concurrent node raised: {[e for e in errors if e]}"
+    agents = {nid: executor.history[nid].agent_id for nid in ("n0", "n1")}
+    assert len(set(agents.values())) == 2, (
+        f"two nodes needing {executor.history['n0'].skill!r} both ran as {agents} — binding saw both "
+        "holdings as idle because the first node's work was never recorded"
+    )
+    assert set(agents.values()) == {first.id, "ag_second_holder"}
+
+
+def test_two_nodes_that_bind_at_the_same_instant_still_land_on_two_agents(config, source):
+    """The window between *deciding* and *claiming*: both binds see both holders free.
+
+    This is the race the first test can miss. There, the second node binds after the first has already
+    claimed, so simply asking the roster which holder is free is enough to separate them — and a
+    version that checked and then claimed separately would pass. Holding both threads inside `bind`
+    with a barrier makes the stale-decision case certain instead of occasional, and only the atomic
+    claim closes it: the second node finds its preferred agent at its limit and moves to the next
+    candidate in the binding's pool.
+    """
+    org, _first = two_holder_org()
+    executor, _provider = make_executor(config, source, one_skill_manifest(count=2), org=org,
+                                        provider=rendezvous_provider(source))
+    gate = threading.Barrier(2, timeout=15)
+    real_bind = executor.binder.bind
+
+    def bind_together(*args, **kwargs):
+        binding = real_bind(*args, **kwargs)
+        # Held *after* the decision and *before* the claim: both threads now hold a binding that names
+        # the same free agent, which is precisely the stale answer the claim has to be able to survive.
+        # A broken barrier is let through, so a node that failed before reaching `bind` surfaces as its
+        # own failure rather than as a second thread waiting out the timeout.
+        try:
+            gate.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return binding
+
+    executor.binder.bind = bind_together
+    state = ready_state(source, pending=("n0", "n1"))
+
+    errors = run_concurrently([
+        lambda: executor.execute_node("n0", state, {}),
+        lambda: executor.execute_node("n1", state, {}),
+    ])
+
+    assert not any(errors), f"a concurrent node raised: {[e for e in errors if e]}"
+    agents = {nid: executor.history[nid].agent_id for nid in ("n0", "n1")}
+    assert len(set(agents.values())) == 2, (
+        f"both nodes bound while the roster still looked idle and both ran as {agents}: the claim has "
+        "to be able to move to another candidate, not only confirm the first choice"
+    )
+
+
+def test_an_agents_limit_is_its_own_concurrency_not_one(config, source):
+    """Three slots, three nodes: two on the holder limited to two, one on the holder limited to one.
+
+    Single-flight is "no more than the agent's `max_concurrency`", and both halves of that matter. A
+    hard one-at-a-time rule would push the third node onto the second holder with the first holder
+    half full, and no rule at all would stack all three on the first — the total capacity here is
+    exactly three, so an implementation that respects the field fills both holders precisely.
+    """
+    org, first = two_holder_org()
+    first.max_concurrency = 2              # the roster's word, which the claim has to follow
+    watcher = slot_watch_provider(source, org=org, parties=3)
+    executor, _provider = make_executor(config, source, one_skill_manifest(count=3), org=org,
+                                       provider=watcher)
+    state = ready_state(source, pending=("n0", "n1", "n2"))
+
+    errors = run_concurrently([
+        (lambda i=i: executor.execute_node(f"n{i}", state, {})) for i in range(3)
+    ])
+
+    assert not any(errors), f"a concurrent node raised: {[e for e in errors if e]}"
+    held = {agent_id: max(row.get(agent_id, 0) for row in watcher.rows)
+            for agent_id in (first.id, "ag_second_holder")}
+    assert held == {first.id: 2, "ag_second_holder": 1}, (
+        f"the holders were observed at {held} while three nodes were in flight — the limit is the "
+        "agent's own max_concurrency, so one holder must take two and the other one"
+    )
+    assert watcher.rows, "the observation has to come from inside the calls, not from the aftermath"
+
+
+def test_a_fanout_spreads_its_items_over_every_holder(config, source):
+    """A fan-out's items are independent work: stacking them on the bound agent is why they collided.
+
+    The bound agent is a *preference* for the node; the items are handed round-robin over the whole
+    pool and each item's claim confirms its suggestion is free. One holder would be indistinguishable
+    from the defect, so the fixture hires two.
+    """
+    org, first = two_holder_org()
+    manifest = {"name": "wf", "version": "1.0.0", "start": "reviewall",
+                "nodes": [{"id": "reviewall", "skill": "code-reviewer", "phase": "REVIEW",
+                           "fanout": "Review {{item}} for regressions.",
+                           "items": ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"],
+                           "inputs": [], "outputs": ["review-report"]}],
+                "edges": []}
+    executor, _provider = make_executor(config, source, manifest, org=org)
+
+    result = executor.execute_node("reviewall", ready_state(source, pending=("reviewall",)), {})
+    used = {item["agent_id"] for item in result["fanout"]["items"]}
+
+    assert result["status"] == "done", result.get("summary")
+    assert used == {first.id, "ag_second_holder"}, (
+        f"the fan-out ran every item as {used}; a second holder sat idle while the items were "
+        "stacked on the agent the node happened to bind to"
+    )
+
+
+def test_nodes_that_outnumber_their_holders_still_run(config, source):
+    """THE safety test: one holder, three nodes, no deadlock and no refusal.
+
+    Every capable agent being at its limit is not a reason to stop a run that works today. The honest
+    outcome is chosen deliberately — the work runs anyway, the overload is taken as a real claim and
+    recorded, and the agent is preferred last next time. A binder that *refused* here would turn a
+    working plan into a stopped one, which is worse than the sharing this change exists to fix.
+    """
+    org = default_company(provider="fake", model="m", context_window=32768)
+    holder = next(a for a in org.agents.values() if "code-reviewer" in a.skills)
+    executor, _provider = make_executor(config, source, one_skill_manifest(count=3), org=org)
+    state = ready_state(source, pending=("n0", "n1", "n2"))
+
+    errors = run_concurrently([
+        # `i=i` rather than a bare closure: a lambda that reads the loop variable sees its final
+        # value, so an unbound one would run "n2" three times and never touch n0 or n1.
+        (lambda i=i: executor.execute_node(f"n{i}", state, {})) for i in range(3)
+    ])
+
+    assert not any(errors), f"a node on a saturated holder raised: {[e for e in errors if e]}"
+    assert sorted(executor.history) == ["n0", "n1", "n2"], \
+        "every node must have run: the one holder is oversubscribed, not a reason to stop"
+    assert all(executor.history[nid].status == "done" for nid in ("n0", "n1", "n2"))
+    runtime = org.runtime(holder.id)
+    assert runtime.inflight == 0 and not runtime.busy(), \
+        "the three claims must all be released, or the holder stays busy forever"
+
+
+def test_an_agent_that_raises_mid_node_is_not_left_busy(config, source):
+    """The release is on the exception path too: a slot that is never given back wedges the org."""
+    org, holder = two_holder_org()
+    executor, _provider = make_executor(config, source, one_skill_manifest(count=1), org=org,
+                                        provider=exploding_provider(source))
+
+    with pytest.raises(RuntimeError):
+        executor.execute_node("n0", ready_state(source, pending=("n0",)), {})
+
+    runtime = org.runtime(holder.id)
+    assert runtime.inflight == 0, "the claim taken before the call must be released by its failure"
+    assert not runtime.busy() and runtime.state is AgentState.IDLE
+    assert runtime.tasks_failed == 1 and runtime.last_error, \
+        "the failure must reach the health record, not only the traceback"
+
+
+def test_a_worker_that_is_killed_mid_node_leaves_no_slot_held(config, source):
+    """An abort is an exit path: a `BaseException` raised while a node runs must release its claim.
+
+    `SystemExit`/`KeyboardInterrupt` are not `Exception`s, so a release guarded by `except Exception`
+    would leave the agent holding a slot for the rest of the process's life — and with a limit of one
+    that agent is then never chosen again.
+    """
+    org, holder = two_holder_org()
+    executor, _provider = make_executor(config, source, one_skill_manifest(count=1), org=org)
+    bundle = executor._load_skill("code-reviewer")
+    binding = executor._bind("n0", {"skill": "code-reviewer"}, "code-reviewer", is_reviewer=True)
+    assert binding.primary == holder.id, "the load-balanced choice is the first holder"
+
+    def _abort(**_kwargs):
+        raise KeyboardInterrupt("the worker was killed")
+
+    executor._run_one_claimed = _abort
+    with pytest.raises(KeyboardInterrupt):
+        executor._run_one(node_id="n0", node={"skill": "code-reviewer"}, skill="code-reviewer",
+                          state=ready_state(source, pending=("n0",)), attempt=1, bundle=bundle,
+                          binding=binding, is_reviewer=True, inputs={}, findings=[],
+                          agent_id=binding.primary)
+
+    runtime = org.runtime(binding.primary)
+    assert runtime.inflight == 0 and not runtime.busy()
