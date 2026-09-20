@@ -144,15 +144,23 @@ jobs:
     defaults:
       run:
         working-directory: AgentOrg
-    env:
-      # The engine refuses to resolve without a Skills checkout — `engine/library.py:574` raises
-      # `LibraryError` unless `scripts/workflow-runner.py` is found — and on a runner none of
-      # `default_search_paths()` exists. This is the same variable a developer sets locally
-      # (README.md:578). It points outside the workspace so the library is never mistaken for part
-      # of the tree under test.
-      AGENTORG_SKILLS_ROOT: ${{ runner.temp }}/skills-library
     steps:
       - uses: actions/checkout@v4
+
+      - name: Point the engine at a Skills checkout
+        # The engine refuses to resolve without one — `engine/library.py:574` raises `LibraryError`
+        # unless `scripts/workflow-runner.py` is found — and on a runner none of
+        # `default_search_paths()` exists. This is the variable a developer sets locally
+        # (README.md:578), pointing outside the workspace so the library is never mistaken for part of
+        # the tree under test.
+        #
+        # Set here rather than in a job-level `env:`, because `${{ runner.temp }}` cannot be used
+        # there: the `runner` context exists per *step*, and naming it above the step level makes the
+        # entire file unparseable. GitHub's whole report of that is a 0-second failure with no jobs and
+        # the words "workflow file issue" — every push after this file first landed failed exactly that
+        # way, with nothing pointing at the offending line. `$RUNNER_TEMP` is the shell variable for
+        # the same directory, valid inside `run:`, and `$GITHUB_ENV` publishes it to every later step.
+        run: echo "AGENTORG_SKILLS_ROOT=$RUNNER_TEMP/skills-library" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:
