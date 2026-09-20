@@ -84,13 +84,24 @@ def _yaml_list(items: list[str], indent: int = 2) -> str:
     return "\n".join(f"{pad}- {item}" for item in items)
 
 
-def _yaml_block_scalar(text: str, indent: int = 2) -> str:
-    """A folded scalar, so a long description stays readable in the file."""
-    pad = " " * indent
+def _yaml_block_scalar(text: str, indent: int = 0) -> str:
+    """A folded scalar for `key: >-`, with the indicator on the **key's own line**.
+
+    The indicator must follow the key on the same line. This used to return the `>-` on a line of its
+    own — `description:` then `  >-` — which is still valid YAML and PyYAML reads it, but the engine's
+    own stdlib parser (the one a machine without PyYAML uses) refuses it: *"line is neither a
+    'key: value' mapping nor a sequence item: '>-' (frontmatter line 3)"*.
+
+    So `skills new` wrote a skill the engine could only read where PyYAML happened to be installed.
+    Five tests in `tests/test_phase8_authoring.py` passed on a developer machine and failed in CI for
+    exactly that reason — the clean environment was the only one telling the truth. The output is now
+    the same shape every library skill uses, and both parsers read it.
+    """
+    pad = " " * (indent + 2)
     lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
     if not lines:
-        return f"{pad}>-"
-    return f"{pad}>-\n" + "\n".join(f"{pad}  {line}" for line in lines)
+        return ">-"
+    return ">-\n" + "\n".join(f"{pad}{line}" for line in lines)
 
 
 def scaffold(template: SkillTemplate, *, criteria: list[str], checklist: list[str],
@@ -126,8 +137,7 @@ def scaffold(template: SkillTemplate, *, criteria: list[str], checklist: list[st
     front = [
         "---",
         f"name: {name}",
-        "description:",
-        _yaml_block_scalar(description),
+        f"description: {_yaml_block_scalar(description)}",
         "license: MIT",
         "tags:",
         _yaml_list(tags),

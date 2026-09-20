@@ -107,6 +107,31 @@ def test_an_authored_skill_is_parsed_identically_to_a_library_one(home, project,
     assert bundle.checklist_ids() == ["DM1"], bundle.checklist_ids()
 
 
+def test_the_scaffold_is_readable_without_pyyaml(home, project):
+    """The scaffolder's output must satisfy the engine's *own* fallback parser, not just PyYAML.
+
+    This is the defect CI found and a developer machine could not. `_yaml_block_scalar` emitted the
+    folded indicator on a line of its own — `description:` then `  >-` — which is valid YAML and
+    PyYAML reads it, while the stdlib parser a PyYAML-less machine uses refuses it ("line is neither a
+    'key: value' mapping nor a sequence item: '>-'"). So `skills new` wrote a skill the engine could
+    only read where PyYAML happened to be installed, and five tests in this file passed locally and
+    failed in CI for exactly that reason.
+
+    Asserted against `prefer_pyyaml=False` rather than by hiding the import, so the guard holds on a
+    machine that has PyYAML — which is every developer machine, and that is the problem.
+    """
+    from engine.skills.frontmatter import parse_frontmatter
+
+    document = scaffold(SkillTemplate(name="stdlib-readable", purpose="survives a bare interpreter"),
+                        criteria=["It parses"], checklist=["one item"])
+    front, _ = parse_frontmatter(document, prefer_pyyaml=False)
+    assert front["name"] == "stdlib-readable"
+    assert front["description"] == "survives a bare interpreter"
+    # The canonical shape: the indicator follows the key on the same line, as every library skill does.
+    assert "description: >-" in document
+    assert "\n  >-\n" not in document
+
+
 def test_authoring_requires_at_least_one_criterion(home, project):
     """A skill with no criteria cannot gate a node, so it would never be enforced."""
     with pytest.raises(AuthoringError, match="criteria"):
