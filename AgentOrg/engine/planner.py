@@ -905,9 +905,10 @@ class Planner:
             # The catalogue the validator resolves against is the *org's*, not the checkout's: the
             # pinned library plus the Owner's own skills — the same overlay the hire is validated
             # against and the executor loads through. Widening it is not a weakening: a name the
-            # overlay cannot resolve is still refused, by name. Leaving it library-only meant a node
-            # naming an authored skill was rejected by a validator that had never been told the skill
-            # existed, so a skill could be created, hired against, planned — and never run.
+            # overlay cannot resolve is still refused, by name. Library-only, it rejected a node
+            # naming an authored skill, which is the first of the *two* refusals such a node used to
+            # meet: this one, at plan time, and the runner's own validator — which resolves against
+            # its own directory and is answered by `engine.runner_view` — at run time.
             skills = dict(module._find_skill_names()) if hasattr(module, "_find_skill_names") else {}
             for name in self._skill_names():
                 skills.setdefault(name, f"<authored>/{name}")

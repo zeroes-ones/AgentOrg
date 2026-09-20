@@ -120,6 +120,20 @@ class OverlaySkillSource(SkillSource):
     def has(self, name: str) -> bool:
         return name in self._user_paths() or self.base.has(name)
 
+    def authored_dirs(self) -> dict[str, Path]:
+        """The Owner's skill *directories*, name -> directory, project-first.
+
+        The same mapping :meth:`_user_paths` builds, in the shape a caller that presents the
+        catalogue rather than loading from it needs: :mod:`engine.runner_view` links these into the
+        view the pinned runner validates against, so the runner's catalogue is *this* scan instead of
+        a second one that could order the roots differently and agree about nothing.
+
+        Directories, not ``SKILL.md`` paths, because a directory is what a symlink wants — and the
+        *unresolved* directory, so a user's own symlink is followed by the reader exactly as
+        :meth:`names` promises it will be.
+        """
+        return {name: path.parent for name, path in self._user_paths().items()}
+
     # ── loading ─────────────────────────────────────────────────────────────
 
     def _user_path(self, name: str) -> Path | None:

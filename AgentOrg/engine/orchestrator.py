@@ -417,7 +417,12 @@ class Orchestrator:
         self.workspace = workspace
         self.bus = bus
         self.workspace.ensure()
-        self.source = _skill_source(library, project=getattr(workspace, "root", None))
+        # The *project directory*, not the root that holds projects. `root` is a directory *of*
+        # projects (`projects/`, or the parent of an attached folder), so resolving the user skill
+        # roots against it looked for `projects/.agentorg/skills` or `/tmp/.agentorg/skills` and
+        # never found an attached project's own skills — the overlay then held nothing the project
+        # authored and the planner's validator, told the same catalogue, refused the node by name.
+        self.source = _skill_source(library, project=getattr(workspace, "path", None))
         self.diagnostics = diagnostics or Diagnostics(
             run_id="", state_dir=workspace.state_dir)
         self.registry: Registry = default_registry(dict(config.schemas or {}))
@@ -984,6 +989,11 @@ gated tier rather than the least"
 
         host = RunnerHost(
             config=self.config, library=self.library, workspace=run.workspace,
+            # The catalogue the run was planned against, so the runner is shown it instead of only
+            # the pinned library. Without it a node naming a skill the Owner authored is refused by
+            # the runner's own validator with "does not resolve under skills/" — the last wall between
+            # authoring a skill and executing it.
+            skills=self.source,
             on_event=self._host_event(run, on_event),
             on_stderr=lambda line: self._emit(EventType.AGENT_LOG, {
                 "run_id": run.run_id, "stream": "stderr", "text": line[:500]}),

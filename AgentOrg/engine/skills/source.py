@@ -9,6 +9,7 @@ came from, and so the MCP backend can be enabled without touching the prompt bui
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -20,8 +21,9 @@ __all__ = ["SkillSource"]
 class SkillSource(ABC):
     """Where skills come from.
 
-    Deliberately narrow: list the names, and fetch one bundle. A source that needs more is
-    doing work that belongs to the caller.
+    Deliberately narrow: list the names, fetch one bundle, and — for a source that holds the Owner's
+    own skills — say where those live. A source that needs more is doing work that belongs to the
+    caller.
     """
 
     @abstractmethod
@@ -56,3 +58,14 @@ class SkillSource(ABC):
         filesystem source overrides it with real content hashes.
         """
         return ""
+
+    def authored_dirs(self) -> dict[str, Path]:
+        """The Owner's own skills, name -> directory; empty for a source that has none.
+
+        Not abstract, and not part of loading. It answers "where do these names live", which the
+        engine needs in exactly one place — presenting the catalogue to the pinned runner, whose own
+        validator resolves skills relative to its own checkout (:mod:`engine.runner_view`). A source
+        that reads only the pinned library answers with nothing, which is what keeps that view opt-in
+        per project rather than a step every source has to implement.
+        """
+        return {}

@@ -13,7 +13,10 @@ runner's own output into the engine's event stream.
 DESIGN
 ------
 - **The runner is never modified.** It is invoked with `--executor` and `--guardrail` pointing at our
-  plugins, and its own output is read rather than replaced. Its stdout stays its own.
+  plugins, and its own output is read rather than replaced. Its stdout stays its own. When the
+  project holds skills the Owner authored, it is invoked from a composed view of the library instead
+  (`engine.runner_view`) — the catalogue is *presented* to the validator rather than the validator
+  being edited to accept it.
 - **A heartbeat proves liveness, not activity.** A runner that is thinking and a runner that is wedged
   look identical from outside, so the host watches the *state file's* mtime and the process's own
   liveness rather than guessing from silence.
@@ -61,6 +64,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable
+
+from .runner_view import ViewError, runner_view
 
 __all__ = ["HostError", "RunHandle", "RunOutcome", "RunnerHost", "RunnerState",
            "TERMINATION_ABORTED", "TERMINATION_DIED", "TERMINATION_SHUTDOWN",
@@ -407,12 +412,19 @@ class RunnerHost:
         The pinned library, for the runner's path.
     workspace:
         Where the run-state, the plugins and the artifacts live.
+    skills:
+        The skill source the run plans and loads through. Passed so the runner can be *shown* the
+        catalogue it holds — the pinned library plus the Owner's own roots — because the runner's own
+        validator resolves skills against its own checkout and would otherwise refuse a node naming a
+        skill the Owner authored. `None` means "no catalogue to present", and the runner is invoked
+        from the pinned library exactly as before.
     on_event:
         A callback invoked with each diagnostic line, so the orchestrator can put it on the bus. The
         host itself does not write to stdout: that belongs to the protocol.
     """
 
     def __init__(self, *, config: Any, library: Any, workspace: Any,
+                 skills: Any = None,
                  on_event: Callable[[str, dict[str, Any]], None] | None = None,
                  on_stderr: Callable[[str], None] | None = None,
                  python: str | None = None,
@@ -427,6 +439,7 @@ class RunnerHost:
             self.workspace = Path(workspace.path).resolve()
         else:
             self.workspace = Path(workspace).resolve()
+        self.skills = skills
         self.on_event = on_event
         self.on_stderr = on_stderr
         self.python = python or sys.executable
@@ -716,6 +729,32 @@ def classify(node_id, result, state):
 
     # ── running ─────────────────────────────────────────────────────────────
 
+    def _runner_and_root(self) -> tuple[Path, Path]:
+        """The runner to invoke, and the library root it will believe it lives in.
+
+        The runner validates every node's `skill:` against the `skills/` directory beside its own
+        `scripts/`, derived from its own `__file__` — so a node naming a skill the Owner authored was
+        refused by a process that had never been told the skill existed, and the refusal named the
+        library's directory as the place the skill was missing from. Presenting the view the engine
+        actually runs against is the fix: same runner, a path through a composed catalogue
+        (:mod:`engine.runner_view`). It is composed here rather than at startup because the catalogue
+        is per run — the workspace, and the skills in it, are what a run is aimed at.
+
+        The root is `dirname(dirname(runner))` rather than a field of the library handle, because
+        that is what the runner computes for *itself* from `__file__`. Deriving it from the path being
+        invoked is what makes the cwd handed to the subprocess and the root the subprocess believes it
+        lives in the same directory by construction, and it holds for a view exactly as for the
+        untouched library.
+        """
+        try:
+            view = runner_view(library=self.library, workspace=self.workspace, source=self.skills)
+        except ViewError as exc:
+            # A startup problem in the same sense a missing runner is: nothing has been executed and
+            # the run must not proceed on a catalogue the runner would refuse node by node.
+            raise HostError(str(exc)) from exc
+        runner = view.runner if view is not None else Path(self.library.files.runner)
+        return runner, runner.parent.parent
+
     def run(self, *, manifest_path: Path, run_id: str, workflow: str = "",
             project: str = "", extra_args: Iterable[str] = (),
             goal_active: bool = False) -> RunOutcome:
@@ -731,9 +770,9 @@ def classify(node_id, result, state):
             which are startup problems rather than run problems.
         """
         # Every path handed to the runner must be absolute, because the subprocess runs with its cwd
-        # set to the *library* root (it imports its own siblings from there). A relative manifest or
-        # state path therefore resolves against the wrong directory and the runner dies on startup
-        # with a FileNotFoundError before it can read a single node.
+        # set to the library root it is presented as. A relative manifest or state path therefore
+        # resolves against the wrong directory and the runner dies on startup with a FileNotFoundError
+        # before it can read a single node.
         manifest_path = Path(manifest_path).resolve()
         plugins = self.plugin_paths(manifest_path=manifest_path, run_id=run_id, workflow=workflow,
                                     project=project, goal_active=goal_active)
@@ -746,7 +785,7 @@ def classify(node_id, result, state):
                       else Path(self.workspace) / ".agent_state" / "runner_state.json")
         state_path = state_path.resolve()
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        runner = Path(self.library.files.runner)
+        runner, runner_root = self._runner_and_root()
         if not runner.is_file():
             raise HostError(f"the workflow runner is missing at {runner}")
 
@@ -769,8 +808,10 @@ def classify(node_id, result, state):
         try:
             process = subprocess.Popen(
                 args,
-                # The runner imports its own siblings, so it must run from the library root.
-                cwd=str(self.library.files.root),
+                # The root the runner is presented *as*: the library's own, or the composed view
+                # holding the Owner's skills too. Either way it is the directory `ROOT` resolves to,
+                # so a sibling import and a `ROOT`-relative read land in the same tree.
+                cwd=str(runner_root),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,

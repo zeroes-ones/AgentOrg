@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 
@@ -27,7 +28,7 @@ from engine.authoring import AuthoringError, SkillTemplate, scaffold, slugify, w
 from engine.config import load
 from engine.library import resolve
 from engine.people import HireError, HireRequest, People
-from engine.planner import Planner
+from engine.planner import Planner, emit_safe_yaml
 from engine.skills import FilesystemSkillSource
 from engine.skills.overlay import OverlaySkillSource
 
@@ -337,16 +338,14 @@ def _output_line(stdout: str, prefix: str) -> str:
 
 def test_the_runner_refuses_a_manifest_naming_a_new_skill_and_says_so(home, project, config,
                                                                      library):
-    """The one wall an authored skill still meets, pinned so it cannot pass unnoticed.
+    """A host that was never told the catalogue still refuses an authored name, and says why.
 
-    The engine's planner and validator now resolve a node's skill through the overlay — as the hire
-    and the executor already did — but the *runner* validates the manifest itself against the
-    library's names before executing anything, and there is no way to tell it about an authored one.
-    So a genuinely new name is planned and then refused at the run's first line. What must not happen
-    is that refusal arriving as a bare exit code: the runner's own line is the whole diagnosis.
+    This is the old behaviour, kept because it is still the behaviour of a host that was handed no
+    skill source: the composed view is opt-in, so nothing here widened by accident. What must not
+    happen is the refusal arriving as a bare exit code — the runner's own line is the whole diagnosis,
+    and here the engine's own planner is out of the picture entirely.
     """
     from engine.host import RunnerHost
-    from engine.planner import emit_safe_yaml
 
     write_skill(SkillTemplate(name="db-migrator"), criteria=["reversible"], checklist=["down"],
                 root=project / ".agentorg")
@@ -359,6 +358,252 @@ def test_the_runner_refuses_a_manifest_naming_a_new_skill_and_says_so(home, proj
         manifest_path=manifest, run_id="wall", workflow="wall", project="wall")
     assert outcome.broken, outcome.as_dict()
     assert "db-migrator" in outcome.error, outcome.as_dict()
+
+
+# ── the runner's own catalogue ───────────────────────────────────────────────
+#
+# The runner validates every node's `skill:` against the `skills/` directory beside its own
+# `scripts/`, so an authored name was refused by a process that had never been told the skill
+# existed. `engine.runner_view` composes the catalogue the engine actually uses — the pinned library
+# plus the Owner's roots — into a directory the runner can be invoked *from*, and these tests pin
+# both halves: that the wall is real against the library alone, and that the view moves it without
+# the library being touched or a name nobody wrote becoming acceptable.
+
+
+def _invoke_runner(runner: pathlib.Path, manifest: pathlib.Path,
+                   state: pathlib.Path) -> subprocess.CompletedProcess:
+    """Invoke the pinned runner the way the host does, with no executor and so no model call.
+
+    `--executor` is left off on purpose: the runner then answers each node with its own stub, which is
+    what keeps these tests about the manifest validation in front of execution rather than about a
+    provider. The cwd is the root the runner *path* presents, exactly as `host.py` sets it, because
+    that root is what `validate-workflows.py` scans for skills.
+    """
+    return subprocess.run(
+        [sys.executable, str(runner), "--manifest", str(manifest), "--state", str(state)],
+        cwd=str(runner.parent.parent), capture_output=True, text=True, timeout=300,
+    )
+
+
+def _runner_fixture(project: pathlib.Path, skill: str) -> tuple[pathlib.Path, pathlib.Path]:
+    """A one-file project holding a manifest whose first node names `skill`.
+
+    The manifest's *filename* has to equal its `name`, which the library's validator enforces, and
+    `_manifest_naming` names it `authored-node`.
+    """
+    workspace = project / "runner-view"
+    workspace.mkdir(parents=True, exist_ok=True)
+    manifest = workspace / "authored-node.yaml"
+    manifest.write_text(emit_safe_yaml(_manifest_naming(skill)), encoding="utf-8")
+    return workspace, manifest
+
+
+def _tree_fingerprint(root: pathlib.Path) -> dict[str, tuple[int, int]]:
+    """Every path under `root` with its size and mtime, so a run that rewrote it would show."""
+    return {
+        str(path.relative_to(root)): (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def test_the_pinned_runner_refuses_an_authored_name_from_the_library_alone(home, project, library):
+    """The wall, reproduced against the pinned runner with nothing about it patched.
+
+    Asserted rather than assumed: if a later library version resolved the Owner's skills by itself,
+    this test would fail and the composed view would be dead weight rather than the fix.
+    """
+    write_skill(SkillTemplate(name="db-migrator"), criteria=["reversible"], checklist=["down"],
+                root=project / ".agentorg")
+    workspace, manifest = _runner_fixture(project, "db-migrator")
+
+    result = _invoke_runner(library.files.runner, manifest, workspace / "state.json")
+    assert result.returncode == 1, result.stdout
+    assert "db-migrator" in result.stderr
+    assert "does not resolve under skills/" in result.stderr
+
+
+def test_the_composed_view_lets_that_same_manifest_run(home, project, library):
+    """The whole point: the same manifest, the same pinned runner, a catalogue it can resolve.
+
+    The graph's *second* node names `backend-developer`, a library skill, so this also fails if the
+    view lost the library — a view that resolved only the Owner's skills would move the wall rather
+    than remove it.
+    """
+    from engine import runner_view
+
+    write_skill(SkillTemplate(name="db-migrator"), criteria=["reversible"], checklist=["down"],
+                root=project / ".agentorg")
+    workspace, manifest = _runner_fixture(project, "db-migrator")
+
+    source = OverlaySkillSource(FilesystemSkillSource(library), project=project,
+                                include_global=False)
+    view = runner_view.runner_view(library=library, workspace=workspace, source=source)
+    assert view is not None
+    assert view.runner.is_file(), view.runner
+
+    result = _invoke_runner(view.runner, manifest, workspace / "state.json")
+    assert result.returncode == 0, result.stderr
+    summary = json.loads(result.stdout)
+    assert summary["outcome"] == "complete", summary
+    assert set(summary["nodes"]) == {"work", "fix"}, summary["nodes"]
+
+
+def test_the_composed_view_still_refuses_a_skill_nobody_wrote(home, project, library):
+    """A view is a catalogue, not a licence: the wall must move for authored names, not for invented ones.
+
+    The words are the library's own, because the refusal is still the library's — nothing about the
+    check was weakened, only the catalogue it checks against.
+    """
+    from engine import runner_view
+
+    write_skill(SkillTemplate(name="db-migrator"), criteria=["reversible"], checklist=["down"],
+                root=project / ".agentorg")
+    workspace, _ = _runner_fixture(project, "db-migrator")
+    manifest = workspace / "authored-node.yaml"
+    manifest.write_text(emit_safe_yaml(_manifest_naming("no-such-skill")), encoding="utf-8")
+
+    source = OverlaySkillSource(FilesystemSkillSource(library), project=project,
+                                include_global=False)
+    view = runner_view.runner_view(library=library, workspace=workspace, source=source)
+    assert view is not None
+
+    result = _invoke_runner(view.runner, manifest, workspace / "state.json")
+    assert result.returncode == 1, result.stdout
+    assert "no-such-skill" in result.stderr
+    assert "does not resolve under skills/" in result.stderr
+
+
+def test_composing_the_view_leaves_the_library_untouched(home, project, library):
+    """Nothing under the pinned library may be created, moved or rewritten by a run.
+
+    The pin is a content manifest of that tree, so a run that wrote into the library — even to add a
+    skill it had every right to add — would break the guarantee that makes the library a dependency
+    rather than a scratch directory. The view is a directory of symlinks in the workspace for exactly
+    this reason.
+    """
+    from engine import runner_view
+
+    write_skill(SkillTemplate(name="db-migrator"), criteria=["reversible"], checklist=["down"],
+                root=project / ".agentorg")
+    workspace, _ = _runner_fixture(project, "db-migrator")
+
+    before = {name: _tree_fingerprint(library.files.root / name)
+              for name in ("skills", "scripts")}
+    source = OverlaySkillSource(FilesystemSkillSource(library), project=project,
+                                include_global=False)
+    view = runner_view.runner_view(library=library, workspace=workspace, source=source)
+    assert view is not None
+
+    after = {name: _tree_fingerprint(library.files.root / name) for name in ("skills", "scripts")}
+    assert after == before
+    # And the view itself is not inside the library: a directory under it would have been a link
+    # *into* the library, which the fingerprint above already refuses, but nothing should point back.
+    assert library.files.root.resolve() not in view.root.resolve().parents
+
+
+def test_the_view_is_not_composed_when_the_project_authored_nothing(home, project, library):
+    """A library-only org keeps the plain invocation, and nothing is written for it.
+
+    This is what makes the view safe to have: with no authored skills there is nothing a catalogue
+    could add, so the host asks for the runner exactly where it has always asked for it.
+    """
+    from engine import runner_view
+
+    workspace = project / "runner-view"
+    workspace.mkdir(parents=True)
+    source = OverlaySkillSource(FilesystemSkillSource(library), project=project,
+                                include_global=False)
+    assert runner_view.runner_view(library=library, workspace=workspace, source=source) is None
+    # A source that has no notion of authored skills at all answers the same way.
+    assert runner_view.runner_view(library=library, workspace=workspace,
+                                   source=FilesystemSkillSource(library)) is None
+    assert not (workspace / ".agent_state" / "runner-view").exists()
+
+
+def test_the_view_prunes_a_skill_the_owner_deleted(home, project, library):
+    """A name that outlives its skill is worse than a missing one.
+
+    It resolves in the runner and then fails at bind in the process that loads the skill — a failure
+    that describes nothing. Pruning is what turns that back into a refusal by name.
+    """
+    from engine import runner_view
+
+    for name in ("db-migrator", "kept-writer"):
+        write_skill(SkillTemplate(name=name), criteria=["reversible"], checklist=["down"],
+                    root=project / ".agentorg")
+    workspace, _ = _runner_fixture(project, "db-migrator")
+
+    def compose():
+        source = OverlaySkillSource(FilesystemSkillSource(library), project=project,
+                                    include_global=False)
+        return runner_view.runner_view(library=library, workspace=workspace, source=source)
+
+    view = compose()
+    assert view is not None
+    authored = view.root / "skills" / runner_view.AUTHORED_DIRNAME
+    assert (authored / "db-migrator" / "SKILL.md").is_file()
+    assert (authored / "kept-writer" / "SKILL.md").is_file()
+
+    shutil.rmtree(project / ".agentorg" / "skills" / "db-migrator")
+    view = compose()
+    assert view is not None
+    assert not (authored / "db-migrator").exists()
+    assert (authored / "kept-writer" / "SKILL.md").is_file()
+
+
+def test_the_host_shows_the_runner_the_catalogue_it_was_given(home, project, config, library):
+    """The wiring, asserted on its own, because a fix that is never handed to the host is inert.
+
+    Two facts, both of them the contract: a host given a source with authored skills runs the
+    composed view's runner from the view's root, and a host given nothing runs the pinned library's
+    runner from the pinned library.
+    """
+    from engine import runner_view
+    from engine.host import RunnerHost
+
+    write_skill(SkillTemplate(name="db-migrator"), criteria=["reversible"], checklist=["down"],
+                root=project / ".agentorg")
+    source = OverlaySkillSource(FilesystemSkillSource(library), project=project,
+                                include_global=False)
+
+    shown = RunnerHost(config=config, library=library, workspace=project, skills=source)
+    runner, root = shown._runner_and_root()
+    # Resolved, because both sides resolve: `Workspace.attach` and the host hand over real paths, and
+    # on macOS a temp directory's own path is a symlink target (`/var` vs `/private/var`).
+    assert root == (project / ".agent_state" / runner_view.VIEW_DIRNAME).resolve()
+    assert runner == root / "scripts" / "workflow-runner.py"
+    assert runner.is_file()
+
+    plain = RunnerHost(config=config, library=library, workspace=project)
+    plain_runner, plain_root = plain._runner_and_root()
+    assert plain_runner == pathlib.Path(library.files.runner)
+    # The root is derived from the path, and for the pinned layout that is the library's own root —
+    # which is what the runner's `ROOT` resolves to when nothing is composed.
+    assert plain_root == pathlib.Path(library.files.runner).parent.parent
+
+
+def test_the_orchestrator_resolves_skills_against_the_project_it_attached(home, project, config,
+                                                                         library):
+    """A project's own skills must be found through `--project`, not through its *parent*.
+
+    The overlay was given the workspace's `root` — the directory projects live in, which for an
+    attached folder is its parent — so the project's own skills directory was never searched. The
+    engine then planned and hired against a catalogue that was missing exactly the skills the Owner
+    had just authored, and refused the node by name. The roster resolver has always read the folder
+    itself (`usercfg.project_root`), so anything that reads it from the parent disagrees with it.
+    """
+    from engine.orchestrator import Orchestrator
+    from engine.state import Workspace
+
+    write_skill(SkillTemplate(name="db-migrator"), criteria=["reversible"], checklist=["down"],
+                root=project / ".agentorg")
+    orch = Orchestrator(config=config, library=library, workspace=Workspace.attach(project))
+
+    assert orch.source.roots()[0] == (project / ".agentorg" / "skills").resolve()
+    assert "db-migrator" in orch.source.names()
+    # And the planner's validator — which is handed the same catalogue — accepts the node it refused.
+    assert orch.planner.validate(_manifest_naming("db-migrator")).valid
+
 
 
 # ── hiring ───────────────────────────────────────────────────────────────────
