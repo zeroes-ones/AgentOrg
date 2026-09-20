@@ -131,14 +131,16 @@ struct AgentOrgApp: App {
     /// ⌘R started a run with **no goal at all** while the visible Start button used the field's text —
     /// two controls, one shortcut, two behaviours — and that class of divergence is what the shared
     /// call sites below exist to prevent.
-    @ViewBuilder
+    // `@CommandsBuilder`, not `@ViewBuilder`. This property yields `Commands`, and `ViewBuilder`
+    // requires `View` — so with the wrong builder every element in the body was checked against the
+    // `View` requirement, and the first one was rejected with a message that named the element rather
+    // than the real cause: "static method 'buildExpression' requires that 'CommandGroup<EmptyView>'
+    // conform to 'View'". Swift 6.4 resolves the ambiguity; Swift 6.3.3, which the CI runner has,
+    // does not — so the app built locally and failed on the runner. Found by CI.
+    @CommandsBuilder
     private var commands: some Commands {
-        // `EmptyView()` is written out rather than leaving the closure empty. An empty body makes the
-        // content type an *inferred* `EmptyView`, and Swift 6.3.3 then fails to resolve the
-        // `CommandsBuilder` overload: "static method 'buildExpression' requires that
-        // 'CommandGroup<EmptyView>' conform to 'View'". Swift 6.4 accepts the empty form, so this only
-        // shows up on the older toolchain — CI runs 6.3.3 and caught it, which is the whole reason the
-        // Swift job exists. Naming the type removes the inference and compiles on both.
+        // `EmptyView()` is written out rather than leaving the closure empty: an empty body infers the
+        // content type, and naming it removes a second inference from the same expression.
         CommandGroup(replacing: .newItem) { EmptyView() }
         CommandGroup(after: .newItem) {
             Button("Open Project…") {
