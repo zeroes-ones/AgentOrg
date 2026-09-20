@@ -49,15 +49,54 @@ with tempfile.TemporaryDirectory() as td:
              'route_class':'R-CONTRACT','autonomy':'auto','decided_by':'org','chosen':'ag_9c1d',
              'proposed':False,'candidates':[{'agent_id':'ag_9c1d','score':0.81}]})
     bus.emit(EventType.HANDOFF_VERIFIED, payload={'from':'developer','to':'reviewer','sha':'b'*16})
+    # The typed handoff lifecycle, in the shape `executor._emit_handoff` actually writes it: the four
+    # keys the flow board keys on (`handoff_id`, `from_node`, `to_node`, `summary`) plus the state.
+    # Recorded because the Swift side's `handoff.*` summary reads these names, and a hand-written
+    # fixture would not catch a rename on the Python side.
+    bus.emit(EventType.HANDOFF_PROPOSED, node_id='developer',
+             payload={'handoff_id':'ho_4f21ac','from_node':'developer','to_node':'reviewer',
+                      'from_agent':'Alice','to_agent':'Ravi','state':'PROPOSED','status':'done',
+                      'summary':'cursor pagination implemented','artifacts':['src/app.py']})
+    bus.emit(EventType.HANDOFF_ACCEPTED, node_id='developer',
+             payload={'handoff_id':'ho_4f21ac','from_node':'developer','to_node':'reviewer',
+                      'from_agent':'Alice','to_agent':'Ravi','state':'ACCEPTED','status':'done',
+                      'summary':'cursor pagination implemented','artifacts':['src/app.py']})
+    bus.emit(EventType.HANDOFF_FULFILLED, node_id='developer',
+             payload={'handoff_id':'ho_4f21ac','from_node':'developer','to_node':'reviewer',
+                      'from_agent':'Alice','to_agent':'Ravi','state':'FULFILLED','status':'done',
+                      'summary':'cursor pagination implemented','artifacts':['src/app.py']})
+    bus.emit(EventType.HANDOFF_REJECTED, node_id='developer',
+             payload={'handoff_id':'ho_9c02be','from_node':'developer','to_node':'qa',
+                      'from_agent':'Alice','to_agent':'','state':'REJECTED','status':'needs_review',
+                      'summary':'handoff propose refused: R6: 4 open questions exceeds the ceiling of 3',
+                      'artifacts':[]})
+    bus.emit(EventType.HANDOFF_BREACHED, node_id='reviewer',
+             payload={'handoff_id':'ho_11dd07','from_node':'reviewer','to_node':'human-gate',
+                      'from_agent':'Ravi','to_agent':'','state':'BREACHED','status':'blocked',
+                      'summary':'reviewer handed on a blocked payload','artifacts':[]})
     bus.emit(EventType.AGENT_SPAWN_REQUESTED, payload={'tier':'T2','reason':'durable capability gap',
              'requisition':{'kind':'specialist','skill':'devops-engineer','expected_outcome':'unblock'}})
     bus.emit(EventType.GUARDRAIL_ON_EDGE if False else EventType.AGENT_SLO_BREACH,
              agent_id='ag_7f3a', payload={'objective':'agent_success','attainment':0.62,'severity':'warning'})
     bus.emit(EventType.COST_RECONCILED, payload={'estimated_tokens':4200,'actual_tokens':4100,'error_pct':2.4})
+    # The gate the Owner must answer: the engine emits `waiting_on: owner` with its own reason when it
+    # *refuses* to pass one, which is the field the console's auto-approve rule reads.
     bus.emit(EventType.HUMAN_GATE, node_id='release',
              payload={'gate_id':'release','kind':'human','reason':'Owner release approval',
-                      'requires':['change'],'present':['change'],'missing':[]})
-    bus.emit(EventType.HUMAN_DECISION, payload={'gate_id':'release','approved':True,'note':'ship it'})
+                      'requires':['change'],'present':['change'],'missing':[],
+                      'waiting_on':'owner',
+                      'why':'a terminal gate is only passable by the Owner'})
+    # The gate the engine answered itself, recorded as the goal's decision. The Swift side must tell
+    # this from a person's decision, which is what the `by` field is for.
+    bus.emit(EventType.HUMAN_DECISION, payload={'gate_id':'reroute-gate','approved':True,
+                                                'note':'auto-approved by the goal policy',
+                                                'kind':'agent','by':'goal'})
+    bus.emit(EventType.POLICY_CHANGED, payload={'run_id':'run_fixture',
+                                                'gate_id':'reroute-gate','approved':True,
+                                                'by':'goal','kind':'agent',
+                                                'why':'the goal authorises the org to decide this gate'})
+    bus.emit(EventType.HUMAN_DECISION, payload={'gate_id':'release','approved':True,'note':'ship it',
+                                                'kind':'human','by':'owner'})
     # The goal and subagent lifecycle, so the Swift side's summaries and decoding are exercised by the
     # same real frames the engine emits — a hand-written fixture would not catch a renamed field.
     bus.emit(EventType.GOAL_ARMED, payload={'objective':'add cursor pagination','by':'cli',

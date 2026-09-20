@@ -72,6 +72,47 @@ final class ProtocolContractTests: XCTestCase {
                       "the engine emitted types this build does not know: \(unknown.sorted())")
     }
 
+    func testEveryEventTypeTheEngineDeclaresIsKnownToThisBuild() throws {
+        // The fixture is a *sample*, so the test above can only catch a type the recorder happened to
+        // emit. This reads the engine's own `EventType` source and compares the whole list, which is
+        // the only arrangement that catches "the engine added a type and nothing recorded it yet".
+        // Skipped rather than failed when the engine is not beside the app: this package is
+        // `macos/` inside a repository that contains it, but it is still a separate artifact.
+        let here = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // AgentOrgKitTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // macos
+            .deletingLastPathComponent()   // AgentOrg
+            .appendingPathComponent("engine/protocol.py")
+        guard let source = try? String(contentsOf: here, encoding: .utf8) else {
+            throw XCTSkip("engine/protocol.py is not available from this checkout")
+        }
+        let declared = Self.eventTypeLiterals(in: source)
+        XCTAssertGreaterThan(declared.count, 50, "the EventType block should be substantial")
+        let unknown = declared.filter { !EventType.isKnown($0) }.sorted()
+        XCTAssertTrue(unknown.isEmpty,
+                      "engine/protocol.py declares types this build does not know: \(unknown)")
+    }
+
+    /// The string literals assigned inside `class EventType`.
+    ///
+    /// A deliberately small parse rather than importing Python: what is being checked is a *list of
+    /// names*, and the shape of the block is stable enough that a regex is honest about what it does.
+    /// Only `= "…"` assignments inside the class body are collected, so a docstring or a later class
+    /// cannot contribute a false positive.
+    static func eventTypeLiterals(in source: String) -> [String] {
+        guard let start = source.range(of: "class EventType"),
+              let end = source.range(of: "\nclass ", range: start.upperBound..<source.endIndex)
+        else { return [] }
+        let block = String(source[start.lowerBound..<end.lowerBound])
+        guard let pattern = try? NSRegularExpression(
+            pattern: "=\\s*\"([a-z][a-z0-9_.]*)\"") else { return [] }
+        let full = NSRange(block.startIndex..<block.endIndex, in: block)
+        return pattern.matches(in: block, range: full).compactMap { match in
+            Range(match.range(at: 1), in: block).map { String(block[$0]) }
+        }
+    }
+
     func testEveryEventCarriesAProtocolVersion() throws {
         for event in try fixtureEvents() {
             XCTAssertEqual(event.v, Protocol.version,
@@ -99,6 +140,71 @@ final class ProtocolContractTests: XCTestCase {
         XCTAssertEqual(gate.payload["requires"]?.arrayValue?.count, 1)
         XCTAssertEqual(gate.payload["present"]?.arrayValue?.count, 1)
         XCTAssertEqual(gate.payload["missing"]?.arrayValue?.count, 0)
+        // The engine's own verdict on who may answer. `waiting_on: owner` is its *refusal* — the field
+        // the console's auto-approve rule reads instead of re-deriving the policy, and `why` is the
+        // sentence a person is shown.
+        XCTAssertEqual(gate.payload["waiting_on"]?.stringValue, "owner")
+        XCTAssertNotNil(gate.payload["why"]?.stringValue)
+    }
+
+    // MARK: - The goal's own decisions
+
+    func testAGoalDecisionCarriesWhoDecided() throws {
+        // `by: goal` and `by: owner` are different facts about a run, and the console tells them apart
+        // to know whether a gate was decided for it or by it. The fixture records both, so a rename
+        // fails here rather than making the app silently treat a person's decision as the goal's.
+        let decisions = try fixtureEvents().filter { $0.type == "human.decision" }
+        let byGoal = try XCTUnwrap(decisions.first { $0.payload["by"]?.stringValue == "goal" })
+        XCTAssertEqual(byGoal.payload["gate_id"]?.stringValue, "reroute-gate")
+        XCTAssertEqual(byGoal.payload["approved"]?.boolValue, true)
+        XCTAssertEqual(byGoal.payload["kind"]?.stringValue, "agent")
+
+        let byOwner = try XCTUnwrap(decisions.first { $0.payload["by"]?.stringValue == "owner" })
+        XCTAssertEqual(byOwner.payload["gate_id"]?.stringValue, "release")
+    }
+
+    func testAGoalGateReleaseCarriesItsReason() throws {
+        // `policy.changed` with `by: goal` is how the engine reports that it answered a gate itself.
+        // The console reads this rather than re-deriving whether a gate was answerable.
+        let change = try XCTUnwrap(try fixtureEvents().first {
+            $0.type == "policy.changed" && $0.payload["by"]?.stringValue == "goal"
+        })
+        XCTAssertEqual(change.payload["gate_id"]?.stringValue, "reroute-gate")
+        XCTAssertEqual(change.payload["approved"]?.boolValue, true)
+        XCTAssertNotNil(change.payload["why"]?.stringValue)
+    }
+
+    // MARK: - The typed handoff
+
+    func testTheTypedHandoffCarriesItsEdgeAndSummary() throws {
+        // These four keys are what `flow._handoffs` keys and labels a row on, and what the offline
+        // handoffs browser reads. A rename on either side would show an edge that moved information as
+        // nothing at all, so they are asserted against the engine's own recorded frames.
+        for type in ["handoff.proposed", "handoff.accepted", "handoff.fulfilled"] {
+            let event = try firstEvent(type)
+            XCTAssertEqual(event.payload["handoff_id"]?.stringValue, "ho_4f21ac")
+            XCTAssertEqual(event.payload["from_node"]?.stringValue, "developer")
+            XCTAssertEqual(event.payload["to_node"]?.stringValue, "reviewer")
+            XCTAssertNotNil(event.payload["summary"]?.stringValue)
+            XCTAssertNotNil(event.payload["state"]?.stringValue)
+        }
+    }
+
+    func testARefusedHandoffNamesTheRuleThatFired() throws {
+        // A refusal that did not name its rule would be unactionable: "the contract refused this" is
+        // not something an agent or an operator can fix. The rule id travels in the summary.
+        let rejected = try firstEvent("handoff.rejected")
+        let summary = try XCTUnwrap(rejected.payload["summary"]?.stringValue)
+        XCTAssertTrue(summary.contains("R6"), summary)
+        XCTAssertEqual(rejected.payload["state"]?.stringValue, "REJECTED")
+    }
+
+    func testABreachedHandoffIsRecordedDistinctlyFromARejection() throws {
+        // Two different failures — a payload that failed a rule versus a contract that was never
+        // honoured — and the browser flags both while naming which.
+        let breached = try firstEvent("handoff.breached")
+        XCTAssertEqual(breached.payload["state"]?.stringValue, "BREACHED")
+        XCTAssertEqual(breached.payload["handoff_id"]?.stringValue, "ho_11dd07")
     }
 
     func testTheReviewRejectionCarriesFindingsWithFileAndLine() throws {
@@ -182,6 +288,25 @@ final class ProtocolContractTests: XCTestCase {
         let end = try XCTUnwrap(try fixtureEvents().first { $0.type == "run.end" })
         XCTAssertEqual(end.payload["outcome"]?.stringValue, "complete")
         XCTAssertEqual(end.payload["iterations"]?["review-fix-loop"]?.intValue, 2)
+    }
+
+    func testTheEventTypeParserItselfFindsLiterals() {
+        // Without this, a regex that silently matched nothing would make the coverage assertion above
+        // pass vacuously — an empty list has no unknown entries. So the parser is tested on a known
+        // input first, which is what makes the assertion above mean something.
+        let source = """
+        class EventType(str, Enum):
+            RUN_START = "run.start"
+            HUMAN_GATE = "human.gate"
+            NOT_A_NAME = 3
+            # a comment with "quotes" in it
+
+        class CommandType(str, Enum):
+            START = "start"
+        """
+        let found = Self.eventTypeLiterals(in: source)
+        XCTAssertEqual(found, ["run.start", "human.gate"],
+                       "the parser must find the class's own literals and stop at the next class")
     }
 
     // MARK: - Rendering

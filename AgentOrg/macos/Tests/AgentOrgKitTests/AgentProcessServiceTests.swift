@@ -245,6 +245,29 @@ final class AgentProcessServiceTests: XCTestCase {
         XCTAssertEqual(service2.state, .running)
     }
 
+    func testReadinessArrivesWhileStderrIsStillWriting() throws {
+        // The bug this pins: both pipe handlers ran on ONE serial queue, so the stderr handler's
+        // blocking `availableData` held the queue the stdout handler needed, and `engine.ready` sat
+        // unread forever. The app stayed on "launching the engine…" while the engine was alive and
+        // healthy — found by sampling the live process and seeing the stderr read parked at
+        // `AgentProcessService.swift` in `read()`.
+        //
+        // The child therefore writes a steady stream to **stderr** and only then emits readiness on
+        // stdout, which is the real engine's shape: it logs provider warnings to stderr before it
+        // announces itself. On the shared queue this could not pass.
+        let ready = expectation(description: "ready despite stderr traffic")
+        let service = try launchService(
+            "i=0; while [ $i -lt 40 ]; do echo \"provider skipped: deepseek has no API key\" >&2; "
+            + "i=$((i+1)); done; "
+            + "echo '{\"v\":1,\"seq\":1,\"type\":\"engine.ready\",\"payload\":{\"providers\":[]}}'; "
+            + "while true; do echo \"still busy\" >&2; sleep 0.2; done")
+        defer { service.terminate() }
+        service.onStateChange = { state in if state == .running { ready.fulfill() } }
+        wait(for: [ready], timeout: 8)
+        XCTAssertTrue(service.isReady, "readiness must survive concurrent stderr output")
+        XCTAssertEqual(service.state, .running)
+    }
+
     func testAFatalErrorFrameIsReportedAsTheFailureReason() throws {
         // The engine writes its fatal reason to stdout as a typed frame precisely so the app can read
         // it before the exit — otherwise all the app knew was "exited with status 1".

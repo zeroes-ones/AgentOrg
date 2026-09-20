@@ -2,21 +2,19 @@
 //  Chrome.swift
 //  AgentOrg
 //
-//  The app-level chrome: the Settings scene, the menu-bar item, and the shared terminal toggle.
+//  The app-level chrome: the menu-bar item, and the shared terminal toggle.
 //
-//  WHY THESE ARE HERE AND NOT IN A PANEL
-//  -------------------------------------
-//  A panel answers a question about the *run*. These three answer questions about the *app* — where its
-//  engine and project are, what it is doing while the window is closed, and whether the terminal is
-//  showing. Keeping them separate is what lets the panels stay about the work.
+//  WHY THESE ARE HERE AND NOT IN A DESTINATION
+//  ------------------------------------------
+//  A destination answers a question about the *run*. These answer questions about the *app* — what it
+//  is doing while the window is closed, and whether the terminal is showing. Keeping them separate is
+//  what lets the destinations stay about the work.
 //
-//  The two skills that shaped this file:
-//
-//  - `swiftui-appkit-selection-guide.md`: "A `Settings` scene in 20 lines vs 200" — so Preferences is a
-//    `Form` in a `Settings` scene rather than a hand-built window. macOS then supplies the app-menu
-//    entry and the ⌘, shortcut for free, which is exactly the HIG expectation.
-//  - `macos-menu-bar-apps.md`: a resident app needs a `MenuBarExtra` with `.menuBarExtraStyle(.window)`
-//    and an explicit Quit, because with the last window closed there is otherwise no way out.
+//  The `Settings` scene is gone on purpose. It held two tabs that duplicated what is now Setup — the
+//  interpreter, the credentials path, the launch buttons, the project folder — and the audit found that
+//  duplication by reading both. Having one place to configure the app is worth more than matching the
+//  convention of a Preferences window, and ⌘, now opens the Setup destination instead, which is where
+//  every one of those controls actually lives.
 
 import SwiftUI
 import AppKit
@@ -41,10 +39,12 @@ final class TerminalVisibility: ObservableObject {
     private static let key = "console.terminalVisible"
 
     private init() {
-        // Default to showing it: a run is the thing being watched, and an empty terminal is a useful
-        // prompt rather than noise. A stored value wins once the user has expressed a preference.
+        // Default to hiding it: the terminal is a power-user view of a run, and the destinations were
+        // redesigned so that everything a person needs — the gate, the next action, the goal — is on
+        // the spine without it. Showing it by default put a wall of engine chatter beside a person who
+        // had just been told the app was confusing. A stored value wins once they express a preference.
         if UserDefaults.standard.object(forKey: Self.key) == nil {
-            isVisible = true
+            isVisible = false
         } else {
             isVisible = UserDefaults.standard.bool(forKey: Self.key)
         }
@@ -53,153 +53,72 @@ final class TerminalVisibility: ObservableObject {
     func toggle() { isVisible.toggle() }
 }
 
-// MARK: - Settings
-
-/// Preferences: where the engine, the project and the skills live.
-///
-/// A `Form` with `Section`s, which is the idiomatic macOS settings shape — system spacing, aligned
-/// labels, and the right control widths without any manual layout.
-struct SettingsView: View {
-    @ObservedObject var controller: OrgController
-
-    var body: some View {
-        TabView {
-            engineTab
-                .tabItem { Label("Engine", systemImage: "gearshape.2") }
-            projectTab
-                .tabItem { Label("Project", systemImage: "folder") }
-        }
-        .frame(width: 620, height: 380)
-        .padding(.top, 8)
-    }
-
-    private var engineTab: some View {
-        Form {
-            Section("Interpreter") {
-                LabeledContent("Runtime", value: controller.runtimeDescription)
-                LabeledContent("Status", value: controller.engineState.rawValue.capitalized)
-                if let error = controller.engineError {
-                    Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                        .textSelection(.enabled)
-                }
-            }
-
-            Section("Credentials") {
-                LabeledContent("File") {
-                    Text(controller.credentialsPath)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .foregroundStyle(.secondary)
-                }
-                Text("Keys live in this 0600 file. Add or test a provider in the Providers tab; a key is "
-                     + "never sent back to this window.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-
-            Section {
-                HStack {
-                    Button("Launch engine") { controller.launch() }
-                        .disabled(!controller.canLaunch || controller.engineState.isLive)
-                    Button("Stop") { controller.stop() }
-                        .disabled(!controller.engineState.isLive)
-                    Spacer()
-                    Button("Refresh") { Task { await controller.refresh() } }
-                        .disabled(controller.engineState != .running)
-                }
-            }
-        }
-        .formStyle(.grouped)
-    }
-
-    private var projectTab: some View {
-        Form {
-            Section("Attached project") {
-                LabeledContent("Folder") {
-                    Text(controller.projectPath)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                }
-                if controller.workspace["attached"]?.boolValue == true {
-                    Label("The agents work in your own folder. Engine state is kept in "
-                          + ".agent_state/ inside it.", systemImage: "checkmark.seal.fill")
-                        .font(.caption).foregroundStyle(.green)
-                } else {
-                    Label("A managed project the engine owns, under AgentOrg/projects/.",
-                          systemImage: "shippingbox")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                HStack {
-                    Button("Choose folder…") { openProjectPicker(controller: controller) }
-                        .disabled(!controller.canLaunch)
-                    Button("Use a managed project") {
-                        Task { await controller.detachProject() }
-                    }
-                    .disabled(controller.workspace["attached"]?.boolValue != true)
-                }
-            }
-
-            Section("Skills library") {
-                LabeledContent("Root") {
-                    Text(controller.libraryPath)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .foregroundStyle(.secondary)
-                }
-                LabeledContent("Skills available", value: "\(controller.skills.count)")
-            }
-        }
-        .formStyle(.grouped)
-    }
-}
-
 // MARK: - The menu-bar item
 
 /// What the menu bar shows: the state, the one next action, and Quit.
 ///
-/// Deliberately short. A menu-bar item is a glance, not a second console — the reference is explicit
-/// that the panel is for reachability (`Show Console`), and everything longer belongs in the window.
+/// Deliberately short. A menu-bar item is a glance, not a second console — everything longer belongs in
+/// the window. The one thing it *must* do is carry the gate, because a menu-bar app with the window
+/// closed has no other way to tell a person that a run is parked waiting for them.
 struct MenuBarPanel: View {
     @ObservedObject var controller: OrgController
     @ObservedObject private var terminal = TerminalVisibility.shared
 
+    private var spine: SpineModel { controller.spine }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                Circle().fill(stateColour).frame(width: 9, height: 9)
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 1) {
-                    // Spelled out as well as coloured: a status that exists only as a hue is unreadable
-                    // to some people, and this is the surface most likely to be glanced at.
-                    Text(stateWord).font(.headline)
-                    Text(controller.workspace["name"]?.stringValue ?? controller.projectPath)
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
+                Label(spine.stateWord, systemImage: spine.stateTone.symbol)
+                    .font(.headline)
+                    .foregroundStyle(spine.stateTone.colour)
                 Spacer()
             }
             .accessibilityElement(children: .combine)
-            .accessibilityLabel("AgentOrg: \(stateWord)")
+            .accessibilityLabel("AgentOrg: \(spine.stateWord)")
 
-            if controller.goal["live"]?.boolValue == true || !goalObjective.isEmpty {
+            Text(spine.projectName)
+                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+
+            if let objective = spine.goalObjective {
                 Divider()
-                Label(goalObjective.isEmpty ? "No goal" : goalObjective,
-                      systemImage: "target")
+                Label(objective, systemImage: "target")
                     .font(.caption).lineLimit(2)
-                    .foregroundStyle(controller.goal["live"]?.boolValue == true ? .green : .secondary)
+                    .foregroundStyle(spine.goalTone == .ok ? .primary : spine.goalTone.colour)
             }
 
-            if let gate = controller.pendingGate {
-                Label(gate["reason"]?.stringValue ?? "Waiting on you",
-                      systemImage: "hand.raised.fill")
-                    .font(.caption).foregroundStyle(.orange).lineLimit(2)
+            // The gate, with its decision controls where the engine says they belong. This is the one
+            // panel that matters while the window is shut.
+            if let gate = spine.gate {
+                Divider()
+                Label(gate.reason, systemImage: gate.canAct ? "hand.raised.fill" : "hourglass")
+                    .font(.caption).foregroundStyle(gate.canAct ? .orange : .secondary).lineLimit(2)
+                if gate.canAct {
+                    HStack(spacing: 6) {
+                        Button("Approve") { Task { await controller.approve() } }
+                            .accessibilityLabel("Approve this gate")
+                        Button("Reject") { Task { await controller.reject() } }
+                            .accessibilityLabel("Reject this gate")
+                    }
+                } else {
+                    Text(gate.why).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                }
+            }
+
+            if let next = spine.next, spine.gate == nil {
+                Divider()
+                Label(next.label, systemImage: "arrow.forward.circle")
+                    .font(.caption).lineLimit(2)
+                    .foregroundStyle(.secondary)
             }
 
             Divider()
 
+            // One launch/stop control, named for what it does — the same one the spine carries.
             if controller.engineState.isLive {
                 Button("Stop the engine") { controller.stop() }
             } else {
-                Button("Launch the engine") { controller.launch() }
+                Button("Start the engine") { controller.launch() }
                     .disabled(!controller.canLaunch)
             }
             Button("Show Console") { ConsoleWindow.show() }
@@ -210,29 +129,6 @@ struct MenuBarPanel: View {
                 .keyboardShortcut("q")
         }
         .padding(12)
-        .frame(width: 300)
-    }
-
-    private var goalObjective: String {
-        controller.goal["objective"]?.stringValue ?? ""
-    }
-
-    private var stateWord: String {
-        if controller.goal["live"]?.boolValue == true { return "Goal running" }
-        switch controller.engineState {
-        case .running: return "Engine running"
-        case .failed: return "Engine failed"
-        case .launching, .pausing, .terminating: return "Working…"
-        default: return "Idle"
-        }
-    }
-
-    private var stateColour: Color {
-        if controller.goal["live"]?.boolValue == true { return .green }
-        switch controller.engineState {
-        case .running: return .green
-        case .failed: return .red
-        default: return .secondary
-        }
+        .frame(width: 320)
     }
 }

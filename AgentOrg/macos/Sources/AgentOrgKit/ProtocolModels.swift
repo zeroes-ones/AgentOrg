@@ -90,10 +90,22 @@ public struct EngineEvent: Codable, Sendable, Identifiable, Equatable {
             return "checklist: \(items) item(s) reported"
         case "review.rejected": return "review rejected: \(payload["summary"]?.stringValue ?? "")"
         case "review.approved": return "review approved"
-        case "human.gate": return "waiting on you: \(payload["reason"]?.stringValue ?? "")"
+        case "human.gate":
+            // The engine's own verdict travels as `waiting_on`. When it is `owner` the engine has
+            // *declined* to answer the gate, so the terminal says who is being waited on rather than
+            // implying the run is simply slow.
+            let waiting = payload["waiting_on"]?.stringValue ?? ""
+            let reason = payload["reason"]?.stringValue ?? ""
+            return waiting == "owner"
+                ? "waiting on you: \(reason)"
+                : "gate reached: \(reason)"
         case "human.decision":
             let approved = payload["approved"]?.boolValue ?? false
-            return "you \(approved ? "approved" : "rejected") \(payload["gate_id"]?.stringValue ?? "")"
+            let gate = payload["gate_id"]?.stringValue ?? ""
+            // `by` is the same distinction the engine's ledger records. Rendering a goal's release as
+            // "you approved" would make the terminal claim a person was present when they were not.
+            let who = (payload["by"]?.stringValue ?? "owner") == "goal" ? "the goal" : "you"
+            return "\(who) \(approved ? "approved" : "rejected") \(gate)"
         case "session.compact":
             return "compacted \(payload["recovered"]?.intValue ?? 0) token(s)"
         case "session.saturation":
@@ -102,8 +114,29 @@ public struct EngineEvent: Codable, Sendable, Identifiable, Equatable {
             return "context \(percent)% (\(band))"
         case "session.rotate", "session.rotate.requested":
             return "rotating: \(payload["trigger"]?.stringValue ?? "?")"
-        case "handoff.verified":
-            return "handoff verified \(payload["from"]?.stringValue ?? "?") → \(payload["to"]?.stringValue ?? "?")"
+        case "handoff.proposed", "handoff.accepted", "handoff.fulfilled", "handoff.verified",
+             "handoff.rejected", "handoff.breached", "handoff.escalated":
+            // Both shapes are read because the engine has both: the typed handoff carries
+            // `from_node`/`to_node`, while an older `handoff.verified` carried `from`/`to`. A summary
+            // that only knew one would render "? → ?" for half the crossings on the wire.
+            let from = payload["from_node"]?.stringValue ?? payload["from"]?.stringValue ?? "?"
+            let to = payload["to_node"]?.stringValue ?? payload["to"]?.stringValue ?? "?"
+            let state = type.replacingOccurrences(of: "handoff.", with: "")
+            let summary = payload["summary"]?.stringValue ?? ""
+            return summary.isEmpty
+                ? "handoff \(state): \(from) → \(to)"
+                : "handoff \(state): \(from) → \(to) — \(summary)"
+        case "policy.changed":
+            let by = payload["by"]?.stringValue ?? ""
+            let gate = payload["gate_id"]?.stringValue ?? ""
+            if by == "goal", !gate.isEmpty {
+                // The engine reports its own gate reasoning here. Re-deriving "may the goal answer
+                // this" in Swift would be a second implementation of a policy the engine already
+                // resolved, and the two would disagree the first time the engine changed its mind.
+                return "the goal \(payload["approved"]?.boolValue == true ? "passed" : "refused") "
+                    + "gate \(gate): \(payload["why"]?.stringValue ?? "no reason given")"
+            }
+            return "policy changed: \(payload["reason"]?.stringValue ?? payload["instruction"]?.stringValue ?? "updated")"
         case "route.decided", "route.proposed":
             let chosen = payload["chosen"]?.stringValue
             let proposed = payload["proposed"]?.boolValue ?? false
@@ -125,7 +158,6 @@ public struct EngineEvent: Codable, Sendable, Identifiable, Equatable {
         case "cost.ceiling": return "budget ceiling reached — the run parked"
         case "cost.reconciled":
             return "cost estimate drifted \(payload["error_pct"]?.doubleValue ?? 0)%"
-        case "guardrail.blocked": return "guardrail blocked a payload"
         case "agent.health.changed":
             return "health \(payload["current"]?.stringValue ?? "?")"
         case "goal.armed":
@@ -179,7 +211,7 @@ public enum EventType {
         "run.criteria.satisfied",
         "route.proposed", "route.decided", "route.overridden",
         "handoff.proposed", "handoff.accepted", "handoff.rejected", "handoff.fulfilled",
-        "handoff.breached", "handoff.verified", "delegation.rejected",
+        "handoff.breached", "handoff.verified", "handoff.escalated", "delegation.rejected",
         "session.open", "session.saturation", "session.compact", "session.rotate",
         "session.rotate.requested", "session.sealed", "session.handoff.verified",
         "session.closed", "context.irreducible_overflow", "attention.decay",

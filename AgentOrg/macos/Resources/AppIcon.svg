@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppIcon.svg · the console's icon, as source rather than as a committed .icns.
+
+  WHY THE SOURCE SHIPS
+  ====================
+  An .icns is a binary blob: nobody can review it, diff it, or fix a wrong pixel in it. The SVG is the
+  editable definition, and `scripts/run-macos-app.sh` renders it into the bundle. Regenerating is one
+  command, so a colour or a node can be changed without owning the icon tools.
+
+  WHAT IT IS, AND WHY
+  ===================
+  The app is an *org of agents*: a console for a team of named workers, one of whom is you. The mark is
+  therefore an org tree — one node above three — rather than a monogram or a generic glyph:
+
+  · The **amber top node is you**, the Owner. It is the only warm colour on the tile, so "where am I in
+    this picture" is answerable at a glance and without reading anything.
+  · The **three white nodes are the workers**, all the same size, because the roster is peers rather
+    than a hierarchy among them.
+  · The **connections are drawn, not implied**. An org chart's whole content is who reports to whom,
+    and a row of unconnected dots would say "group" rather than "org".
+
+  HOW THE COLOURS WERE CHOSEN (macOS never inverts an icon)
+  =========================================================
+  The tile must hold its edge against a light Dock (about #F5F5F7) *and* a dark one (about #2B2B2B), so
+  a near white tile and a near black tile are both out: each disappears into one of the two. A saturated
+  indigo gradient sits between them and carries hue as a second signal, which is what keeps it legible
+  in a dark Dock where the luminance difference alone is thin:
+
+    tile top    #5B4BE8  relative luminance 0.11   about 2.8:1 against a light Dock
+    tile bottom #251F6B  relative luminance 0.03   about 3.2:1 against a light Dock
+    glyph white #FFFFFF  relative luminance 1.00   about 4.6:1 against the tile's darkest part
+    node amber  #FFC24B  relative luminance 0.60   about 8:1   against the tile, distinct by hue
+
+  None of those is a text contrast ratio and none is claimed as one: the tile is a shape against a
+  translucent material, and macOS draws the Dock behind it. What the numbers are for is the one failure
+  that would actually matter — a tile the same brightness as the surface behind it.
+
+  WHY IT SURVIVES 16x16
+  =====================
+  At 16 px the tile is about 13 px across, so the only things that survive are *large* shapes: four
+  round dots and three thick strokes. Everything fussy was left out on purpose — there is no text, no
+  outline stroke, no gradient on the glyph, and the gaps between the nodes stay open at 16 px so the
+  dots never fuse into a blob. Verified by rendering a 16 px copy and looking at it, which is the only
+  way to check this: a design that reads only large is a design that fails where it is seen most.
+
+  The tile follows the macOS grid rather than filling the canvas: an 824 px body centred in 1024 px with
+  a 185 px corner radius, which is what keeps it the same visual weight as the system's own icons in the
+  Dock. The drop shadow is part of that convention — macOS supplies none for a third-party icon.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024"
+     viewBox="0 0 1024 1024" role="img" aria-label="AgentOrg">
+  <title>AgentOrg</title>
+  <desc>An org tree: an amber node for the Owner above three white worker nodes.</desc>
+
+  <defs>
+    <!-- Vertical, and light at the top: the eye reads the lighter edge as the near surface, which is
+         what stops the tile looking like a flat sticker in the Dock. -->
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5B4BE8"/>
+      <stop offset="1" stop-color="#251F6B"/>
+    </linearGradient>
+
+    <!-- The shadow macOS does not draw for us. Kept inside the tile's own footprint so the 824 px body
+         stays the thing a person measures against their other icons. -->
+    <filter id="tileShadow" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#000000" flood-opacity="0.38"/>
+    </filter>
+  </defs>
+
+  <!-- The body: 824 in a 1024 canvas, radius 22.5% of the body, which is the macOS proportion. -->
+  <rect x="100" y="100" width="824" height="824" rx="185" ry="185"
+        fill="url(#tile)" filter="url(#tileShadow)"/>
+
+  <!-- A hairline inner rim. Invisible at 16 px, but it is what makes the tile read as a surface rather
+       than a hole at Dock sizes on a dark background. -->
+  <rect x="104" y="104" width="816" height="816" rx="181" ry="181"
+        fill="none" stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="8"/>
+
+  <!-- The org: three worker nodes under one Owner.
+       Every number here was tuned against a rendered 16 px copy rather than picked at design size. The
+       first attempt used 74 px worker nodes on a 300/512/724 spread and the three dots fused into one
+       white smear at 16 px — the icon read as a blob with a yellow dot above it. So the nodes grew to
+       96 px, the spread widened to 262/512/762, and the connector thinned to 40 px, which is the
+       narrowest that still survives the downscale. The gaps that result are 54 px at 1024 — about
+       0.9 px at 16 — and they are the entire difference between "three workers" and "a white bar". -->
+  <g stroke="#FFFFFF" stroke-opacity="0.92" stroke-width="40" stroke-linecap="round" fill="none">
+    <path d="M512 320 V 500"/>
+    <path d="M262 500 H 762"/>
+    <path d="M262 500 V 664"/>
+    <path d="M512 500 V 664"/>
+    <path d="M762 500 V 664"/>
+  </g>
+
+  <circle cx="512" cy="320" r="104" fill="#FFC24B"/>
+  <circle cx="262" cy="664" r="96" fill="#FFFFFF"/>
+  <circle cx="512" cy="664" r="96" fill="#FFFFFF"/>
+  <circle cx="762" cy="664" r="96" fill="#FFFFFF"/>
+</svg>

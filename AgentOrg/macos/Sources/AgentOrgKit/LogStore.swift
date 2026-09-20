@@ -73,6 +73,13 @@ public final class LogStore: ObservableObject {
     @Published public private(set) var droppedCount: Int = 0
     /// The highest sequence number seen, for a "live" indicator.
     @Published public private(set) var lastSeq: Int = 0
+    /// Bumped whenever `lines` changes, so a view can cache something *derived* from the buffer
+    /// without re-deriving it on every body evaluation.
+    ///
+    /// A count is not enough to detect a change here: at `capacity` the buffer stops growing, so an
+    /// append that trims the front leaves the count identical while every line has shifted by one.
+    /// Nothing else published by this type distinguishes those two states.
+    @Published public private(set) var revision: Int = 0
 
     private let capacity: Int
     private let publishInterval: TimeInterval
@@ -151,6 +158,19 @@ public final class LogStore: ObservableObject {
         buffer.removeAll()
         lines = []
         dirty = false
+        revision += 1
+    }
+
+    /// Remove just one kind of line.
+    ///
+    /// A diagnostic flood is what makes a terminal unreadable, and clearing it must not take the
+    /// events with it — which is the same argument the kind filter makes, so the two agree about what
+    /// "this kind" means. `droppedCount` is left alone for the same reason as `clear()`.
+    public func clear(kind: LogLine.Kind) {
+        buffer.removeAll { $0.kind == kind }
+        lines = buffer
+        dirty = false
+        revision += 1
     }
 
     /// Lines matching a filter, for a filtered terminal view.
@@ -199,6 +219,7 @@ public final class LogStore: ObservableObject {
         lines = buffer
         dirty = false
         lastPublish = Date()
+        revision += 1
     }
 
     // MARK: - Introspection

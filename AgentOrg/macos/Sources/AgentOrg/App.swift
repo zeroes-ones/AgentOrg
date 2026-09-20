@@ -4,12 +4,12 @@
 //
 //  The application entry point and the window that hosts the console.
 //
-//  WHY THE WINDOW IS ONE VIEW WITH A PICKER RATHER THAN SIX WINDOWS
-//  ----------------------------------------------------------------
-//  The owner's attention is the scarce resource here as much as the model's is. Six windows that must be
-//  arranged before a run can be watched would mean the console costs attention instead of saving it. So
-//  the panels are tabs, each answering one question, and the terminal is always present because a run is
-//  the thing being watched.
+//  WHY THE WINDOW IS ONE VIEW WITH FOUR DESTINATIONS
+//  ------------------------------------------------
+//  The owner's attention is the scarce resource here as much as the model's is. Separate windows that
+//  must be arranged before a run can be watched would mean the console costs attention instead of
+//  saving it, so the destinations live in one window — and there are four of them, not twelve, because
+//  a list whose rows overlap is a list a person has to learn.
 //
 //  `@MainActor` throughout, and no I/O in any view: everything goes through `OrgController`, which the
 //  kit keeps off the main actor where it matters.
@@ -25,6 +25,10 @@ struct AgentOrgApp: App {
     /// The lifecycle policy — resident on window close, regular activation, engine stopped on quit —
     /// lives in `AgentOrgKit.ConsoleAppDelegate` so it can be unit-tested rather than only observed.
     @NSApplicationDelegateAdaptor(ConsoleAppDelegate.self) private var appDelegate
+    /// Which destination the ⌘, command should select. A tiny observable rather than a plain static,
+    /// because the menu command and the window have to agree about it and the menu lives outside the
+    /// window's view hierarchy.
+    @ObservedObject private var router = DestinationRouter.shared
 
     init() {
         // Resolve the repository root from where this executable actually lives.
@@ -77,18 +81,11 @@ struct AgentOrgApp: App {
             ConsoleView(controller: controller)
                 // A floor rather than a fixed size: the sidebar and the terminal both need room, and an
                 // owner with a large display should be able to use it.
-                .frame(minWidth: 1_040, minHeight: 660)
+                .frame(minWidth: 1_020, minHeight: 640)
         }
         .windowToolbarStyle(.unified)
         .windowResizability(.contentMinSize)
         .commands { commands }
-
-        // Preferences in their conventional place, with the conventional shortcut. A `Settings` scene
-        // is the whole implementation — the reference notes it replaces ~200 lines of NSViewController
-        // and Auto Layout — and macOS puts it under the app menu as "Settings…" with ⌘, for free.
-        Settings {
-            SettingsView(controller: controller)
-        }
 
         // The background presence. A menu-bar item is what makes "still running" visible and reachable
         // after the window is closed, and it is how a resident app is *quit* deliberately rather than
@@ -105,7 +102,11 @@ struct AgentOrgApp: App {
     }
 
     /// The status glyph, driven by what the app is actually doing.
+    ///
+    /// A gate outranks everything: an app that has stopped and needs a person must not be represented
+    /// by the same glyph as one working happily, or the whole reason the menu-bar item exists is lost.
     private var menuBarSymbol: String {
+        if controller.spine.needsAPerson { return "hand.raised.fill" }
         if controller.engineState == .failed { return "exclamationmark.triangle" }
         if controller.goal["live"]?.boolValue == true { return "target" }
         if controller.engineState == .running { return "circle.fill" }
@@ -113,6 +114,7 @@ struct AgentOrgApp: App {
     }
 
     private var menuBarAccessibilityLabel: String {
+        if controller.spine.needsAPerson { return "AgentOrg, a gate is waiting for you" }
         if controller.goal["live"]?.boolValue == true { return "AgentOrg, a goal is running" }
         switch controller.engineState {
         case .running: return "AgentOrg, engine running"
@@ -123,53 +125,118 @@ struct AgentOrgApp: App {
 
     /// The menu bar, with the standard shape the HIG expects: state first, the actions that matter,
     /// then Quit last and explicitly.
+    ///
+    /// Every command here goes through the same controller method the window's own control calls, so
+    /// the menu can never do something subtly different from the button beside it. The previous build's
+    /// ⌘R started a run with **no goal at all** while the visible Start button used the field's text —
+    /// two controls, one shortcut, two behaviours — and that class of divergence is what the shared
+    /// call sites below exist to prevent.
     @ViewBuilder
     private var commands: some Commands {
         CommandGroup(replacing: .newItem) { }
         CommandGroup(after: .newItem) {
-            Button("Open Project…") { openProjectPicker(controller: controller) }
-                .keyboardShortcut("o", modifiers: [.command])
-                .disabled(!controller.canLaunch)
+            Button("Open Project…") {
+                openProjectPicker(controller: controller) { controller.confirmProject() }
+            }
+            .keyboardShortcut("o", modifiers: [.command])
+            .disabled(!controller.canLaunch)
             Divider()
             Button("Show Console") { ConsoleWindow.show() }
                 .keyboardShortcut("0", modifiers: [.command])
         }
+
+        // ⌘, is the conventional Preferences shortcut, and this is where every preference now lives —
+        // so it selects the destination rather than opening a second window with a subset of the same
+        // controls, which is what the audit found the old `Settings` scene to be.
+        CommandGroup(replacing: .appSettings) {
+            Button("Setup…") {
+                ConsoleWindow.show()
+                DestinationRouter.shared.select(.setup)
+            }
+            .keyboardShortcut(",", modifiers: [.command])
+        }
+
         CommandMenu("Run") {
-            Button("Launch Engine") { controller.launch() }
-                .keyboardShortcut("l", modifiers: [.command, .shift])
-                .disabled(!controller.canLaunch || controller.engineState.isLive)
+            if controller.engineState.isLive {
+                Button("Stop the Engine") { controller.stop() }
+                    .keyboardShortcut(".", modifiers: [.command, .shift])
+            } else {
+                Button("Start the Engine") { controller.launch() }
+                    .keyboardShortcut("l", modifiers: [.command, .shift])
+                    .disabled(!controller.canLaunch)
+            }
+            Divider()
+            // The same two methods the Now pane's buttons call, with the same goal string. Both are
+            // disabled without a goal, because a run with no goal is refused by the engine anyway —
+            // and the old shortcut started one with `goal: nil`, which is how it diverged.
             Button("Start Run") {
-                Task { await controller.startRun(goal: nil) }
+                let goal = controller.goalDraft
+                Task { await controller.startRun(goal: goal) }
             }
             .keyboardShortcut("r", modifiers: [.command])
-            .disabled(controller.engineState != .running)
-            Button("Pause") { controller.pause() }
-                .keyboardShortcut(".", modifiers: [.command])
-            Button("Stop Engine") { controller.stop() }
-                .keyboardShortcut(".", modifiers: [.command, .shift])
-                .disabled(!controller.engineState.isLive)
-            Divider()
-            Button("Refresh") { Task { await controller.refresh() } }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
-        }
-        CommandMenu("Goal") {
-            Button("Set Goal and Continue") {
-                Task { await controller.setGoal(controller.goalDraft, arm: true) }
+            .disabled(controller.engineState != .running || controller.goalDraft.isEmpty)
+
+            Button("Plan Only") {
+                let goal = controller.goalDraft
+                Task { await controller.startRun(goal: goal, dryRun: true) }
+            }
+            .keyboardShortcut("r", modifiers: [.command, .shift])
+            .disabled(controller.engineState != .running || controller.goalDraft.isEmpty)
+
+            Button("Keep Working Until Done") {
+                let goal = controller.goalDraft
+                Task { await controller.setGoal(goal, arm: true) }
             }
             .keyboardShortcut("g", modifiers: [.command, .shift])
             .disabled(controller.engineState != .running || controller.goalDraft.isEmpty)
-            Button("Pause Goal") { Task { await controller.pauseGoal() } }
+
+            Divider()
+            Button("Pause the Run") { Task { await controller.pause() } }
+                .keyboardShortcut(".", modifiers: [.command])
+                // Disabled unless a run is actually live. `runStatus` is the whole status payload from
+                // the engine, so it is non-empty as soon as any poll has been answered — the old
+                // `!runStatus.isEmpty` test therefore disabled Pause exactly when a run existed, and
+                // enabled it when the engine was stopped and `pause` could only be refused. Mirrors
+                // the goal menu's own `goal["live"] != true` idiom below.
+                .disabled(controller.runStatus["running"]?.boolValue != true)
+            Button("Refresh") { Task { await controller.refresh() } }
+                .keyboardShortcut("r", modifiers: [.command, .option])
+        }
+
+        // The goal's own controls, in their own menu, with their own words: "Pause the Goal" is not
+        // "Pause the Run", and the two used to share a label as well as a shortcut key.
+        CommandMenu("Goal") {
+            Button("Pause the Goal") { Task { await controller.pauseGoal() } }
                 .disabled(controller.goal["live"]?.boolValue != true)
-            Button("Resume Goal") { Task { await controller.resumeGoal() } }
+            Button("Resume the Goal") { Task { await controller.resumeGoal() } }
                 .disabled(controller.goal["live"]?.boolValue == true)
-            Button("Clear Goal") { Task { await controller.clearGoal() } }
+            Button("Clear the Goal") { Task { await controller.clearGoal() } }
                 .disabled((controller.goal["state"]?.stringValue ?? "cleared") == "cleared")
         }
+
         CommandGroup(after: .sidebar) {
             Button("Toggle Terminal") { TerminalVisibility.shared.toggle() }
                 .keyboardShortcut("t", modifiers: [.command, .shift])
         }
     }
+}
+
+/// Which destination a command from outside the window should select.
+///
+/// A tiny observable rather than a static, because the menu command has to be able to open the window
+/// and *then* select a destination — and `@SceneStorage` inside `ConsoleView` is not reachable from the
+/// menu. `ConsoleView` mirrors this into its scene storage, so a selection made either way persists.
+@MainActor
+final class DestinationRouter: ObservableObject {
+    static let shared = DestinationRouter()
+
+    @Published var requested: Destination?
+
+    func select(_ destination: Destination) {
+        requested = destination
+    }
+
+    private init() {}
 }
 
 /// Bringing the console back after the window was closed.
