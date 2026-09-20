@@ -123,6 +123,9 @@ name: tests
 on:
   push:
   pull_request:
+  # Dispatchable so the gate can be run on demand — after a fix, or to tell a billing/runner
+  # problem apart from a test failure without inventing a commit.
+  workflow_dispatch:
 
 # Read-only: nothing in this workflow writes to the repository, and a token that could is a token
 # that some future step will use by accident.
