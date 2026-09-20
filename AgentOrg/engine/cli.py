@@ -2033,6 +2033,74 @@ def cmd_takeover(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _bytes_label(total: int) -> str:
+    """A byte count a person can read, for the one line that reports what a discard freed."""
+    if total >= 1_048_576:
+        return f"{total / 1_048_576:.1f} MB"
+    if total >= 1024:
+        return f"{total / 1024:.1f} KB"
+    return f"{total} B"
+
+
+def cmd_discard(args: argparse.Namespace) -> int:
+    """Clear a *settled* run's checkpoints, so the board stops reporting work nobody can act on.
+
+    **This is not `abort`, and the difference is the whole point.** `abort` stops a run that is still
+    going and keeps its checkpoint so the finished work can be read. `discard` acts on a run that has
+    already ended — most often one parked at a gate or blocked — and *moves* its two checkpoints out
+    of the way, because those files are the only thing making `flow` and `status` report a node with
+    no way to resolve it. `abort`, `decide`, `reassign` and `takeover` all act on a run in flight, so
+    on a settled run every one of them refuses with "no run found"; this is the verb that was missing.
+
+    The record of what happened — the trace, the handoffs, the ledger, the goal and the cache — is
+    **kept**, so discarding is not erasing; `--include-record` is the explicit, separately named way
+    to move those too. Nothing is deleted either way: the checkpoints are moved into
+    `.agent_state/discarded/<stamp>/`, and the reply says exactly where. A run that is *live* is
+    refused by the engine operation, which is told the answer by the process running it.
+    """
+    from .state import StateError
+    from .systemcli import NEXT_SEP
+
+    slug = _slug_for(args)
+    workspace = _resolve_workspace(args, slug)
+    try:
+        # `live=False` deliberately: this process owns no run thread, so it has no run in flight. A
+        # server that *does* passes its own `_run_is_live()` — the engine operation refuses on that,
+        # so a live checkpoint is never moved out from under the writer.
+        report = workspace.discard_run(include_record=bool(getattr(args, "include_record", False)))
+    except StateError as exc:
+        _warn(str(exc))
+        return EXIT_CHECK_FAILED
+
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+
+    if not report["discarded"]:
+        # Already clean is the *answer*, not a failure: the desired state holds. The reason is still
+        # stated, so "nothing to do" cannot be confused with a command that did not run.
+        print(f"nothing to discard for {slug}")
+        print(f"  workspace : {report['workspace']}")
+        print(f"  reason    : {report['reason']}")
+        print(f"Next: engine.cli flow --slug {slug}{NEXT_SEP}the board already reports no run")
+        return EXIT_OK
+
+    moved = report["moved"]
+    print(f"discarded {len(moved)} checkpoint(s) for {slug}")
+    print(f"  workspace : {report['workspace']}")
+    print(f"  backup    : {report['backup_dir']}")
+    for entry in moved:
+        print(f"    moved   : {entry['name']} ({_bytes_label(entry['bytes'])})")
+    print(f"  freed     : {_bytes_label(report['freed_bytes'])}")
+    if report["kept"]:
+        print(f"  kept      : {', '.join(report['kept'])} — the record of what happened")
+    else:
+        print("  kept      : the roster, schedules, proposals and sessions — none of the record was "
+              "on disk")
+    print(f"Next: engine.cli flow --slug {slug}{NEXT_SEP}the board no longer reports the discarded run")
+    return EXIT_OK
+
+
 def _agent_for(orch: Any, ref: str) -> Any:
     """The roster agent a person named, by id or by name.
 
@@ -4257,6 +4325,17 @@ def build_parser() -> argparse.ArgumentParser:
     takeover.add_argument("--slug", help="project name (optional with --project, which names it)")
     takeover.add_argument("--root", help="projects root (default: AgentOrg/projects)")
     takeover.set_defaults(func=cmd_takeover)
+
+    discard = sub.add_parser(
+        "discard", parents=[common],
+        help="clear a *settled* run so the board stops reporting it — moves the two checkpoints to "
+             ".agent_state/discarded/, never deletes, and is not `abort` (which stops a live run)")
+    discard.add_argument("--slug", help="project name (optional with --project, which names it)")
+    discard.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    discard.add_argument("--include-record", action="store_true", dest="include_record",
+                         help="also move the trace, handoffs, ledger, goal and cache — the record of "
+                              "the run. Off by default, because that record is what is kept")
+    discard.set_defaults(func=cmd_discard)
 
     subagents = sub.add_parser(
         "subagents", parents=[common],

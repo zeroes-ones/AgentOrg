@@ -41,12 +41,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-__all__ = ["StateError", "Workspace", "RunCheckpoint", "ENGINE_STATE_DIRNAME"]
+__all__ = ["StateError", "RunLiveError", "Workspace", "RunCheckpoint", "ENGINE_STATE_DIRNAME",
+           "DISCARDED_DIRNAME", "RECORD_ENTRIES"]
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 CHECKPOINT_VERSION = "1.0.0"
@@ -56,9 +58,66 @@ CHECKPOINT_VERSION = "1.0.0"
 #: into two spellings that disagree about what is project content.
 ENGINE_STATE_DIRNAME = ".agent_state"
 
+#: Where a discarded run's checkpoints are *moved* to — `discarded/<stamp>/` under `.agent_state/`.
+#: A directory rather than a trash can: the backup is part of the workspace, so a person who changed
+#: their mind finds it where the run lived rather than in an OS-specific wastebasket that may have
+#: been emptied, and the engine has no dependency on a platform API to provide the recovery path.
+DISCARDED_DIRNAME = "discarded"
+
+#: The entries under `.agent_state/` that are the *record* of what happened rather than the state that
+#: makes a run look live. Named here so "the record" is one list the operation, the CLI help and the
+#: console can all read, instead of three spellings of the same idea drifting apart.
+#:
+#: `docs/` and `src/` are deliberately **not** here and are never touched by a discard: they sit
+#: outside `.agent_state/`, they are the user's artifacts, and removing a build output because a *run*
+#: was cleared would be a real loss. The roster, schedules, proposals, sessions, memory, telemetry,
+#: diagnostics and the effects journal are also left alone — some of them outlive a run entirely.
+RECORD_ENTRIES: tuple[str, ...] = ("trace.jsonl", "handoffs", "ledger.jsonl", "goal.json", "cache")
+
 
 class StateError(RuntimeError):
     """Raised on an invalid project name or a corrupt, unreadable checkpoint."""
+
+
+class RunLiveError(StateError):
+    """Raised when a discard is asked for while a run is in flight.
+
+    Its own type because the refusal is not a corrupt-state error and a caller may want to answer it
+    differently from one — the CLI exits non-zero on either, but a console could re-enable the button
+    the moment the run settles, which it can only tell if the two are distinguishable.
+    """
+
+
+def _discard_stamp() -> str:
+    """A filesystem-safe UTC stamp for a discard's backup directory (`2026-09-20T083000Z`).
+
+    The ISO form with the separators inside the time dropped: `:` is legal on macOS and Linux but not
+    on every filesystem a project directory may sit on, and a backup that cannot be created on the
+    disk the workspace lives on is not a backup.
+    """
+    return time.strftime("%Y-%m-%dT%H%M%SZ", time.gmtime())
+
+
+def _entry_bytes(path: Path) -> int:
+    """Roughly what moving `path` frees: a file's size, or a directory's contents summed.
+
+    Best-effort by design — a file that vanishes between the walk and the `stat` is skipped rather
+    than raising, because a slightly stale size is not a reason to refuse a cleanup. The figure is for
+    the reply only; nothing in the operation depends on it.
+    """
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            try:
+                total += child.stat().st_size
+            except OSError:
+                continue
+    return total
 
 
 def _iso_now() -> str:
@@ -545,3 +604,119 @@ class Workspace:
                 except OSError:
                     continue
         return total
+
+    # ── discarding a settled run ────────────────────────────────────────────
+
+    def _discard_backup_dir(self) -> Path:
+        """A fresh `discarded/<stamp>/` directory, unique within the second.
+
+        The stamp is the moment in a form a person can read, so `ls .agent_state/discarded/` answers
+        "when did I clear this" without decoding a counter. The suffix exists only for the impossible
+        case of two discards inside one second, where the second must not overwrite the first — the
+        backup of a backup.
+        """
+        stamp = _discard_stamp()
+        candidate = self.state_dir / DISCARDED_DIRNAME / stamp
+        suffix = 2
+        while candidate.exists():
+            candidate = self.state_dir / DISCARDED_DIRNAME / f"{stamp}-{suffix}"
+            suffix += 1
+        return candidate
+
+    def discard_run(self, *, live: bool = False,
+                    include_record: bool = False) -> dict[str, Any]:
+        """Clear a settled run's checkpoints so the board stops reporting work nobody can act on.
+
+        THE DEFECT THIS CLOSES
+        ----------------------
+        A run that parked at a human gate — or died blocked — leaves `run_state.json` (and the library
+        runner's `runner_state.json`) in `.agent_state/`, and every reader of run state reads those
+        first. `flow`, `status` and the app's Runs and Flow panels therefore go on reporting a node as
+        blocked for ever, while the verbs that *look* like a way out (`abort`, `decide`, `reassign`,
+        `takeover`) all act on a run **in flight**: with no orchestrator run to load they refuse with
+        "no run found". So the gate became permanent and the board became a lie. This is the one
+        operation that removes the state making both true.
+
+        MOVE, NEVER DELETE
+        ------------------
+        The files are moved into `discarded/<stamp>/` under `.agent_state/` rather than unlinked. The
+        person clearing up a stuck run is the person least able to say whether a checkpoint they have
+        not read yet matters, and this repository's rule is that a destructive default is wrong while
+        a recoverable one is fine — so the default is recoverable and the reply names where the files
+        went.
+
+        WHAT IS KEPT
+        ------------
+        Only the two checkpoints move by default. They are the **only** thing that makes the board
+        report a run, because every reader keys off them. The rest of `.agent_state/` is the *record*
+        of what happened — the trace, the handoffs, the ledger (the decisions a person may still need
+        to audit), the goal and the cache — and deleting a record to tidy a board would destroy the
+        evidence of the very failure being cleaned up. `include_record=True` moves those too and is a
+        caller's explicit choice rather than a default; the roster, schedules, proposals, sessions,
+        memory, telemetry, diagnostics and the effects journal are never touched by either path.
+        `docs/` and `src/` are outside `.agent_state/` and are never touched at all: they are the
+        user's artifacts, and moving a build output because a *run* was discarded would be a real
+        loss. The reply's `kept` names what stayed.
+
+        A LIVE RUN IS REFUSED
+        ---------------------
+        A checkpoint being written by a running node is not litter — moving it out from under the
+        writer would leave the run persisting into a directory that no longer describes it. The caller
+        owns that judgement, because only the caller can see a run thread: it passes `live`, which on
+        the server is `serve._run_is_live()` (the run *thread* is the fact) and from a CLI process —
+        which owns no run thread — is False. Raising rather than returning a refusal keeps a caller
+        from acting on a reply it never read. The refusal names the workspace, because a script that
+        discards several projects needs to know which one was still busy.
+
+        Returns the report both surfaces show: `discarded` (whether anything moved), `reason` (why
+        not, when nothing did), `workspace`, `state_dir`, `backup_dir`, `moved` (name/from/to/bytes
+        per entry), `kept` and `freed_bytes`.
+        """
+        if live:
+            raise RunLiveError(
+                f"a run is in flight for {self.path}, and its checkpoint is being written; "
+                "discard acts on a *settled* run. Pause or abort it first, then discard.")
+        targets: list[Path] = [self.checkpoint_path, self.runner_state_path]
+        if include_record:
+            targets += [self.state_dir / name for name in RECORD_ENTRIES]
+        present = [path for path in targets if path.exists()]
+        kept = ([] if include_record
+                else [name for name in RECORD_ENTRIES if (self.state_dir / name).exists()])
+        if not present:
+            return {
+                "discarded": False,
+                "reason": (f"no run checkpoint in {self.state_dir} — nothing here is making the "
+                           "board report a run"),
+                "workspace": str(self.path),
+                "state_dir": str(self.state_dir),
+                "backup_dir": "",
+                "moved": [],
+                "kept": kept,
+                "freed_bytes": 0,
+            }
+
+        backup = self._discard_backup_dir()
+        backup.mkdir(parents=True, exist_ok=True)
+        moved: list[dict[str, Any]] = []
+        freed = 0
+        for source in present:
+            # `shutil.move` rather than `os.replace`: it handles a directory as well as a file and a
+            # state directory on another volume, and `include_record` moves directories. The backup
+            # is created first, so a failure part-way leaves the moved entries recoverable and the
+            # report is never written — the caller sees the exception, not a half-truth.
+            size = _entry_bytes(source)
+            destination = backup / source.name
+            shutil.move(str(source), str(destination))
+            moved.append({"name": source.name, "from": str(source), "to": str(destination),
+                          "bytes": size})
+            freed += size
+        return {
+            "discarded": True,
+            "reason": "",
+            "workspace": str(self.path),
+            "state_dir": str(self.state_dir),
+            "backup_dir": str(backup),
+            "moved": moved,
+            "kept": kept,
+            "freed_bytes": freed,
+        }

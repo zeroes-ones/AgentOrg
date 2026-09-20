@@ -66,7 +66,18 @@ final class OrgControllerBridgeTests: XCTestCase {
                 continue
             with open(received_path, "a") as handle:
                 handle.write(json.dumps(command) + "\\n")
-            detail = \(pauseAnswer) if command.get("type") == "pause" else {"accepted": True}
+            if command.get("type") == "pause":
+                detail = \(pauseAnswer)
+            elif command.get("type") == "discard_run":
+                # A reply shaped like the engine's own, so the test asserts the app reads the count
+                # and the backup path rather than a sentence it wrote itself.
+                detail = {"discarded": True, "reason": "",
+                          "moved": [{"name": "run_state.json", "bytes": 12},
+                                    {"name": "runner_state.json", "bytes": 30}],
+                          "backup_dir": "/tmp/agentorg-discard-backup",
+                          "kept": ["trace.jsonl"], "freed_bytes": 42}
+            else:
+                detail = {"accepted": True}
             emit({"v": 1, "seq": 0, "type": "command.ack",
                   "payload": {"cmd_id": command["cmd_id"], "ok": True, "detail": detail}})
         """
@@ -227,6 +238,26 @@ final class OrgControllerBridgeTests: XCTestCase {
         let terminal = terminalText(controller)
         XCTAssertTrue(terminal.contains("pause refused"),
                       "the refusal must reach the terminal as well as the notice:\n\(terminal)")
+    }
+
+    // MARK: - Discarding a settled run is the engine's operation, not the app's
+
+    func testDiscardRunSendsTheEngineCommandAndReadsItsReply() async throws {
+        // The app must not move the files itself: `discard_run` is the one engine operation, and the
+        // count and backup path a person reads come from its reply rather than from Swift. So this
+        // asserts the command actually crossed the wire *and* that the reply is what the console held.
+        let controller = try await launchedController()
+        defer { controller.stop() }
+
+        let answered = await controller.discardRun()
+        XCTAssertTrue(answered)
+        XCTAssertTrue(try commandsSent().contains { $0["type"] as? String == "discard_run" },
+                      "discard must actually go on the wire")
+        XCTAssertEqual(controller.lastDiscard["backup_dir"]?.stringValue,
+                       "/tmp/agentorg-discard-backup",
+                       "the backup path must be the engine's, not one the app composed")
+        XCTAssertEqual(controller.lastDiscard["moved"]?.arrayValue?.count, 2)
+        XCTAssertEqual(controller.lastDiscard["kept"]?.arrayValue?.first?.stringValue, "trace.jsonl")
     }
 
     // MARK: - The posture reaches the engine as one word

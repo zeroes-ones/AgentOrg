@@ -293,6 +293,15 @@ public final class OrgController: ObservableObject {
     /// A stored field rather than a computed one — see `offlineGoal` for why that matters.
     @Published public private(set) var offlineGoalDocument: [String: JSONValue] = [:]
 
+    /// The engine's reply to the last `discard_run`, held whole so the panel reads the count and the
+    /// backup path **from the engine** rather than from `moved`/`backup_dir` it wrote itself.
+    ///
+    /// The reply is the same dict `engine.cli discard --json` prints, because both surfaces call the
+    /// one `Workspace.discard_run`. A Swift sentence assembled here would be a second account of an
+    /// operation the engine already describes, and it would go stale the first time the operation
+    /// changed.
+    @Published public private(set) var lastDiscard: [String: JSONValue] = [:]
+
     /// How many automatic restarts remain before the console stops trying.
     ///
     /// Published so the failure banner can say "2 attempts left" instead of silently retrying, and so
@@ -3046,6 +3055,40 @@ public final class OrgController: ObservableObject {
         } else {
             offlineHandoffDetail = snapshot.handoffs.first
         }
+    }
+
+    /// Discard a *settled* run's checkpoints, so the Runs pane and the board stop reporting it.
+    ///
+    /// The console's control for `engine.cli discard` — the **same engine operation**, reached through
+    /// `serve._cmd_discard_run` rather than a Swift copy. The app deliberately does not move the files
+    /// itself: the liveness judgement ("is a run in flight") lives with the engine, and only the
+    /// engine's reply knows which entries actually moved and where the backup went. A second
+    /// implementation here would be able to disagree with the terminal about both.
+    ///
+    /// The reply is kept in `lastDiscard` so the panel renders the count, the backup path and the kept
+    /// list the engine returned rather than a sentence assembled in Swift. A no-op is *not* a refusal —
+    /// the engine answers `{discarded: false, reason}` because "already clean" is the state the person
+    /// wanted — so it is reported as such and returns true. A **live** run is refused with `ok: false`,
+    /// which `mutate` surfaces as a notice and returns false.
+    ///
+    /// - Returns: whether the engine answered at all.
+    @discardableResult
+    public func discardRun() async -> Bool {
+        let answered = await mutate("discard_run", payload: [:]) { [weak self] response in
+            guard let self else { return }
+            self.lastDiscard = response
+            if response["discarded"]?.boolValue == true {
+                let count = response["moved"]?.arrayValue?.count ?? 0
+                let backup = response["backup_dir"]?.stringValue ?? ""
+                self.notice = "discarded \(count) checkpoint file(s); the backup is \(backup)"
+            } else {
+                self.notice = response["reason"]?.stringValue ?? "nothing to discard"
+            }
+        }
+        // The checkpoint the pane read is gone (or was already absent), so re-read `.agent_state/`
+        // rather than leaving the Runs table describing a run the engine no longer reports.
+        await refreshOfflineState()
+        return answered
     }
 
     /// Everything one offline reload produces, carried back from the detached read in one hop.

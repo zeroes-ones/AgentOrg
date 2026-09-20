@@ -127,9 +127,16 @@ struct RunsPane: View {
 /// The old History panel: the checkpoint, the handoffs, and the cache store.
 struct DiskRunsSection: View {
     @ObservedObject var controller: OrgController
+    /// The discard confirmation is on screen. Held here rather than per row so a poll's re-render of
+    /// the checkpoint rows cannot dismiss a dialog the person is still reading.
+    @State private var pendingDiscard = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            // The engine's account of the last discard, rendered from its reply rather than from a
+            // sentence written here — and drawn *outside* the "nothing on disk" branch, because a
+            // discard is most often what leaves the panel with no run to show.
+            discardResult
             if !controller.hasOfflineState {
                 ContentUnavailableView {
                     Label("Nothing on disk yet", systemImage: "externaldrive")
@@ -143,6 +150,66 @@ struct DiskRunsSection: View {
                 handoffSection
                 cacheSection
             }
+        }
+        // **The confirmation says what is kept and where the backup goes**, which is the whole reason
+        // this is safe to offer where "Forget" a schedule is not: `discard` moves the two checkpoints
+        // rather than deleting them. The buttons copy the schedule section's shape — a destructive
+        // role on the act, a cancel beside it — and the engine's own refusal for a live run is left
+        // to surface (it would be a second liveness rule to pre-empt it here).
+        .alert("Discard this settled run?", isPresented: $pendingDiscard) {
+            Button("Discard it", role: .destructive) {
+                Task { await controller.discardRun() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(discardMessage)
+        }
+    }
+
+    /// What a discard does, in the terms the engine implements it: the two checkpoints move, the
+    /// record stays. The *result* is not described here — the count, the moved entries and the backup
+    /// path come from `controller.lastDiscard`, the engine's reply.
+    private var discardMessage: String {
+        "run_state.json and runner_state.json are moved — never deleted — into a timestamped folder "
+        + "under .agent_state/discarded/, so the board stops reporting a node nobody can resolve. "
+        + "Everything else is kept: the trace, the handoffs, the ledger, the goal and the cache. "
+        + "A run still in flight is refused."
+    }
+
+    /// The engine's reply to the last discard, shown verbatim where a person needs it: how many
+    /// checkpoints moved, where the backup is, and what was kept.
+    @ViewBuilder
+    private var discardResult: some View {
+        let report = controller.lastDiscard
+        if !report.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                if report["discarded"]?.boolValue == true {
+                    Label("Discarded \(report["moved"]?.arrayValue?.count ?? 0) checkpoint file(s)",
+                          systemImage: "archivebox")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if let backup = report["backup_dir"]?.stringValue, !backup.isEmpty {
+                        // The engine's path, verbatim and selectable: it is the recovery route.
+                        Text("backup: \(backup)")
+                            .font(.system(.caption2, design: .monospaced))
+                            .textSelection(.enabled)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let kept = report["kept"]?.arrayValue, !kept.isEmpty {
+                        Text("kept: " + kept.compactMap { $0.stringValue }.joined(separator: ", "))
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                } else if let reason = report["reason"]?.stringValue, !reason.isEmpty {
+                    // The no-op's stated reason, passed through: "already clean" must not read as a
+                    // failure, and an empty table would not say which it was.
+                    Text(reason).font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.secondary.opacity(0.06))
+            .cornerRadius(6)
+            .accessibilityElement(children: .combine)
         }
     }
 
@@ -159,6 +226,21 @@ struct DiskRunsSection: View {
                     if !run.updated.isEmpty {
                         Text(run.updated).font(.caption2).foregroundStyle(.secondary)
                     }
+                    // The cleanup control the pane was missing: a stuck run could be read here and
+                    // acted on nowhere, so a gate the person could not resolve stayed on the board for
+                    // ever. It goes through the engine (`discard_run`) rather than moving files from
+                    // the app, so the app and the terminal share one implementation and one liveness
+                    // rule.
+                    Button(role: .destructive) { pendingDiscard = true } label: {
+                        Label("Discard run", systemImage: "trash")
+                    }
+                    .controlSize(.small)
+                    .disabled(controller.engineState != .running)
+                    .help(controller.engineState == .running
+                          ? "Move this run's checkpoints out of the way, so the board stops reporting "
+                              + "it. Recoverable — the backup path is shown."
+                          : "Discarding is an engine operation, and the engine is not running.")
+                    .accessibilityLabel("Discard this settled run's checkpoints")
                 }
                 HStack(spacing: 22) {
                     Metric(label: "Workflow", value: run.workflow)

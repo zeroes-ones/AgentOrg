@@ -1765,6 +1765,39 @@ class Server:
         except Exception as exc:  # noqa: BLE001 - aborting nothing is not an error worth raising
             return {"aborted": False, "reason": str(exc)}
 
+    def _cmd_discard_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Discard a settled run's checkpoints, so the board stops reporting work nobody can act on.
+
+        The console's half of `engine.cli discard`, and the **same engine operation** rather than a
+        second implementation: both call `Workspace.discard_run`, so the count, the backup path and
+        the kept list a person reads here are the ones the terminal printed. A Swift copy of that
+        account would drift the first time the operation changed.
+
+        `_run_is_live()` is passed in as the liveness judgement rather than a second rule written
+        here — a run on this server's run thread is exactly the "checkpoint being written by a running
+        node" the operation refuses to move, and reusing the helper the `start`/`resume` guards use
+        keeps one answer to "is a run in flight" instead of two.
+        """
+        from .state import StateError
+
+        try:
+            report = self.workspace.discard_run(
+                live=self._run_is_live(),
+                include_record=bool(payload.get("include_record")))
+        except StateError as exc:
+            # A live run and an unreadable state directory are both refusals a person must see:
+            # `ServerError` is what turns one into `ok: false` carrying the reason, rather than an ack
+            # that looks like success while nothing moved.
+            raise ServerError(str(exc)) from exc
+        if report["discarded"] and self.orchestrator is not None:
+            # The orchestrator may still hold the run it loaded before the files moved, and `status`
+            # reads *that object* — so without this a poll taken a moment later would go on describing
+            # the run the board has already forgotten, and the app and the terminal would disagree
+            # about a workspace this command just reconciled. Only the run is dropped: the roster, the
+            # policy and the bus are not what was discarded.
+            self.orchestrator._run = None  # noqa: SLF001 - the same field `_current_run` reads
+        return report
+
     def _cmd_pause(self, payload: dict[str, Any]) -> dict[str, Any]:
         orch = self.orchestrator
         if orch is None:

@@ -252,6 +252,13 @@ class CommandType(str, Enum):
     SUBAGENT_RESULT = "subagent_result"
     # flow — the org board: who is working on what, and what crossed between them
     FLOW = "flow"
+    #: Discard a *settled* run's checkpoints, so the board stops reporting it.
+    #:
+    #: Named `discard_run` rather than a bare `discard` so it reads next to the state it acts on and
+    #: cannot be confused with a roster or schedule removal. Distinct from `ABORT`, which stops a run
+    #: in flight: this acts on a run that is already over, and moving its state — never deleting it —
+    #: is what clears a gate the person cannot otherwise resolve.
+    DISCARD_RUN = "discard_run"
     # providers — the endpoints and keys the console can configure
     PROVIDERS = "providers"
     PROVIDER_TEST = "provider_test"

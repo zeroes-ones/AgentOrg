@@ -41,7 +41,7 @@ sys.path.insert(0, str(ROOT))
 from engine.cli import EXIT_CHECK_FAILED, EXIT_OK, EXIT_USAGE, build_parser, main
 from engine.config import load
 from engine.library import resolve
-from engine.serve import Server
+from engine.serve import Server, ServerError
 from engine.state import Workspace
 
 
@@ -182,6 +182,7 @@ def argparse_args(**kwargs) -> argparse.Namespace:
 def test_every_new_operation_resolves_to_a_command():
     parser = build_parser()
     for argv in (["abort"], ["reassign", "dev", "--agent", "Alice"], ["takeover", "dev"],
+                 ["discard", "--slug", "s"],
                  ["subagents", "list"], ["subagents", "result", "sub_1"],
                  ["agent", "update", "Alice", "--title", "x"], ["agent", "retire", "Alice"],
                  ["providers", "list"], ["providers", "add", "groq", "--base-url", "https://x/v1"],
@@ -209,7 +210,7 @@ def test_every_new_command_is_documented_in_usage_md():
     reads, so every new one appears there — and the doc still describes commands that run."""
     text = (ROOT / "USAGE.md").read_text(encoding="utf-8")
     for documented in ("`abort --slug s`", "`reassign --slug s <node> --agent A`",
-                       "`takeover --slug s <node>`", "`subagents list --slug s`",
+                       "`takeover --slug s <node>`", "`discard --slug s`", "`subagents list --slug s`",
                        "`subagents result <child> --slug s`", "`agent update <name>",
                        "`agent retire <name>`", "`providers list`", "`providers add <id>",
                        "`providers test <id>", "`providers remove <id>`", "`improve`", "`proposals`"):
@@ -924,6 +925,160 @@ def test_proposals_json_is_only_json(tmp_path):
     assert result.returncode == EXIT_OK
     json.loads(result.stdout)                    # must not raise
     assert "proposal(s) in" not in result.stdout
+
+
+# ── discard: clearing a settled run ──────────────────────────────────────────
+
+
+def _checkpoints(root: pathlib.Path, slug: str = "clirun") -> tuple[pathlib.Path, pathlib.Path]:
+    """Both of a run's checkpoints — the orchestrator's and the library runner's."""
+    state = root / slug / ".agent_state"
+    return state / "run_state.json", state / "runner_state.json"
+
+
+def test_discard_clears_both_checkpoints_and_keeps_the_record(run_project):
+    """The defect this closes: a settled run no verb could act on and no verb could remove.
+
+    `abort`/`decide`/`reassign`/`takeover` all act on a run *in flight*, so on a parked run every one
+    refuses with "no run found" — and `flow` went on reporting its blocked node for ever. This moves
+    the two files the board reads, and only those: the record of what happened is kept.
+    """
+    root, project, creds_path = run_project
+    park_at_the_gate(root, project, creds_path)
+    run_state, runner_state = _checkpoints(root)
+    assert run_state.is_file() and runner_state.is_file(), "the fixture must have both to discard"
+    before = {run_state.name: run_state.read_bytes(), runner_state.name: runner_state.read_bytes()}
+    trace = root / "clirun" / ".agent_state" / "trace.jsonl"
+    trace_before = trace.read_bytes()
+
+    payload = cli_json("--config", str(creds_path), "discard", "--slug", "clirun", "--root", str(root))
+    assert payload["discarded"] is True
+    assert sorted(entry["name"] for entry in payload["moved"]) == ["run_state.json", "runner_state.json"]
+    assert not run_state.exists() and not runner_state.exists()
+    # "Move, not delete": the backup holds the exact bytes, and the record is untouched.
+    backup = pathlib.Path(payload["backup_dir"])
+    assert backup.is_dir()
+    for name, content in before.items():
+        assert (backup / name).read_bytes() == content, f"{name} was not moved byte-for-byte"
+    assert trace.read_bytes() == trace_before
+    assert "trace.jsonl" in payload["kept"]
+
+
+def test_discard_json_is_only_json_and_names_the_backup(run_project):
+    root, project, creds_path = run_project
+    park_at_the_gate(root, project, creds_path)
+    result = run_cli("--json", "--config", str(creds_path), "discard", "--slug", "clirun",
+                     "--root", str(root))
+    assert result.returncode == EXIT_OK
+    payload = json.loads(result.stdout)          # must not raise: no human line on stdout
+    assert payload["discarded"] is True
+    assert payload["backup_dir"].startswith(str(root / "clirun" / ".agent_state" / "discarded"))
+    assert "checkpoint(s) for" not in result.stdout
+
+
+def test_discard_refuses_a_run_that_is_still_live(run_project):
+    """A checkpoint being written by a running node is not litter, so the engine refuses to move it.
+    The judgement is the caller's — a run *thread* is what the server passes — and a refusal must
+    move nothing at all."""
+    from engine.state import RunLiveError
+
+    root, project, creds_path = run_project
+    park_at_the_gate(root, project, creds_path)
+    workspace = Workspace.for_project("clirun", root=root)
+    with pytest.raises(RunLiveError):
+        workspace.discard_run(live=True)
+    run_state, runner_state = _checkpoints(root)
+    assert run_state.is_file() and runner_state.is_file(), "a refused discard must move nothing"
+
+
+def test_the_console_refuses_a_live_run_the_same_way(run_project):
+    root, project, creds_path = run_project
+    park_at_the_gate(root, project, creds_path)
+    server = server_for(creds_path, root=root)
+    # The helper the `start`/`resume` guards already reuse; the handler is expected to pass *this*,
+    # not a second liveness rule, so driving it here is driving the production path.
+    server._run_is_live = lambda: True  # noqa: SLF001
+    with pytest.raises(ServerError):
+        server._cmd_discard_run({})  # noqa: SLF001
+    assert _checkpoints(root)[0].is_file()
+
+
+def test_discard_with_no_checkpoint_is_a_clean_noop_with_a_reason(run_project):
+    root, _project, creds_path = run_project
+    result = run_cli("--config", str(creds_path), "discard", "--slug", "never-ran", "--root", str(root))
+    assert result.returncode == EXIT_OK, "already clean is the answer, not a failure"
+    assert "nothing to discard" in result.stdout
+
+    payload = cli_json("--config", str(creds_path), "discard", "--slug", "never-ran", "--root", str(root))
+    assert payload["discarded"] is False
+    assert payload["reason"], "a no-op must state why, or it reads as a command that did not run"
+
+
+def test_discard_moves_the_record_only_when_explicitly_asked(run_project):
+    root, project, creds_path = run_project
+    park_at_the_gate(root, project, creds_path)
+    payload = cli_json("--config", str(creds_path), "discard", "--include-record", "--slug", "clirun",
+                       "--root", str(root))
+    names = {entry["name"] for entry in payload["moved"]}
+    assert "trace.jsonl" in names, "--include-record is the explicit way to move the record"
+    assert not (root / "clirun" / ".agent_state" / "trace.jsonl").exists()
+    assert payload["kept"] == []
+
+
+def test_the_cli_and_the_console_discard_through_the_same_operation(run_project):
+    """The parity that is the point: driven twice over the same starting state, the terminal and the
+    console must report the same shape — because the app renders the reply rather than describing the
+    move in its own words, and a second implementation would be free to disagree."""
+    root, project, creds_path = run_project
+    park_at_the_gate(root, project, creds_path)
+    cli_payload = cli_json("--config", str(creds_path), "discard", "--slug", "clirun", "--root", str(root))
+
+    park_at_the_gate(root, project, creds_path)   # back to the same starting state
+    server = server_for(creds_path, root=root)
+    console_payload = server._cmd_discard_run({})  # noqa: SLF001
+
+    assert set(cli_payload) == set(console_payload)
+    assert cli_payload["discarded"] == console_payload["discarded"] is True
+    assert (sorted(entry["name"] for entry in cli_payload["moved"])
+            == sorted(entry["name"] for entry in console_payload["moved"]))
+    assert cli_payload["kept"] == console_payload["kept"]
+    assert cli_payload["freed_bytes"] == console_payload["freed_bytes"]
+
+
+def test_discarding_drops_the_run_the_console_was_holding(run_project):
+    """`status` reads the orchestrator's in-memory run, so a discard that moved the checkpoint but left
+    that object in place would have the app reporting a run the board had already forgotten — the two
+    surfaces disagreeing about a workspace this command exists to reconcile."""
+    root, project, creds_path = run_project
+    park_at_the_gate(root, project, creds_path)
+    server = server_for(creds_path, root=root)
+    server.orchestrator = server._orchestrator("clirun")  # noqa: SLF001
+    server.orchestrator.load("clirun")                    # the console is now holding the run
+
+    server._cmd_discard_run({})  # noqa: SLF001
+    assert server.orchestrator._run is None  # noqa: SLF001
+    assert server.orchestrator.status()["phase"] == "idle"
+
+
+def test_discard_is_a_named_command_the_console_can_answer(tmp_path):
+    """`serve.handle` resolves `_cmd_<type>` by name, so the protocol constant must have a handler —
+    and the handler must reach the *one* engine operation rather than a second implementation. The
+    delegation is asserted by watching the workspace method, not by grepping a string a refactor could
+    rename, and the payload flag is asserted to reach it."""
+    from engine.protocol import CommandType
+
+    assert CommandType.DISCARD_RUN.value == "discard_run"
+    creds_path = creds(tmp_path)
+    server = server_for(creds_path, slug="delegated", root=tmp_path / "projects")
+    seen: dict = {}
+
+    def _spy(*, live: bool = False, include_record: bool = False) -> dict:
+        seen.update(live=live, include_record=include_record)
+        return {"discarded": False, "reason": "spied"}
+
+    server.workspace.discard_run = _spy  # noqa: SLF001 - the delegation is what is under test
+    assert server._cmd_discard_run({"include_record": True})["reason"] == "spied"  # noqa: SLF001
+    assert seen == {"live": False, "include_record": True}
 
 
 # ── the exit-code contract, per new command ──────────────────────────────────

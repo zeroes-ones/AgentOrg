@@ -122,6 +122,7 @@ python3 -m engine.cli --config /path/credentials.json --json doctor
 | `abort --slug s` | **Stop the run.** Keeps its checkpoint — not `decide`, which lets it carry on spending |
 | `reassign --slug s <node> --agent A` | Pin a node to a different agent; the router's refusals still apply |
 | `takeover --slug s <node>` | Take a node over yourself, so its artifact records a human producer |
+| `discard --slug s` | **Clear a settled run.** Moves its two checkpoints into `.agent_state/discarded/` — not `abort`, which stops a run still going. `--include-record` moves the trace, handoffs, ledger, goal and cache too |
 | `subagents list --slug s` | *What children did it start?* The bounded frames the parent saw |
 | `subagents result <child> --slug s` | Read one child's transcript, a byte range at a time (`--offset`, `--limit`) |
 | `instruct --slug s "…"` | Push guidance into a run (`--constraint` makes it survive every handoff) |
@@ -373,6 +374,7 @@ python3 -m engine.cli instruct --slug booking --constraint "never log a full car
 python3 -m engine.cli abort   --slug booking             # stop it for good, keeping the checkpoint
 python3 -m engine.cli reassign --slug booking dev --agent Alice   # pin a node to another agent
 python3 -m engine.cli takeover --slug booking dev         # do that node yourself
+python3 -m engine.cli discard  --slug booking             # clear a settled run, keeping its record
 python3 -m engine.cli subagents list --slug booking           # the children this run started
 python3 -m engine.cli subagents result sub_1 --slug booking   # read one child's transcript
 ```
@@ -384,6 +386,16 @@ rotation for the rest of the run.
 **`abort` is not `decide`.** `decide` resolves the gate the run is waiting on and the run carries on
 spending; `abort` ends it where it stands. The checkpoint is kept either way, so `activity` still
 shows everything that finished.
+
+**`discard` is neither.** `abort`, `decide`, `reassign` and `takeover` all act on a run *in flight*,
+so a run that has already ended — parked at a gate nobody resolved, or blocked by a guardrail — is
+refused by every one of them with "no run found", and `flow` goes on reporting its stuck node for
+ever. `discard` is the verb for that run. It *moves* the two checkpoints (`run_state.json` and the
+runner's `runner_state.json`) into a timestamped `.agent_state/discarded/<stamp>/`, and the reply
+names the backup path — nothing is deleted, so a person who changes their mind can put it back. The
+record of what happened (the trace, the handoffs, the ledger, the goal and the cache) is **kept**;
+`--include-record` is the separate, explicit way to move that too. A run still in flight is refused,
+because the engine will not move a checkpoint a running node is writing.
 
 ## Running several orgs (the portfolio)
 
