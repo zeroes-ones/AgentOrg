@@ -79,35 +79,65 @@ the exceptions are explicit. The authority lives in two places:
 
 | Level | Setting | Scope |
 |---|---|---|
-| Config | `goal.auto_pass_auto_gates`, `goal.auto_hire_missing`, `goal.persist_auto_hires` | the default a *new* goal inherits |
-| Goal | `GoalPolicy` (`--human-gate`, `--auto-approve/--no-auto-approve`, `--auto-hire/--no-auto-hire`, `--persist-hires`) | what *this* objective may decide |
+| Config | `goal.default_posture` | the posture a *new* goal inherits |
+| Config | `goal.auto_pass_auto_gates`, `goal.auto_hire_missing`, `goal.persist_auto_hires`, `goal.max_rounds` | the narrower switches a new goal inherits beneath it |
+| Goal | `GoalPolicy` (`--posture`, `--auto-approve/…`, `--auto-hire/…`, `--persist-hires`) | what *this* objective may decide |
 
 A goal inherits the config at creation and then owns its copy. Inheriting rather than consulting the
 config live is deliberate: a goal's authority should not change under it because someone edited
 `credentials.json` mid-run.
 
-### What may be passed, and what never
+### The posture: one word for "do I have to be here?"
+
+Three overlapping switches had grown for one question — the config's `auto_pass_auto_gates`, the goal's
+`human_gate`, the goal's `auto_approve` — and none of them answered it directly. So the authority is
+stated once, as the goal's **posture**:
 
 ```
-gate kind        who can pass it                                    why
+posture          who answers each gate
+──────────────────────────────────────────────────────────────────────────────────────────
+unattended       agent gate: the goal, when it has a route
+(default)        policy gate: the goal, only if the config already permits that class
+                 human gate: the goal, with evidence present, on the record  ← this is the change
+supervised       nobody but you, at every gate
+```
+
+`human_gate: true` is kept as a **legacy alias** that resolves to `supervised`, so a `goal.json` written
+by an earlier build — and every existing CLI flag and console control — keeps meaning exactly what its
+owner asked for.
+
+### What may be released, and what may never
+
+```
+gate kind        unattended                          supervised
 ──────────────────────────────────────────────────────────────────────────────────────────────
-human            nobody but you, always                             release / close / spend = terminal
-agent            the goal, when it has a route                       the runner computed the decision
-policy           the goal, when auto_approve                        the config already answered the class
-mystery          nobody                                            a gate this build does not understand
+human            released, if the four guards hold   parked, always
+agent            passed, when it has a route         parked
+policy           passed, only if the config permits  parked
+mystery          refused                             refused
 ```
 
-Three refusals make this a policy rather than a rubber stamp:
+Releasing the *terminal* gate is the decision that lets an unattended goal finish, so it is the most
+guarded path in the engine. Four refusals, each emitting its own reason so the trace names which one
+fired:
 
-- **A terminal gate is never passed.** `kind: human` is the release/close/spend authority. Autonomy
-  does not extend to it, whatever any setting says.
-- **An agent gate with no untried route is left for you.** Approving with nothing to act on advances
-  the graph with no corrective action — the definition of an infinite loop — so it reaches you instead.
-- **An unknown kind defaults to *not* approvable.** The safe polarity for a gate type this build does
-  not understand.
+- **The evidence must be present.** The gate declares `requires`; every requirement must resolve —
+  `<node>.summary` against the run's node records, anything else against the artifact index. A gate
+  that cannot show its evidence parks exactly as it did before autonomy existed. A gate declaring
+  *nothing* is treated as incomplete, never as trivially satisfied.
+- **No safety control may have fired.** A guardrail block or a contract violation is refused outright.
+  Autonomy may decide the work is done; it may not decide that a control which fired was wrong.
+- **No node may be blocked.** A blocked node is a stated, concrete failure, and releasing over it would
+  record "done" against a run that said it could not proceed.
+- **The ledger must accept the record.** The release is written as a decision at the gate's own name.
+  If the ledger refuses it, the run parks rather than releasing unrecorded.
 
-And every automatic decision records `by: goal`, never `by: owner`. "The org passed this" and "you
-passed this" are different facts about a run, and conflating them would make the audit trail lie.
+Beyond those, the two old refusals still hold: an agent gate with no untried route is left for you
+(approving with nothing to act on advances the graph with no corrective action — the definition of an
+infinite loop), and an unknown gate kind is never approvable.
+
+And every automatic decision records `by: goal`, never `by: owner`. "The org released this" and "you
+released this" are different facts about a run, and conflating them would make the audit trail lie.
 
 ### "Create the person if they do not exist"
 
@@ -165,12 +195,19 @@ disagree about who is working on what.
 - **The board does not predict.** It reports the binding that was made and the handoff that was
   recorded. A node nobody has reached has no owner, and the board says so rather than showing the
   agent who *would* be chosen.
-- **Autonomy is per goal, not global.** There is no "make everything autonomous everywhere" switch.
-  The config sets the default a goal inherits; the goal owns its own authority. A global switch would
-  make "this one objective, with you involved" impossible to express.
+- **Autonomy is per goal, not global.** The config sets the posture a goal inherits; the goal owns its
+  own authority. A global switch would make "this one objective, with you involved" impossible to
+  express — and `supervised` is that floor, in one word, asserted by `check_autonomy_floor` rather
+  than documented.
 - **Auto-hiring does not recurse.** A helper created to fill a gap cannot itself create another; the
   delegation desk's depth cap and the tier ceiling (`goal.auto_hire_max_tier`) both still apply. The
   gaps are filled once, from the plan's own skill list.
+- **The tier ceiling bounds a real classification, not a label.** The helper the engine creates reads
+  anywhere in the project and writes inside it, which the delegation desk's own `classify_tier` scores
+  as the safest tier — so the default cap admits it and auto-staffing works. A helper that would land
+  above the cap is not created: the gap is reported to you with the tier it would have reached and the
+  reason, so it arrives as work to staff rather than as a silent hire. Because the cap is computed from
+  the same capability definition the helper is created with, the two cannot drift apart.
 - **The default is one pair, not a policy per role.** Per-agent binding (`hire --provider --model`,
   the People panel) is how you make a reviewer run on a different model; `defaults` is the *floor*
   everything else inherits.
@@ -181,10 +218,12 @@ disagree about who is working on what.
 |---|---|
 | `DefaultsConfig`, `Config.default_pair` | `engine/config.py` |
 | `set_defaults`, `set_autonomy` (atomic, `0600`) | `engine/config.py` |
-| `[goal]` autonomy settings | `engine/config.py` |
-| `GoalPolicy`, `Goal.policy` | `engine/goal.py` |
-| `_auto_pass`, `_auto_staff`, `prepare(auto_staff=…)` | `engine/orchestrator.py` |
+| `[goal]` posture, autonomy settings and `max_rounds` | `engine/config.py` |
+| `Posture`, `GoalPolicy`, `Goal.policy` | `engine/goal.py` |
+| `_auto_pass`, `_release_terminal_gate`, `_gate_evidence`, `_auto_staff`, `prepare(auto_staff=…)` | `engine/orchestrator.py` |
+| `CacheStore` (durable prefix/shape/savings) | `engine/cachestore.py` |
 | `build_flow`, `FlowRow`, `FlowHandoff` | `engine/flow.py` |
+| `Handoff` + `validate_handoff` (the typed contract, now on every edge) | `engine/org/handoff.py`, `engine/executor.py` |
 | `defaults`, `flow`, `defaults_set`, `autonomy_set` | `engine/cli.py`, `engine/serve.py`, `engine/protocol.py` |
-| The **Flow** panel, the **Defaults** editor, the goal autonomy controls | `macos/Sources/AgentOrg/` |
-| Tests | `tests/test_phase28_defaults_autonomy_flow.py` |
+| The **Flow** panel, the **Defaults** editor, the goal posture controls | `macos/Sources/AgentOrg/` |
+| Tests | `tests/test_phase28_defaults_autonomy_flow.py`, `tests/test_phase29_handoff_wiring.py`, `tests/test_phase30_cachestore.py` |

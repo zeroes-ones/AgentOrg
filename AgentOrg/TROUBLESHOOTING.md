@@ -219,12 +219,21 @@ git status                     # see what changed
 git diff skills-flat/code-reviewer/SKILL.md
 ```
 
-**Fix:** review the change, then re-pin deliberately (rebuild the manifest). Do not disable the check
-— it exists because prompt content is a real attack surface.
+**Fix:** review the change, then re-pin deliberately. Do not disable the check — it exists because
+prompt content is a real attack surface.
+
+```bash
+cd /path/to/Skills && git diff                # after reviewing the change
+python3 -m engine.cli skills pin              # records the new baseline
+```
 
 ### `library commit mismatch: expected …, found …`
 
-The checkout moved. Same reasoning: review the change, then re-pin.
+The checkout moved. Same reasoning: review the change, then re-pin with `skills pin`.
+
+A `content unpinned` in `doctor` is *not* this failure: it means no pin has been recorded for this
+checkout yet, so only the runner's capability surface was checked. Record one with
+`python3 -m engine.cli skills pin`.
 
 ### `workflow-runner.py is missing CLI capabilities AgentOrg depends on: --guardrail`
 

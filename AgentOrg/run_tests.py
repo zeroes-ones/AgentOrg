@@ -93,6 +93,31 @@ def _fixture_cache_for(module: Any) -> dict[str, Any] | None:
     return cache
 
 
+def _scratch_base(project: pathlib.Path) -> str | None:
+    """Where per-test scratch directories go: outside the checkout, always.
+
+    Returns `None` to let `tempfile` choose, which is right whenever the temp dir is already outside
+    the project. When it is *inside*, a fixed system location is returned instead, because the
+    alternative is what actually happened: a suite run with `TMPDIR` pointing into the repository
+    wrote one scratch directory per test *into the repository* — 819 of them, which then read as
+    untracked changes and buried the real diff. A test harness that litters the tree it is testing is
+    worse than a slow one, because the mess is indistinguishable from work in progress.
+    """
+    import tempfile
+
+    resolved = pathlib.Path(tempfile.gettempdir()).resolve()
+    project = project.resolve()
+    try:
+        resolved.relative_to(project)
+    except ValueError:
+        return None                      # outside the checkout: the normal, correct case
+    for fallback in ("/tmp", "/var/tmp"):
+        candidate = pathlib.Path(fallback)
+        if candidate.is_dir():
+            return str(candidate)
+    return None                          # nothing safer to offer; accept the caller's temp dir
+
+
 def _resolve(name: str, module: Any, fixtures: dict[str, Any], tmp_root: pathlib.Path,
              monkeypatch: Any = None, per_test: dict[str, Any] | None = None) -> Any:
     """Resolve one fixture argument for a test function.
@@ -107,8 +132,14 @@ def _resolve(name: str, module: Any, fixtures: dict[str, Any], tmp_root: pathlib
         if "__tmp_path__" not in cache:
             import tempfile
 
+            # `TMPDIR` is honoured when it points somewhere sane, but a suite that ran with `TMPDIR`
+            # set inside the checkout left 819 `agentorg-test_*` directories in the repository — one
+            # per test — where they showed up as untracked debris in every `git status`. A test
+            # scratch directory belongs in the system temp area or nowhere, so a base that resolves
+            # inside the project is refused in favour of the real temp dir.
+            base = _scratch_base(tmp_root)
             cache["__tmp_path__"] = pathlib.Path(
-                tempfile.mkdtemp(prefix=f"agentorg-{tmp_root.name}-"))
+                tempfile.mkdtemp(prefix=f"agentorg-{tmp_root.name}-", dir=base))
         return cache["__tmp_path__"]
     if name == "monkeypatch":
         return monkeypatch
@@ -266,6 +297,21 @@ def run_file(path: pathlib.Path, *, quiet: bool = False,
                 if not quiet:
                     print(f"  SKIP {label}: {exc}")
             except Exception as exc:  # noqa: BLE001 - a failed test is data, not a crash
+                # A skip must not be reported as a failure. `run_tests._Skip` is raised by this
+                # runner when a fixture cannot be resolved, but a test that calls `pytest.skip()`
+                # raises the *shim's* own `Skipped` — a different class, so it fell through to here
+                # and was counted as FAILED. The two spellings mean the same thing: the test chose
+                # not to run, and that is not a defect in the code under test.
+                #
+                # Matched by identity against the shim's class rather than by the name "Skipped",
+                # because a name test would also swallow an unrelated exception that happened to be
+                # called `Skipped` — turning a genuine failure into a silent skip, which is the exact
+                # failure mode this runner exists to avoid.
+                if isinstance(exc, getattr(pytest_shim, "Skipped", ())):
+                    passed += 1
+                    if not quiet:
+                        print(f"  SKIP {label}: {exc}")
+                    continue
                 failed += 1
                 report = (
                     f"FAIL {label}\n"

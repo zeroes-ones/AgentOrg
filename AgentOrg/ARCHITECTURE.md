@@ -143,7 +143,7 @@ This is the useful part of the map: when a rule matters, exactly one layer is re
 
 | Layer | Owns | Enforced by |
 |---|---|---|
-| `library.py` | The skill corpus cannot change under us | Commit pin + a 445-file content manifest |
+| `library.py` | The skill corpus cannot change under us | A recorded commit + content-manifest pin, compared on every resolve; the engine reports which of the two facts it actually checked |
 | `config.py` | No secret reaches a log or a file | Env-first resolution, a redactor, a leak scan; a provider write merges one entry, sets `0600` before the secret, and never creates the file |
 | `protocol.py` | The engine and the app cannot silently disagree | A versioned schema; unknown types tolerated, malformed frames refused |
 | `state.py` / `artifacts.py` | No torn write, no path escape | Temp + `os.replace`, resolved-path containment |

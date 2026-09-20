@@ -332,7 +332,7 @@ python3 -m engine.cli doctor
 
 ```
 OK   configuration   credentials.json with 5 providers
-OK   skills library  /path/to/Skills at commit 8fbfda61
+OK   skills library  /path/to/Skills at commit 8fbfda61016b — capabilities checked; content unpinned
 OK   skill bundles   327 skills parsed with criteria and checklists
 OK   providers       built ['lmstudio', 'ollama']; skipped 3
 OK   machine         10 cpus, 32.0 GB, ceiling 9 (cpu-bound only)
@@ -367,6 +367,15 @@ python3 -m engine.cli activity --project ~/code/my-app
 # Who is working on what: every unit of work, its owner, its handoffs and progress.
 python3 -m engine.cli flow --project ~/code/my-app
 
+# Every run this projects root holds; hand one over, or branch it to try an alternative.
+python3 -m engine.cli session list
+python3 -m engine.cli session export --slug my-app -o my-app.zip
+python3 -m engine.cli session fork --slug my-app --to my-app-alt
+
+# Start work on a timer — a fired run that ends parked disables its own entry rather than looping.
+python3 -m engine.cli schedules add --slug my-app --goal "close the open findings" --every 6h
+python3 -m engine.cli schedules watch
+
 # What model does everyone run on? And how autonomous is a goal by default?
 python3 -m engine.cli defaults
 ```
@@ -379,13 +388,20 @@ bindings — so you know what to hire before a run rather than discovering it mi
 the built-in company, every hire you make, and every helper the engine creates for you all inherit it
 unless you bind them to something else. `defaults set --provider P --model M` changes it in one
 command (merging, never replacing — your keys and policy survive), and `defaults autonomy
---no-auto-gates` sets how autonomous a new goal is.
+--posture supervised` sets how autonomous a new goal is.
 
-**A goal is autonomous unless you chose otherwise.** Arming a goal is standing authority to pass the
-gates the *org* can decide and to create the person a missing skill needs — on the default model,
-ephemeral by default, so a plan never parks three nodes in on a roster accident. A **terminal** gate
-(a release, a close, a spend) is never passed: that stays yours. Add `--human-gate` to a goal, or flip
-the switch in the app's Work panel, when you want to be involved.
+**A goal is unattended unless you chose otherwise.** Arming a goal is standing authority to answer the
+gates it can answer and to create the person a missing skill needs — on the default model, ephemeral by
+default, so a plan never parks three nodes in on a roster accident. That includes the **terminal** gate,
+which is what lets a long goal actually finish with nobody watching — but only with the gate's evidence
+present, never after a guardrail or contract failure, never over a blocked node, and always recorded in
+the decision ledger as the *goal's* decision rather than yours. Set `--posture supervised` on a goal,
+or flip the picker in the app's Work panel, and every gate waits for you exactly as before.
+
+**What crosses between agents is contract-checked.** Every node edge produces a typed handoff — nine
+required fields, eight mechanical rules — which is validated, persisted to `.agent_state/handoffs/`,
+emitted as trace events, and recorded in the ledger. `flow` shows those crossings; a refused payload
+becomes a rework iteration with the rule that fired named, never a crash.
 
 **Who is working on what.** `flow` is the board: one row per unit of work with its owner, what came in
 from which agent, what went out to whom, and why it stopped if it did. It reads what the engine already
@@ -453,7 +469,7 @@ So each scenario names an invariant the system promises and the reason it matter
 | `constraint-survival` | A `NEVER` rule survives compaction, rotation and re-pinning |
 | `reviewer-independence` | A reviewer is never the producer of the artifact it judges |
 | `delegation-safety` | S1–S5 refuse their violations; least privilege and lineage hold |
-| `autonomy-floor` | No single setting can silently disable every human gate |
+| `autonomy-floor` | No single setting can silently disable every human gate — including the `supervised` posture |
 | `rotation-refuses-when-impossible` | An irreducible overflow is refused, not looped on |
 | `diagnostics-refuses-secrets` | A shared bundle never carries a credential |
 | `idempotent-effects` | A retried effect is not applied twice, while a rework is |
@@ -695,5 +711,6 @@ of it.
 ## Licence
 
 The engine is original work. The skills it consumes are MIT-licensed by their author
-(Sandeep Kumar Penchala) and remain their property; AgentOrg pins a specific commit and verifies its
-content hashes rather than vendoring it.
+(Sandeep Kumar Penchala) and remain their property; AgentOrg does not vendor them. Record a pin
+with `python3 -m engine.cli skills pin`, and every later run checks the library's commit and
+content hashes against it — refusing to start rather than running prompt content that changed.

@@ -21,6 +21,7 @@ If you have not installed it yet, start with [README.md](README.md). If somethin
 - [Isolated subagents](#isolated-subagents)- [Reading a run](#reading-a-run)
 - [Working with skills](#working-with-skills)
 - [Working with models](#working-with-models)
+- [Using the machine yourself: `system`](#using-the-machine-yourself-system)
 - [Approving and intervening](#approving-and-intervening)
 - [Doing this efficiently](#doing-this-efficiently)
 - [Common tasks, by intent](#common-tasks-by-intent)
@@ -97,6 +98,7 @@ python3 -m engine.cli --config /path/credentials.json --json doctor
 | `doctor` | *Why will this not start?* Checks seven preconditions and names each failure |
 | `skills list` | *What can the org do?* Every skill with its criteria and checklist counts |
 | `skills show <name>` | *What will an agent bound to this be held to?* The contract, checklist, research gate |
+| `skills pin` | *Has the library changed since I reviewed it?* Record its commit and file hashes; every later run refuses a mismatch |
 | `models` | *What can I bind?* Every model with its window and its provenance |
 | `models --refresh` | Re-probe providers, bypassing the cache |
 | `defaults` | *What model does everyone run on?* The effective default pair, why, and the default autonomy |
@@ -117,12 +119,26 @@ python3 -m engine.cli --config /path/credentials.json --json doctor
 | `mission set/status/start/advance/mark` | The standing purpose above the goal: objectives worked one at a time |
 | `portfolio init/add/status/run/…` | The person and the several orgs they run; `--org` scopes any command to one org |
 | `decide --slug s --approve` | Resolve a gate: continue past it (`--reject --note "…"` parks instead) |
+| `abort --slug s` | **Stop the run.** Keeps its checkpoint — not `decide`, which lets it carry on spending |
+| `reassign --slug s <node> --agent A` | Pin a node to a different agent; the router's refusals still apply |
+| `takeover --slug s <node>` | Take a node over yourself, so its artifact records a human producer |
+| `subagents list --slug s` | *What children did it start?* The bounded frames the parent saw |
+| `subagents result <child> --slug s` | Read one child's transcript, a byte range at a time (`--offset`, `--limit`) |
 | `instruct --slug s "…"` | Push guidance into a run (`--constraint` makes it survive every handoff) |
 | `chat` | *Talk to a model, or to the org.* A conversational loop; `/help` lists the commands |
 | `chat -m "…"` | One shot: send a message and exit, for scripting |
 | `chat --agent Sana` | Answer as a named agent, on that agent's model |
 | `hire <name> --skill s` | *Create an agent.* Persisted to your root; `run` then uses it |
 | `agents` | *Who do I actually have?* The built-ins plus every hire, and where they came from |
+| `agent update <name> --title "…"` | *Change an agent.* Keeps its id, so its history and bindings stay intact |
+| `agent retire <name>` | *Remove an agent.* Refused for the Owner, or while its reports are working |
+| `providers list` | *What endpoints are configured?* Reachability and model counts; never a key |
+| `providers add <id> --base-url U` | Add or replace one endpoint, then re-read the config in place |
+| `providers test <id> --base-url U` | Probe an entry before saving it; a failed probe is an answer, not a refusal |
+| `providers remove <id>` | Remove one endpoint, pruning the defaults and limits that named it |
+| `improve` | Run one self-improvement cycle — it drafts, proves and **stops**. Nothing is applied |
+| `improve --dry-run` | The findings it measured, with nothing drafted |
+| `proposals` | What the loop has proposed and what it refused — nothing applied, ever |
 | `skills new <name>` | *Author a skill.* Writes an enforceable SOP you can then bind an agent to |
 | `pool add "…" --skill s` | *Offer work.* Capability-routed work an agent pulls rather than is pushed |
 | `pool list --slug s` | *What is queued?* Counts and tasks by state |
@@ -152,7 +168,7 @@ which capabilities the plan needs that nobody holds, and which agent would take 
 
 ```
 OK   configuration   credentials.json with 5 providers
-OK   skills library  /path/to/Skills at commit 8fbfda61
+OK   skills library  /path/to/Skills at commit 8fbfda61016b — capabilities checked; content unpinned
 OK   skill bundles   327 skills parsed with criteria and checklists
 OK   providers       built ['lmstudio', 'ollama']; skipped 3
 OK   machine         10 cpus, 32.0 GB, ceiling 9 (cpu-bound only)
@@ -169,6 +185,29 @@ are configured but unusable — usually a missing API key, and the fix is named:
 
 `ceiling 9 (cpu-bound only)` is the concurrency the machine was measured to support. The reason is
 printed because "why only four agents?" should be answerable without reading source.
+
+### Which integrity check ran
+
+The library line reports two different facts, and they are never merged into the word "verified":
+
+- **capabilities checked** — the paths resolved and `workflow-runner.py` carries every flag this
+  engine passes it. This is the only claim a run with no pin can make.
+- **content pin** — the commit and/or every file hash was compared against a recorded pin.
+
+With no pin recorded the line ends in `content unpinned`, which is the honest description of a
+checkout nobody has pinned. To record one:
+
+```
+python3 -m engine.cli skills pin                 # writes <engine repo>/.library-pin.json
+python3 -m engine.cli skills pin --out /tmp/p.json
+```
+
+Every later run then compares against it and refuses to start on a changed file, naming the paths.
+The pin is looked for at `--library-pin <path>`, then `$AGENTORG_LIBRARY_PIN`, then
+`<engine repo>/.library-pin.json` — absent by default, so a fresh checkout still runs. A pin that
+names a different checkout is reported (`pin not applied`) rather than enforced, because refusing
+every run on a second machine over a pin that never described that tree is not a check, it is an
+outage.
 
 ## Hiring: how an agent is defined
 
@@ -331,11 +370,20 @@ python3 -m engine.cli decide  --slug booking --approve    # continue past the ga
 python3 -m engine.cli decide  --slug booking --reject --note "auth spec is missing rate limits"
 python3 -m engine.cli instruct --slug booking "use UTC everywhere"
 python3 -m engine.cli instruct --slug booking --constraint "never log a full card number"
+python3 -m engine.cli abort   --slug booking             # stop it for good, keeping the checkpoint
+python3 -m engine.cli reassign --slug booking dev --agent Alice   # pin a node to another agent
+python3 -m engine.cli takeover --slug booking dev         # do that node yourself
+python3 -m engine.cli subagents list --slug booking           # the children this run started
+python3 -m engine.cli subagents result sub_1 --slug booking   # read one child's transcript
 ```
 
 `--reject` records the note so agents do not re-attempt identically, and `--constraint` makes the
 text non-negotiable: the AR-04 machinery then preserves it verbatim across every later compaction and
 rotation for the rest of the run.
+
+**`abort` is not `decide`.** `decide` resolves the gate the run is waiting on and the run carries on
+spending; `abort` ends it where it stands. The checkpoint is kept either way, so `activity` still
+shows everything that finished.
 
 ## Running several orgs (the portfolio)
 
@@ -488,39 +536,56 @@ Three things to know, because they are the whole safety argument:
 
 ### Autonomy: a human is involved only if you choose one
 
-By default a goal is **autonomous**. Arming it is standing authorisation to:
+By default a goal is **unattended** — it can finish with nobody watching. The authority is one word,
+the goal's **posture**:
 
-- **pass the gates the org can decide** — the bounded-reroute *agent* gate, and a policy route class
-  the config already answered. A **terminal** gate is *never* passed: a release, a close, or a spend
-  is always yours, whatever the setting says.
+| Posture | What the goal may answer |
+|---|---|
+| `unattended` (default) | the bounded-reroute **agent** gate; a **policy** route class the config already answered; and the **terminal** gate — but only with its evidence present, never after a guardrail or contract failure, and always recorded in the decision ledger |
+| `supervised` | nothing. Every gate parks for you. |
+
+Arming a goal is also standing authorisation to:
+
 - **create a person when a skill is missing.** A plan that needs a capability nobody holds gets a
   helper on the default model, so it does not park three nodes in on a roster accident.
 
-You narrow it per goal, and the config sets the default a new goal inherits:
+A terminal-gate release is the one decision that lets a goal *finish* alone, so it is guarded four
+ways: the gate's declared evidence must be **present**, no guardrail block or contract violation may
+have fired, no node may have ended **blocked**, and the release must be **recordable in the ledger**.
+If any of those fails, the gate parks for you exactly as it always did — and the trace says which one.
+
+You narrow it per goal, and the config sets the posture a new goal inherits:
 
 ```bash
-# A goal that decides its own gates and staffs its own gaps (the default):
+# A goal that finishes alone (the default):
 python3 -m engine.cli goal set "Harden the auth flow" --project ~/code/my-app
 
 # A goal that stops at *every* gate — you decide, the org does not:
-python3 -m engine.cli goal set "Ship the release" --human-gate --project ~/code/my-app
+python3 -m engine.cli goal set "Ship the release" --posture supervised --project ~/code/my-app
 
-# Narrow just one thing:
+# The same choice, stated on a run instead:
+python3 -m engine.cli run --goal "Ship the release" --posture supervised --project ~/code/my-app
+
+# Narrow just one thing, keeping the posture:
 python3 -m engine.cli goal set "…" --no-auto-hire --project ~/code/my-app
 
-# The config default, for every goal that does not say otherwise:
-python3 -m engine.cli defaults autonomy --no-auto-gates
+# The posture every goal inherits unless it says otherwise:
+python3 -m engine.cli defaults autonomy --posture supervised
 python3 -m engine.cli defaults autonomy --persist-hires
 ```
 
-`goal status` reports what the active goal chose, so "why did it pass that gate" always has an answer:
+`goal status` reports what the active goal chose, so "why did it release that gate" always has an
+answer:
 
 ```
+  posture   : unattended  (the goal answers its own gates)
   autonomy  : gates=auto  gaps=auto  hires=ephemeral
 ```
 
-In the app, the **Work** panel shows the same line under the goal, with a one-click **Human gate on**
-switch — the escape hatch when you want to be involved from here on.
+`--human-gate` is still accepted as an older spelling of `--posture supervised`.
+
+In the app, the **Work** panel shows the same line under the goal, with a posture picker — the escape
+hatch when you want to be involved from here on.
 
 **An auto-created person is ephemeral by default.** It does the work and leaves no roster entry to
 clean up. With `--persist-hires` (or `defaults autonomy --persist-hires`) it is written to the roster
@@ -596,7 +661,9 @@ The **People** tab is the roster — the built-in company, the Owner, and the ag
 - **Edit** changes the model, level, team or title. It **keeps the agent's id**, which is what the
   mailbox, session history, ledger entries and health record are keyed on — so "I only changed the
   model" does not look like a brand-new employee with no past.
-- **Retire** removes the agent. The Owner cannot be retired: it holds terminal authority.
+- **Retire** removes the agent. The Owner cannot be retired: it holds terminal authority. The
+  termination is recorded: the roster keeps a `retired` entry with the agent's id, name, the reason
+  you gave (`--reason`) and the time, so the decision outlasts the agent.
 - A name is only re-sent when you change it, so a model-only edit cannot fail because another agent
   already holds that name.
 
@@ -605,8 +672,31 @@ From the CLI the same operations are:
 ```bash
 python3 -m engine.cli agents                       # the roster, with who is hired vs built-in
 python3 -m engine.cli hire --name Nadia --skill code-reviewer --model ollama/qwen2.5-coder:7b
+python3 -m engine.cli agent update Nadia --level staff --title "Staff Reviewer"
+python3 -m engine.cli agent retire Nadia --reason "trial period over"
 python3 -m engine.cli skills list | head           # the skill names to choose from
 ```
+
+And the provider editor, outside the app:
+
+```bash
+python3 -m engine.cli providers list                                  # reachability; never a key
+python3 -m engine.cli providers test groq --base-url https://api.groq.com/openai/v1
+python3 -m engine.cli providers add  groq --base-url https://api.groq.com/openai/v1 \
+                                   --key-env GROQ_API_KEY
+python3 -m engine.cli providers remove groq
+```
+
+`providers test` reports an unreachable endpoint as an *answer*, not a refusal: the values may be
+right and the host down, and you are the one who knows which. Only `add` writes, and it merges that
+one entry — every other provider, the model windows and the policy block are left alone.
+
+`providers remove` prunes the references that named the provider, in the same write: a
+`per_provider_limits` entry, `defaults.provider` and `defaults.reviewer.provider`. It **refuses to
+remove the last one** — the loader requires at least one provider, so the document it would leave
+could not be read by the next launch. Add the replacement first, then remove this one. Agents hired
+onto an endpoint keep that binding and simply stop being callable; the console names them after the
+removal.
 
 Hires are written to `<project>/.agentorg/roster.json`, and the built-in company is deliberately
 *not* frozen into that file — otherwise a later change to the defaults would be silently shadowed by a
@@ -760,6 +850,48 @@ Two behaviours worth knowing:
 - **Each provider lists only models it can serve.** `gpt-4o` appears under OpenAI, not under
   Anthropic. Offering a model a provider cannot serve wastes your time and then fails at call time.
 
+## Using the machine yourself: `system`
+
+Everything an agent may do on this Mac, you can do from the terminal — through the **same tools and
+the same gate**. There is one implementation of "set the volume", not two, which is the only way the
+two can be guaranteed to agree about what is permitted.
+
+```bash
+python3 -m engine.cli system list                    # what exists, what each grant reaches, what it changes
+python3 -m engine.cli system state                   # battery, disk, uptime, running apps
+python3 -m engine.cli system clipboard               # read the clipboard
+python3 -m engine.cli system clipboard --stdin       # replace it (stdin keeps it out of `ps`)
+python3 -m engine.cli system screenshot --path shot.png
+python3 -m engine.cli system volume                  # read the volume
+python3 -m engine.cli system volume --set 30         # change it (asks once)
+python3 -m engine.cli system open Safari             # launch an allowlisted app
+python3 -m engine.cli system automation --file drive.applescript
+python3 -m engine.cli system consent list            # what this holder has approved
+```
+
+Every command takes `--json` for a machine-readable answer, and the commands that change something need
+your approval first, once per tool:
+
+```bash
+python3 -m engine.cli system consent grant --tool set_volume     # approve one tool
+python3 -m engine.cli system consent revoke --tool set_volume    # take it back
+```
+
+Two things are worth knowing about how this behaves:
+
+- **The exit code tells a refusal from a failure.** `0` ran and worked, `1` ran and failed, `2` was a
+  usage error, and **`3` means the engine would not allow it** — no grant, no approval, or an allowlist.
+  A script should not retry a `3`; nothing will change until you change something.
+- **A refusal names the next move.** It prints the grant or the gate it needed, who it was acting as,
+  and the exact command that fixes it — so "it didn't work" is never the whole of what you are told.
+
+`system list` renders the *engine's own* description of each capability (`syscap`), the same words the
+app's System panel shows, so the terminal and the window cannot disagree about what a switch does. The
+grants themselves are declared in the `system` block of `credentials.json` — see `OPERATIONS.md`.
+
+`system call <tool> --arg key=value` reaches any tool in the engine's catalogue by name, which means a
+new capability is usable from the terminal the day it is built.
+
 ## Seeing who is working on what
 
 `activity` is a *story* — what happened, in order. `flow` is a *board* — one row per unit of work,
@@ -803,14 +935,26 @@ You hold terminal authority. During a run:
 
 | You want to | Effect |
 |---|---|
-| **Approve** a gate | The run continues past it |
+| **Approve** a gate | The run continues past it — it keeps spending |
 | **Reject** with a reason | The work returns to the agent, with your reason in its context |
 | **Instruct** | Guidance is injected into the running agent's context without stopping the run |
 | **Inject a constraint** | A new `non_negotiable` constraint, which then survives every later handoff |
 | **Reassign** | Move a task to a different agent — the manual form of the router's job |
 | **Take over** | Act as the agent yourself, then hand back or forward |
 | **Force a route** | Decide when the router finds no confident match |
-| **Abort / park** | Stop a run, keeping the checkpoint for a resume |
+| **Abort** | **Stop the run.** The checkpoint is kept, so a resume remains possible |
+
+Each of those is a command, not a panel:
+
+```bash
+python3 -m engine.cli decide   --slug booking --approve        # continue past the gate
+python3 -m engine.cli abort    --slug booking                  # stop it
+python3 -m engine.cli reassign --slug booking dev --agent Ana  # pin a node to another agent
+python3 -m engine.cli takeover --slug booking dev              # do it yourself
+```
+
+**`decide` and `abort` are different, and the difference costs money.** Approving a gate on the way to
+stopping pays for the work behind it; aborting ends the run where it stands. Choose deliberately.
 
 A human action is recorded the same way as an automated one — same contract, same ledger, same audit
 trail — because the Owner is modelled as an agent, not as a special case. So "who changed this?" has a

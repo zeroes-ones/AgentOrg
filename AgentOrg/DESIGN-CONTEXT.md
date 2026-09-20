@@ -114,6 +114,26 @@ Two rules are **non-negotiable in code**, not prompts:
 - **AR-05 — turn boundaries only.** Compaction and rotation happen only between
   turns, after a state-ledger checkpoint. Never during active generation.
 
+### Cache-aligned eviction (`context/cachealign.py`)
+
+A provider reuses a request only up to its **first changed byte**, so removing a
+turn from the middle of the log invalidates every turn after it and the engine
+re-pays for bytes it already sent. Eviction therefore removes one **contiguous
+run** of evictable turns rather than scattered ones, so what remains still begins
+with the bytes that were sent. Two consequences:
+
+- The staleness score still chooses *which* run goes — a cheap adjacent pair beats
+  an expensive single turn — so priority-based eviction is preserved. Alignment
+  constrains only the **shape** of the removal.
+- When the durable `CacheStore` reports this prefix **warm**, the run that leaves
+  the longest byte-identical head is preferred; with no warm signal, attention
+  leads and the oldest qualifying run breaks the tie. A compaction that breaks a
+  warm prefix is recorded attributably (`invalidated_prefix`), naming the prefix
+  hash and the character at which the cut fell, rather than being silent.
+
+AR-04 is unaffected: protected turns are absent from the candidate list, so a run
+cannot straddle one, and the pin-count guard still reverts the whole compaction.
+
 ## 6. Rotation triggers and guards
 
 | Trigger | Condition | Why |
@@ -207,7 +227,9 @@ accidental skill self-loop, not a deliberate context renewal.
 ## 10. Events and configuration
 
 **Events:** `session.open` · `session.saturation{saturation, band, projected}` ·
-`session.compact{tier, evicted, preserved_verbatim}` ·
+`session.compact{tier, evicted, preserved_verbatim, aligned, prefix_chars_kept}` ·
+`session.cache_invalidated{prefix_hash, skill, prefix_chars_kept, reason}` ·
+`prefix.drift{skill, reasons, pinned, current}` · `prefix.resumed{skill, prefix}` ·
 `session.rotate.requested{reason, saturation}` · `session.sealed{checksum}` ·
 `session.handoff.verified` · `session.closed` · `context.irreducible_overflow` ·
 `attention.decay{turns, weight}`

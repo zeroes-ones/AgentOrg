@@ -1,0 +1,122 @@
+name: what-was-idea-and-how-to-capture-the-market
+version: "1.0.0"
+description: What was idea and how to capture the market
+payloads:
+  handoff-v1:
+    - status
+    - summary
+    - artifacts
+    - decisions
+    - open_questions
+    - verification_evidence
+    - context
+    - budget
+    - next
+start: pm
+nodes:
+  - id: pm
+    skill: product-manager
+    phase: DISCOVER
+    max_iterations: 1
+    tools: true
+    inputs:
+      - market-context
+    outputs:
+      - product-spec
+  - id: pmm
+    skill: marketing-manager
+    phase: DESIGN
+    max_iterations: 1
+    tools: true
+  - id: growth
+    skill: growth-engineer
+    phase: BUILD
+    max_iterations: 1
+    tools: true
+    inputs:
+      - product-spec
+      - funnel-data
+    outputs:
+      - growth-plan
+  - id: content
+    skill: content-strategist
+    phase: BUILD
+    max_iterations: 1
+    tools: true
+  - id: analyst
+    skill: product-analyst
+    phase: REVIEW
+    max_iterations: 1
+  - id: critic
+    skill: critical-thinker
+    phase: VERIFY
+    max_iterations: 1
+gates:
+  - id: reroute-gate
+    type: gate
+    kind: agent
+    pool:
+      - analyst
+      - critic
+      - content
+    max_reroutes: 2
+    escalate_to: human-gate
+    description: "Bounded reroute: on exhaustion, identify the channel best placed to fix the shortfall and grant one fresh pass (at most twice) before escalating to the Owner."
+  - id: human-gate
+    type: gate
+    kind: human
+    requires:
+      - analyst.summary
+      - critic.summary
+    description: "Owner decision: the deliverable is accepted once the verification loop converges, or the escalation report is reviewed when automation exhausted its budget. Nothing downstream (a build, a launch, a spend) proceeds without this."
+edges:
+  - from: pm
+    to: pmm
+    when: pm.status == done
+    payload: handoff-v1
+  - from: pmm
+    to: growth
+    when: pmm.status == done
+    payload: handoff-v1
+  - from: growth
+    to: content
+    when: growth.status == done
+    payload: handoff-v1
+  - from: content
+    to: analyst
+    when: content.status == done
+    payload: handoff-v1
+  - from: content
+    to: critic
+    when: content.status == done
+    payload: handoff-v1
+  - from: analyst
+    to: human-gate
+    when: analyst.status == done
+    payload: handoff-v1
+  - from: critic
+    to: human-gate
+    when: critic.status == done
+    payload: handoff-v1
+loops:
+  - id: review-fix-loop
+    nodes:
+      - analyst
+      - critic
+      - content
+    exit_when: analyst.verdict == pass
+    max_iterations: 3
+    escalate_to: reroute-gate
+    convergence:
+      window: 2
+      require_delta: true
+end:
+  - human-gate
+parallel:
+  - id: reviewers
+    nodes:
+      - analyst
+      - critic
+    join: all
+    outputs:
+      - review-findings

@@ -390,6 +390,74 @@ idle colleague could have done, which is how token-per-task climbs silently.
 T0 makes a temporary, reversed-by-nature hire free of ceremony. T3 makes a `deploy:` capability a
 deliberate decision, because that is the one that can affect something outside the run.
 
+### Letting agents act on the Mac
+
+Everything above confines an agent to a project. `[system]` is the other question — may it read the
+battery, use the clipboard, take a screenshot, change the volume, open an application, run an
+AppleScript. It is **off by default**, and turning it on grants nothing: it only makes the tools
+offerable.
+
+```toml
+[system]
+enabled = true                 # the operator's switch; grants nothing by itself
+allow_apps = ["Safari"]        # applications `open_app` may launch. Empty = none
+allow_automation = ["mail"]    # AppleScript handler prefixes. Empty = none
+screenshot_dir = ""            # default: inside the workspace
+max_seconds = 20               # a command parked on a dialog is stopped, not awaited
+allow_full_access = false      # see below
+```
+
+Then grant per agent — the capability is the scope, and a sibling grant never implies another:
+
+```bash
+engine.cli hire SysOp --skill backend-developer \
+  --capability "read:*" --capability "system:state" --capability "system:screenshot"
+```
+
+| Grant | Reaches |
+|---|---|
+| `system:state` | battery, disk, uptime, running apps — read-only |
+| `system:clipboard` | read and write the clipboard |
+| `system:screenshot` | capture into the workspace |
+| `system:media` | volume, mute |
+| `system:open` | launch an application named in `allow_apps` |
+| `system:automation` | run an AppleScript handler matching `allow_automation` |
+
+**Two gates, not one.** The allowlist is the *scope* of the grant, and a state-changing action
+additionally needs the Owner's consent **once per agent per tool**, recorded in the decision ledger.
+An agent cannot grant itself consent — `grant_consent` refuses a `by` that names an agent, which makes
+that a property of the code rather than a convention. Granting consent does not widen an allowlist;
+they are independent answers.
+
+#### Full access
+
+Both reference agents ship a mode where the agent simply is not interrupted — Reasonix's
+`--permission-mode bypassPermissions` with `sandbox = false`, Kimi's `--auto` ("never interrupts you;
+everything runs and is decided automatically"). `system.allow_full_access` is that mode:
+
+```toml
+[system]
+enabled = true
+allow_full_access = true   # no allowlists, no consent prompt
+```
+
+It is right for a machine you have handed over — a build box, a scratch VM, a laptop you are not
+using — and wrong for the one you are working on. What it changes, and nothing more:
+
+- `open_app` may launch any installed application, not only those in `allow_apps`
+- `run_automation` may run any AppleScript, not only allowlisted handlers
+- a state-changing action no longer waits for consent
+
+What it does **not** change: `enabled` is still required, the agent still needs the relevant
+`system:*` grant, every call is still bounded by `max_seconds` and `max_output_bytes`, and every
+action is still recorded. Full access is permission to *act*, never permission to stop being audited
+— a mode that also silenced the record would make the ledger useless exactly where it matters most.
+
+> **It is a second switch, not the default, deliberately.** `allow_apps` answers "which applications
+> may this agent start"; `allow_full_access` answers "do I still want to be consulted at all". A person
+> who wants the first does not thereby want the second, and a single switch for both would leave them
+> no way to say so.
+
 ### Anti-sprawl
 
 `token-per-completed-task` per agent, tracked as the library's own anti-leak metric. Growth without a
