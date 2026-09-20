@@ -333,6 +333,16 @@ class Workspace:
         return self.state_dir / "library_manifest.json"
 
     @property
+    def handoffs_dir(self) -> Path:
+        """`handoffs/` — one JSON document per edge crossing, keyed by the handoff's own id.
+
+        The handoff is the only thing that crosses a node boundary, so it is the one artifact worth
+        keeping per *crossing* rather than per node: a resumed process, or the flow board, can read
+        back exactly what one node handed the next instead of re-deriving it from node summaries.
+        """
+        return self.state_dir / "handoffs"
+
+    @property
     def agents_dir(self) -> Path:
         """`agents/` — one subdirectory per agent (mailbox, sessions)."""
         return self.state_dir / "agents"
@@ -351,6 +361,16 @@ class Workspace:
     def spans_path(self) -> Path:
         """`telemetry/spans.jsonl`."""
         return self.telemetry_dir / "spans.jsonl"
+
+    @property
+    def cache_dir(self) -> Path:
+        """`cache/` — the durable prefix-cache record: pinned prefixes, shape history, savings.
+
+        Its own directory rather than files beside the checkpoint, because it is a *diagnostic* store
+        with its own bound and its own lifetime: it is safe to delete, and a person debugging a bill
+        should be able to read it without wading through run state. See :mod:`engine.cachestore`.
+        """
+        return self.state_dir / "cache"
 
     def agent_dir(self, agent_id: str) -> Path:
         """Per-agent directory, with the id validated the same way as the slug."""
@@ -379,13 +399,14 @@ class Workspace:
         """
         if self.is_attached:
             for directory in (
-                self.state_dir, self.agents_dir, self.sessions_dir, self.telemetry_dir,
+                self.state_dir, self.agents_dir, self.handoffs_dir, self.sessions_dir,
+                self.telemetry_dir,
             ):
                 directory.mkdir(parents=True, exist_ok=True)
             return self
         for directory in (
             self.path, self.state_dir, self.docs_dir, self.src_dir,
-            self.agents_dir, self.sessions_dir, self.telemetry_dir,
+            self.agents_dir, self.handoffs_dir, self.sessions_dir, self.telemetry_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
         return self

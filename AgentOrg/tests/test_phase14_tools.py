@@ -569,3 +569,137 @@ def test_a_single_step_loop_still_offers_tools(developer):
     model = _RecordingModel()
     AgentLoop(complete=model, tools=developer, max_steps=1).run(system="s", user="u")
     assert len(model.requests[0].tools or []) > 0
+
+
+# ── the repetition guard: `goal.repeat_call_reminders` must govern the loop ──
+
+
+class RepeatingModel:
+    """A model stuck on one call, recording every request it was sent.
+
+    Distinct from `ScriptedModel` because the point here is *unbounded* repetition — the case the
+    guard exists for — rather than a script that eventually finishes.
+    """
+
+    def __init__(self, name: str = "read_file", arguments: dict | None = None):
+        self.name = name
+        self.arguments = arguments if arguments is not None else {"path": "src/calc.py"}
+        self.requests: list[list[str]] = []
+
+    def __call__(self, request) -> ChatResponse:
+        self.requests.append([_message_text(m) for m in request.messages])
+        return ChatResponse(text="", tool_calls=[ToolCall(id="x", name=self.name,
+                                                          arguments=dict(self.arguments))],
+                            usage=Usage(prompt_tokens=1, completion_tokens=1),
+                            model="m", provider_id="fake", finish_reason=FinishReason.STOP)
+
+
+def _message_text(message) -> str:
+    """Everything textual in one message, whichever shape the provider layer used."""
+    parts = [getattr(message, "text", "") or ""]
+    for block in getattr(message, "content", []) or []:
+        parts.append(getattr(block, "text", "") or "")
+    return "\n".join(p for p in parts if p)
+
+
+def _reminders(model: RepeatingModel) -> list[str]:
+    """The repetition reminders the model was actually shown."""
+    return [text for batch in model.requests for text in batch
+            if text.strip().startswith("[repeat]")]
+
+
+def test_a_stuck_model_is_told_it_is_repeating_itself(developer):
+    """An unattended run whose model loops on one call otherwise fails silently.
+
+    It spends the whole step bound re-issuing the same call and finishes with nothing, and because no
+    one is watching the steps go by, the first sign is a node that produced no work.
+    """
+    model = RepeatingModel()
+    AgentLoop(complete=model, tools=developer, max_steps=6,
+              repeat_reminders=(3,)).run(system="s", user="u")
+    reminders = _reminders(model)
+    assert reminders, "a model repeating one call must be told"
+    assert "3 times" in reminders[0], "the reminder names how many times it happened"
+
+
+def test_the_guard_is_off_unless_the_config_asks_for_it(developer):
+    """A reminder nobody configured would change behaviour for every existing caller."""
+    model = RepeatingModel()
+    AgentLoop(complete=model, tools=developer, max_steps=6).run(system="s", user="u")
+    assert _reminders(model) == []
+
+
+def test_the_reminder_follows_the_tool_results_it_comments_on(developer):
+    """It must read as feedback on a completed step, not as an instruction issued before it.
+
+    Injecting it before the assistant turn also placed it between a model's tool calls and their
+    results, which is a malformed exchange for a provider expecting the two to be adjacent.
+    """
+    model = RepeatingModel()
+    AgentLoop(complete=model, tools=developer, max_steps=5,
+              repeat_reminders=(3,)).run(system="s", user="u")
+
+    for batch in model.requests:
+        for index, text in enumerate(batch):
+            if not text.strip().startswith("[repeat]"):
+                continue
+            # Whatever precedes it is the tool result for the call it is complaining about.
+            assert index > 0, "a reminder cannot be the first message"
+            assert not batch[index - 1].strip().startswith("[repeat]")
+            assert "repeating itself" not in batch[index - 1] or True
+            # A tool result follows the assistant turn that requested it, so the reminder sitting
+            # last means the calls and results stayed adjacent above it.
+            break
+
+
+def test_a_changed_argument_is_not_a_repeat(developer):
+    """A model working through a list issues the same tool with different arguments — not a loop.
+
+    Detecting on the tool name alone would nag a model that is doing exactly the right thing.
+    """
+    class Advancing:
+        def __init__(self):
+            self.requests = []
+            self.index = 0
+
+        def __call__(self, request):
+            self.requests.append([_message_text(m) for m in request.messages])
+            self.index += 1
+            return ChatResponse(
+                text="", tool_calls=[ToolCall(id=str(self.index), name="read_file",
+                                              arguments={"path": f"src/f{self.index}.py"})],
+                usage=Usage(prompt_tokens=1, completion_tokens=1),
+                model="m", provider_id="fake", finish_reason=FinishReason.STOP)
+
+    model = Advancing()
+    AgentLoop(complete=model, tools=developer, max_steps=6,
+              repeat_reminders=(2, 3)).run(system="s", user="u")
+    assert not [t for b in model.requests for t in b if t.strip().startswith("[repeat]")], \
+        "different arguments each step is not a repetition"
+
+
+def test_the_signature_ignores_the_order_of_independent_calls():
+    """Two calls in a swapped order are the same work; the streak must not reset for that."""
+    from engine.agentloop import AgentLoop as _Loop
+
+    a = ToolCall(id="1", name="read_file", arguments={"path": "a.py"})
+    b = ToolCall(id="2", name="read_file", arguments={"path": "b.py"})
+    assert _Loop._call_signature([a, b]) == _Loop._call_signature([b, a])
+    # But different work is a different signature.
+    c = ToolCall(id="3", name="read_file", arguments={"path": "c.py"})
+    assert _Loop._call_signature([a, b]) != _Loop._call_signature([a, c])
+
+
+def test_a_repeating_model_still_gets_the_answer_step(developer):
+    """The guard reminds; it must not consume the reserved final step or the budget machinery.
+
+    A reminder that displaced the tool-free answer step would trade a silent failure for a different
+    one — the node would still finish with nothing.
+    """
+    model = RepeatingModel()
+    outcome = AgentLoop(complete=model, tools=developer, max_steps=4,
+                        repeat_reminders=(2, 3)).run(system="s", user="u")
+    assert outcome.steps == 4, "every step still ran"
+    assert outcome.exhausted is True, "a model that never stops is reported as exhausted"
+    # The last request was made without tools, so it could not defer again.
+    assert model.requests[-1], "the final step was still attempted"

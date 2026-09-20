@@ -16,6 +16,8 @@ DESIGN
   display name and every trace, mailbox and health record stays valid.
 - **Termination is explicit, and retiring an agent with active reports is refused.** A
   specialist whose helpers are still working must be retired after them, not before.
+- **A termination leaves a record.** The roster entry is deleted, but `{id, name, reason, at}` is
+  appended to `retired` in the org document, so "who was let go, and why" survives the write.
 - **The Owner is a real agent in the roster**, because that is what lets a human handoff use
   the same contract, ledger and audit path as an automated one.
 - **A default company is provided** so the first-run experience has something to run before
@@ -32,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -44,6 +47,10 @@ __all__ = ["Org", "OrgError", "RoleTemplate", "Team", "default_company", "OWNER_
 #: The Owner's stable id. Fixed rather than generated so a human action recorded in one run
 #: is attributable in the next.
 OWNER_ID = "ag_owner"
+
+
+def _iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + f".{int(time.time() * 1000) % 1000:03d}Z"
 
 
 class OrgError(RuntimeError):
@@ -199,6 +206,12 @@ class Org:
     #: *shared principal, independent agents* split.
     principal_id: str = ""
     org_version: str = "1.0.0"
+    #: Tombstones for agents that have been terminated, oldest first: `{id, name, reason, at}`. A
+    #: termination deletes the roster entry (`terminate`), so without this the decision leaves no
+    #: trace at all and "who was let go, and why" is unanswerable from the product. Kept in the org
+    #: document rather than the live view, so it travels through `save`/`load` and a project roster
+    #: keeps the record of the agents it retired.
+    retired: list[dict[str, Any]] = field(default_factory=list)
     _locks: dict[str, threading.RLock] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
@@ -243,7 +256,7 @@ class Org:
         ))
 
     def terminate(self, agent_id: str, *, reason: str = "") -> AgentSpec:
-        """Remove an agent from the routing pool.
+        """Remove an agent from the routing pool, leaving a tombstone behind.
 
         The spec is returned so a helper's lineage can be recorded before it is dropped. Two
         safeguards apply:
@@ -253,6 +266,13 @@ class Org:
         - An agent with a report that is *currently working* cannot be terminated, because the
           work that report holds would be orphaned mid-flight. Idle reports are re-parented to
           the Owner rather than orphaned, so their reporting line stays valid.
+
+        **The termination is recorded, not discarded.** The roster entry is deleted, so without a
+        record nothing survives to say the agent existed or why it was let go — and `agent retire
+        --reason` advertised exactly that record. `{id, name, reason, at}` is appended to `retired`,
+        which is part of the org document, so it persists through `save` and a reload. A re-hire of
+        the same name is still possible: hiring looks only at the live agents, so a tombstone never
+        blocks a name.
         """
         with self._guard:
             spec = self.get(agent_id)
@@ -273,6 +293,10 @@ class Org:
             runtime = self.runtimes.get(agent_id)
             if runtime is not None:
                 runtime.state = AgentState.TERMINATED
+            # Recorded from the spec *before* it is dropped, and after every refusal above, so a
+            # tombstone never claims a termination that did not happen.
+            self.retired.append({"id": spec.id, "name": spec.name,
+                                 "reason": (reason or "").strip(), "at": _iso_now()})
             del self.agents[agent_id]
             self.runtimes.pop(agent_id, None)
 
@@ -481,6 +505,9 @@ class Org:
             "agents": [spec.as_dict() for spec in sorted(self.agents.values(), key=lambda a: a.id)],
             "teams": [team.as_dict() for team in sorted(self.teams.values(), key=lambda t: t.name)],
             "policy": self.policy,
+            # The termination record, so it survives the write that follows a retire. Copied rather
+            # than shared, so a caller that mutates the returned document cannot rewrite history.
+            "retired": [dict(record) for record in self.retired],
         }
 
     @classmethod
@@ -498,6 +525,10 @@ class Org:
             org_version=str(data.get("org_version") or "1.0.0"),
             policy=data.get("policy") if isinstance(data.get("policy"), dict) else {},
         )
+        # A tombstone without an id records nothing that can be looked up, so it is dropped rather
+        # than carried as an entry the reader has to defensive-check.
+        org.retired = [dict(record) for record in (data.get("retired") or [])
+                       if isinstance(record, dict) and record.get("id")]
         skipped: list[str] = []
         for raw in data.get("agents") or []:
             if not isinstance(raw, dict):

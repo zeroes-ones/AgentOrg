@@ -240,9 +240,10 @@ class _Result:
         self.outcomes = outcomes
 
 
-def test_validation_reports_an_improvement(tmp_path):
-    """The real suite, against the real baseline: an unchanged tree produces no regressions, and the
-    scenario the finding names counts as the improvement."""
+def test_an_unchanged_tree_is_not_an_improvement_against_the_real_baseline(tmp_path):
+    """The real suite, against the real baseline: an unchanged tree produces no regressions — and no
+    improvement either, because every scenario in `baseline.json` already passes. Calling the scenario
+    the finding names an improvement here is exactly how an empty diff gets stamped as a fix."""
     ws = _workspace(tmp_path)
     improver = Improver(workspace=ws)          # defaults to the real suite
     finding = Finding(kind="stagnant_loop", path=".agentorg/skills/", subject="reviser",
@@ -251,8 +252,72 @@ def test_validation_reports_an_improvement(tmp_path):
     validation = improver.validate(proposal)
     assert validation.ran
     assert validation.regressions == []
+    assert validation.improved == []
+    assert not validation.ok
+    assert "already records 'loop-termination' as passing" in validation.detail
+    assert improver.promote(proposal) is None
+
+
+def _baseline_file(tmp_path, monkeypatch, results):
+    """Point the real baseline path at a stub, so the failing→passing rule is tested deterministically."""
+    from engine.evals import runner
+
+    path = tmp_path / "stub-baseline.json"
+    path.write_text(json.dumps({"results": results}), encoding="utf-8")
+    monkeypatch.setattr(runner, "BASELINE_PATH", path)
+
+
+def test_an_improvement_requires_a_failing_to_passing_flip(tmp_path, monkeypatch):
+    """The rule the module claims: a scenario counts as improved only when the baseline recorded it as
+    failing and the run now passes it. A passing baseline is evidence of nothing."""
+    _baseline_file(tmp_path, monkeypatch, {"loop-termination": {"passed": False}})
+    ws = _workspace(tmp_path)
+    improver = Improver(workspace=ws,
+                        run_suite=lambda **k: _Result([_Outcome("loop-termination", True)]))
+    finding = Finding(kind="stagnant_loop", path=".agentorg/skills/", subject="reviser",
+                      detail="x", scenario="loop-termination")
+    proposal = improver.draft(finding)
+    validation = improver.validate(proposal)
     assert validation.improved == ["loop-termination"]
+    assert validation.regressions == []
     assert validation.ok
+    assert improver.promote(proposal) is not None
+
+
+def test_the_converse_passing_baseline_yields_no_improvement(tmp_path, monkeypatch):
+    """The same passing result, against a baseline that already had the scenario passing. Nothing
+    flipped, so nothing is promoted — this is the exact case the old code called an improvement."""
+    _baseline_file(tmp_path, monkeypatch, {"loop-termination": {"passed": True}})
+    ws = _workspace(tmp_path)
+    improver = Improver(workspace=ws,
+                        run_suite=lambda **k: _Result([_Outcome("loop-termination", True)]))
+    finding = Finding(kind="stagnant_loop", path=".agentorg/skills/", subject="reviser",
+                      detail="x", scenario="loop-termination")
+    proposal = improver.draft(finding)
+    validation = improver.validate(proposal)
+    assert validation.improved == []
+    assert not validation.ok
+    assert improver.promote(proposal) is None
+    assert proposal.state == "rejected"
+
+
+def test_an_unreadable_baseline_evidences_no_improvement(tmp_path, monkeypatch):
+    """No baseline means no comparison. A run that cannot be compared must not be read as a pass — and
+    regressions stay unreported, which is the opposite of a claim that anything improved."""
+    from engine.evals import runner
+
+    monkeypatch.setattr(runner, "BASELINE_PATH", tmp_path / "does-not-exist.json")
+    ws = _workspace(tmp_path)
+    improver = Improver(workspace=ws,
+                        run_suite=lambda **k: _Result([_Outcome("loop-termination", True)]))
+    finding = Finding(kind="stagnant_loop", path=".agentorg/skills/", subject="reviser",
+                      detail="x", scenario="loop-termination")
+    proposal = improver.draft(finding)
+    validation = improver.validate(proposal)
+    assert validation.improved == []
+    assert validation.regressions == []
+    assert not validation.ok
+    assert "baseline cannot be read" in validation.detail
 
 
 def test_not_worse_is_not_an_improvement(tmp_path):
@@ -345,9 +410,14 @@ def test_a_suite_that_cannot_run_is_not_a_passed_suite(tmp_path):
 # ── promote: the Owner decides ───────────────────────────────────────────────
 
 
-def test_a_validated_proposal_is_written_where_a_person_can_read_it(tmp_path):
+def test_a_validated_proposal_is_written_where_a_person_can_read_it(tmp_path, monkeypatch):
+    """A proposal that earned promotion is written where a person can read it — so the run has to
+    demonstrate the flip (`loop-termination` failing at baseline, passing now); a merely unchanged tree
+    is not promoted at all."""
+    _baseline_file(tmp_path, monkeypatch, {"loop-termination": {"passed": False}})
     ws = _workspace(tmp_path)
-    improver = Improver(workspace=ws)
+    improver = Improver(workspace=ws,
+                        run_suite=lambda **k: _Result([_Outcome("loop-termination", True)]))
     finding = Finding(kind="stagnant_loop", path=".agentorg/skills/", subject="reviser",
                       detail="node 'reviser' used 4 iterations and still ended needs_review",
                       evidence={"node": "reviser", "iterations": 4},

@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
-    "GoalError", "GoalState", "GoalSpend", "Goal", "GoalDecision", "GoalPolicy",
+    "GoalError", "GoalState", "GoalSpend", "Goal", "GoalDecision", "GoalPolicy", "Posture",
     "GOAL_FILENAME", "GOAL_VERSION", "DECISION_FILENAME",
 ]
 
@@ -103,29 +103,86 @@ class GoalSpend:
 
     Cumulative rather than per-slice, because the question a person actually asks is "what has this
     cost me", and a figure that reset on every resume would answer a different one.
+
+    `cost_unknown` carries the same rule the run's :class:`~engine.gateway.CostLedger` does: `cost_usd`
+    is the total spend *that was reported*, and once any round's cost nobody reported it is a floor
+    rather than a total. Rendering the two identically would make a run that was never measured look
+    like a cheap one, which is the cost illusion the ledger exists to prevent.
     """
 
     rounds: int = 0
     tokens: int = 0
     requests: int = 0
     cost_usd: float = 0.0
+    #: True once any round's cost was unreported, so `cost_usd` is a lower bound.
+    cost_unknown: bool = False
+    #: Calls whose cost the provider never reported, kept so the ledger's own count can be diffed.
+    unknown_cost_calls: int = 0
 
-    def add(self, *, tokens: int = 0, requests: int = 0, cost_usd: float = 0.0, rounds: int = 0) -> None:
+    def add(self, *, tokens: int = 0, requests: int = 0, cost_usd: float | None = 0.0,
+            rounds: int = 0, unknown_cost_calls: int = 0) -> None:
+        """Fold one contribution in. `cost_usd=None` means "unreported", not "zero"."""
         self.rounds += int(rounds)
         self.tokens += int(tokens)
         self.requests += int(requests)
-        self.cost_usd = round(self.cost_usd + float(cost_usd or 0.0), 6)
+        if cost_usd is None:
+            self.cost_unknown = True
+        else:
+            self.cost_usd = round(self.cost_usd + float(cost_usd), 6)
+        self.unknown_cost_calls += int(unknown_cost_calls)
+        if unknown_cost_calls:
+            self.cost_unknown = True
+
+    @property
+    def cost_complete(self) -> bool:
+        """True when every round's cost was reported, so `cost_usd` is a total, not a floor."""
+        return not self.cost_unknown
 
     def as_dict(self) -> dict[str, Any]:
         return {"rounds": self.rounds, "tokens": self.tokens,
-                "requests": self.requests, "cost_usd": self.cost_usd}
+                "requests": self.requests, "cost_usd": self.cost_usd,
+                "cost_complete": self.cost_complete,
+                "unknown_cost_calls": self.unknown_cost_calls}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "GoalSpend":
         data = data or {}
         return cls(rounds=int(data.get("rounds") or 0), tokens=int(data.get("tokens") or 0),
                    requests=int(data.get("requests") or 0),
-                   cost_usd=float(data.get("cost_usd") or 0.0))
+                   cost_usd=float(data.get("cost_usd") or 0.0),
+                   # Absent means complete: a goal written before this field existed was accounted
+                   # under the old rule, and re-reading a gap into it would invent one.
+                   cost_unknown=not bool(data.get("cost_complete", True)),
+                   unknown_cost_calls=int(data.get("unknown_cost_calls") or 0))
+
+
+class Posture(str, Enum):
+    """How far a goal's autonomy reaches — one word, resolved once.
+
+    The engine grew three overlapping switches for this (`goal.auto_pass_auto_gates` in the config,
+    `GoalPolicy.human_gate` and `GoalPolicy.auto_approve` on the goal), and none of them answered the
+    question a person actually asks: *do I have to be here for this to finish?* A posture answers it.
+
+    - ``SUPERVISED`` — a human is involved at every gate, exactly as before this existed. The run
+      parks and waits, and nothing decides on the Owner's behalf.
+    - ``UNATTENDED`` — the goal may answer the gates it is able to answer, including the **terminal**
+      gate, which is what makes a goal able to finish with nobody watching. The terminal release is
+      not a rubber stamp: it requires the gate's evidence to be present, refuses when a safety control
+      fired, and is recorded in the ledger as `by: goal`.
+
+    The default is ``UNATTENDED`` because that is the polarity the product already documents — "a human
+    is involved only if you chose one" — and because the gate vocabulary keeps its meaning either way:
+    the manifest still declares `kind: human`, so a `supervised` goal parks on exactly the gate it
+    always did.
+    """
+
+    SUPERVISED = "supervised"
+    UNATTENDED = "unattended"
+
+    @property
+    def involves_a_human(self) -> bool:
+        """Whether every gate waits for the Owner."""
+        return self is Posture.SUPERVISED
 
 
 @dataclass
@@ -133,50 +190,96 @@ class GoalPolicy:
     """What a goal is authorised to decide on its own.
 
     The person asked for a tool they can leave running, so the polarity is **autonomous unless a human
-    gate was chosen**. Three switches, and the reasoning for each:
+    gate was chosen**. The switches:
 
-    - ``auto_approve`` — may a gate the *org* can decide be passed without asking. A **terminal** gate
-      (release, close, spend) is never passed, whatever this says: that authority is not delegable.
+    - ``posture`` — the one word that settles whether a human is involved. See :class:`Posture`. This
+      is the field to set; ``human_gate`` is kept as a legacy alias that maps onto it.
+    - ``auto_approve`` — may a gate the *org* can decide be passed without asking. Under
+      ``SUPERVISED`` this is forced false.
     - ``auto_hire`` — may a staffing gap be closed by spawning a helper on the default model, rather
       than parking the run. The work is what the objective asked for; the gap is an administrative
       accident of the roster, not a decision.
     - ``persist_hires`` — does that helper become a durable roster entry, or stay ephemeral. Off by
       default: an ephemeral subagent leaves nothing to clean up.
-    - ``human_gate`` — the master switch. When set, no gate is passed and no helper is spawned; the run
-      parks exactly as it did before. This is the "I want to be involved" choice, stated per goal.
+    - ``human_gate`` — **legacy**, superseded by ``posture``. `True` means ``SUPERVISED``. Kept so a
+      `goal.json` written by an earlier build keeps behaving, and so the existing CLI flags and the
+      console's toggle do not break.
+
+    Under ``SUPERVISED`` the *terminal* gate is still parked for the same reason it always was (it is
+    the release/close/spend authority), and it is additionally parked by the posture itself.
     """
 
     auto_approve: bool = True
     auto_hire: bool = True
     persist_hires: bool = False
     human_gate: bool = False
+    posture: Posture = Posture.UNATTENDED
+
+    def __post_init__(self) -> None:
+        # Tolerate a string posture — the CLI and the protocol carry it as text — so the dataclass has
+        # exactly one representation internally and `as_dict` is always safe.
+        if not isinstance(self.posture, Posture):
+            try:
+                self.posture = Posture(str(self.posture).strip().lower())
+            except ValueError as exc:
+                raise GoalError(
+                    f"unknown posture {self.posture!r}; expected one of "
+                    f"{', '.join(p.value for p in Posture)}"
+                ) from exc
+        # One source of truth. A caller that sets the legacy flag (or an older document that only has
+        # it) gets the posture it means, so the two can never disagree.
+        if self.human_gate:
+            self.posture = Posture.SUPERVISED
+        elif self.posture is Posture.SUPERVISED:
+            self.human_gate = True
+
+    @property
+    def unattended(self) -> bool:
+        """Whether the goal may answer its gates itself."""
+        return self.posture is Posture.UNATTENDED
 
     def effective(self) -> "GoalPolicy":
-        """The policy with `human_gate` applied, so callers never repeat the override."""
-        if not self.human_gate:
+        """The policy with the posture applied, so callers never repeat the override."""
+        if self.unattended:
             return self
         return GoalPolicy(auto_approve=False, auto_hire=False,
-                          persist_hires=self.persist_hires, human_gate=True)
+                          persist_hires=self.persist_hires, human_gate=True,
+                          posture=Posture.SUPERVISED)
 
     def as_dict(self) -> dict[str, Any]:
         return {"auto_approve": self.auto_approve, "auto_hire": self.auto_hire,
-                "persist_hires": self.persist_hires, "human_gate": self.human_gate}
+                "persist_hires": self.persist_hires, "human_gate": self.human_gate,
+                "posture": self.posture.value}
 
     @classmethod
     def from_dict(cls, data: Any) -> "GoalPolicy":
-        """Read a policy, tolerating a document written before it existed.
+        """Read a policy, tolerating a document written before any of this existed.
 
-        An older goal.json has no `policy` key; the defaults apply, which are the autonomous ones. That
-        is deliberate: a goal set before this feature should keep behaving, and the person who set it
-        chose no human gate.
+        An older goal.json has no `policy` key at all, or one with no `posture`. In both cases the
+        defaults apply — which are the autonomous ones — because that is the polarity the product
+        documents and the person who set the goal chose no human gate. A document that *does* carry
+        `human_gate: true` resolves to `SUPERVISED`, so an old "I want to be involved" goal stays
+        exactly as involved as its owner asked for.
         """
         if not isinstance(data, dict):
             return cls()
+        posture = data.get("posture")
+        if posture:
+            try:
+                resolved = Posture(str(posture).strip().lower())
+            except ValueError as exc:
+                raise GoalError(
+                    f"goal policy has an unknown posture: {posture!r}; expected one of "
+                    f"{', '.join(p.value for p in Posture)}"
+                ) from exc
+        else:
+            resolved = Posture.SUPERVISED if data.get("human_gate") else Posture.UNATTENDED
         return cls(
             auto_approve=bool(data.get("auto_approve", True)),
             auto_hire=bool(data.get("auto_hire", True)),
             persist_hires=bool(data.get("persist_hires", False)),
             human_gate=bool(data.get("human_gate", False)),
+            posture=resolved,
         )
 
 
@@ -317,10 +420,17 @@ class Goal:
         """
         return self.token_budget > 0 and self.slice_spend.tokens >= self.token_budget
 
-    def record_round(self, *, tokens: int = 0, requests: int = 0, cost_usd: float = 0.0) -> None:
-        """Fold one continuation round into both the slice and the cumulative totals."""
-        self.slice_spend.add(tokens=tokens, requests=requests, cost_usd=cost_usd, rounds=1)
-        self.spend.add(tokens=tokens, requests=requests, cost_usd=cost_usd, rounds=1)
+    def record_round(self, *, tokens: int = 0, requests: int = 0, cost_usd: float | None = 0.0,
+                     unknown_cost_calls: int = 0) -> None:
+        """Fold one continuation round into both the slice and the cumulative totals.
+
+        `cost_usd=None` records a round whose cost nobody reported, and marks the cumulative figure
+        a floor — distinct from a round that genuinely spent nothing.
+        """
+        self.slice_spend.add(tokens=tokens, requests=requests, cost_usd=cost_usd,
+                             unknown_cost_calls=unknown_cost_calls, rounds=1)
+        self.spend.add(tokens=tokens, requests=requests, cost_usd=cost_usd,
+                       unknown_cost_calls=unknown_cost_calls, rounds=1)
 
     # ── serialisation ───────────────────────────────────────────────────────
 
@@ -366,6 +476,10 @@ class Goal:
             # The two derived booleans the UI asks about, so no caller re-implements the override.
             "decides_gates": self.policy.effective().auto_approve,
             "staffs_gaps": self.policy.effective().auto_hire,
+            # Surfaced at the top level as well as inside `policy`: this is the one word the console
+            # renders, and making the UI reach into a nested dict for it invites disagreement.
+            "posture": self.policy.posture.value,
+            "unattended": self.policy.unattended,
         }
 
     @classmethod

@@ -236,6 +236,17 @@ class CommandType(str, Enum):
     PORTFOLIO_RUN = "portfolio_run"
     PORTFOLIO_STOP = "portfolio_stop"
     PORTFOLIO_SELECT = "portfolio_select"
+    #: What `portfolio_remove` will and will not take away, before it is confirmed.
+    #:
+    #: Its own command rather than a field on the snapshot, because the answer is a *sentence about a
+    #: consequence* — how many bytes stay on disk, and whether the engine could delete them — and a
+    #: snapshot that embedded it would recompute a directory walk on every 2s poll.
+    PORTFOLIO_REMOVAL = "portfolio_removal"
+    # schedules — the objectives that fire on a clock
+    SCHEDULES = "schedules"
+    #: Forgetting one entry. Named `_remove` rather than a bare `schedules` action so it cannot
+    #: collide with another track's edit to the same file.
+    SCHEDULE_REMOVE = "schedule_remove"
     # subagents — the isolated children a run dispatched
     SUBAGENTS = "subagents"
     SUBAGENT_RESULT = "subagent_result"
@@ -255,9 +266,30 @@ class CommandType(str, Enum):
     AGENT_UPDATE = "agent_update"
     AGENT_RETIRE = "agent_retire"
     SKILLS = "skills"
-    # improver — the self-improvement loop: proposals only, never applied
+    # system — what an agent may do on this machine, described for the person granting it.
+    #
+    # A *description* command rather than a second implementation: the console renders what the
+    # engine says each grant reaches, so the two cannot disagree about what a switch does. A Swift
+    # copy of this prose would drift the first time a capability changed.
+    SYSTEM = "system"
+    #: The *write* half of `SYSTEM`: grants and switches, so a console can act on what it described.
+    SYSTEM_SET = "system_set"
+    #: The approval half: one state-changing tool, one holder, recorded in the run's ledger.
+    SYSTEM_CONSENT = "system_consent"
+    #: Running a capability from the console, through the *same* gate an agent goes through.
+    SYSTEM_INVOKE = "system_invoke"
+    # improver — the self-improvement loop. The listing and the cycle apply nothing; the lifecycle
+    # commands are how a person moves one forward, and `proposal_apply` is the only one that writes.
     PROPOSALS = "proposals"
     IMPROVE = "improve"
+    #: Read one proposal in full — rationale, evidence and patch, with the patch inlined so the panel
+    #: does not have to open a file off the user's disk to show it.
+    PROPOSAL_SHOW = "proposal_show"
+    PROPOSAL_ACCEPT = "proposal_accept"
+    PROPOSAL_REJECT = "proposal_reject"
+    #: The one transition that edits the working tree: verified by the suite, reverted on regression.
+    PROPOSAL_APPLY = "proposal_apply"
+    PROPOSAL_UNDO = "proposal_undo"
 
 
 @dataclass

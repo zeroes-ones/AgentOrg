@@ -28,6 +28,15 @@ DESIGN
   `code-reviewer`, from d7f6e1e8 to 4a1b…" is.
 - **Scoped to one run.** A new run gets a new store, because a new run *should* pick up an edited
   skill. Pinning is per-run stability, not permanent fossilisation.
+- **A pin is recorded, not only held.** In-memory pinning protects the run; it cannot answer the
+  question a *restart* raises. When a
+  :class:`~engine.cachestore.CacheStore` is supplied, every pin is written to it, so a resumed run can
+  compare the prefix it would send against the one its predecessor actually sent. The record is
+  best-effort — a pin that cannot be written is still a pin.
+- **A resumed run re-pins from the record, not from the source.** `resume_from_store` adopts the hash
+  the store holds for a key, so a continuation sends the bytes its predecessor sent. Re-deriving
+  would *usually* agree, and the times it would not are exactly the times the cache silently goes
+  cold: a skill edited between runs, a tool set that gained an entry.
 
 Usage:
     pins = PrefixPins(run_id="run_1")
@@ -95,9 +104,13 @@ class PrefixPins:
         that reports the cache went cold.
     """
 
-    def __init__(self, *, run_id: str = "", strict: bool = False) -> None:
+    def __init__(self, *, run_id: str = "", strict: bool = False, store: Any = None) -> None:
         self.run_id = run_id
         self.strict = strict
+        #: A :class:`engine.cachestore.CacheStore`, when a durable record is wanted. Optional, and
+        #: every write through it is best-effort: a pin that cannot be *recorded* is still a pin, and
+        #: a run must not fail because its diagnostics directory is read-only.
+        self.store = store
         self._pinned: dict[str, Prefix] = {}
         self._drift: list[PrefixDrift] = []
         #: Keys whose change the caller has explicitly accepted for this run.
@@ -132,10 +145,78 @@ class PrefixPins:
             return pinned
         prefix = Prefix.for_skill(skill=skill, system=system, procedure=procedure, tools=tools)
         self._pinned[key] = prefix
+        self._remember(prefix)
         return prefix
+
+    def _remember(self, prefix: Prefix) -> None:
+        """Record a pinned prefix in the durable store, when there is one.
+
+        Recorded here rather than at the call site because this is the only place that knows a prefix
+        is *pinned* — the difference between "a prefix was computed" and "these bytes are what this
+        run sends". That distinction is the whole answer to "is this run still cache-warm?" after a
+        restart, so it belongs where the pinning happens.
+
+        Best-effort by design: a store that cannot be written leaves the run working and its cache
+        unrecorded, which is strictly better than refusing the pin.
+        """
+        if self.store is None:
+            return
+        try:
+            self.store.remember_prefix(
+                prefix_hash=prefix.prefix_hash, skill=prefix.skill,
+                tool_names=[str(t.get("name") or "") for t in prefix.tools],
+                chars=prefix.chars, run_id=self.run_id, source="pin")
+        except Exception:  # noqa: BLE001 - a pin must not fail because its record could not be kept
+            pass
 
     def pinned(self, *, skill: str, tools: Iterable[Any] = ()) -> Prefix | None:
         return self._pinned.get(self.key_for(skill, tools))
+
+    def pinned_all(self) -> dict[str, Prefix]:
+        """Every prefix pinned this run, keyed as `pins.summary()['pinned']` is.
+
+        A copy: a caller reading this is reporting on the pins, and handing it the live dict would let
+        a report mutate what a running session sends.
+        """
+        return dict(self._pinned)
+
+    def resume_from_store(self, *, skill: str, tools: Iterable[Any] = (),
+                          store: Any = None, system: str = "", procedure: str = "") -> Any:
+        """Adopt the prefix a previous run pinned, so a continuation does not re-derive it.
+
+        A resumed run has the same source files, so re-deriving would *usually* produce the same bytes
+        — and the times it would not are exactly the times the cache would silently go cold: a skill
+        edited between runs, a tool set that gained an entry. So the store's record is consulted first
+        and, when it holds a prefix for this key, that hash is what the run sends. Re-deriving is the
+        fallback, not the rule.
+
+        Returns a `PrefixCheck`, or None when there is no store to ask. Never raises: a resume that
+        cannot read its history is a cold start, which is a degraded state rather than a failure.
+        """
+        record_store = store if store is not None else self.store
+        if record_store is None:
+            return None
+        try:
+            record = record_store.latest_pinned(skill=skill)
+            if record is None:
+                return None
+            check = record_store.verify_prefix(prefix_hash=record.prefix_hash, skill=skill)
+            if not check.unchanged:
+                return check
+            pinned = self._pinned.get(self.key_for(skill, tools))
+            if pinned is not None and pinned.prefix_hash == record.prefix_hash:
+                return check
+            # The recorded prefix is adopted as this run's pin, without `accept_change`'s
+            # "deliberately changed" marking: nothing changed, we are restoring what was already
+            # agreed. Only when the caller supplies the bytes can the object be rebuilt — a resumed
+            # run has them, and one that does not keeps its own pin and the check stands as a report.
+            if system or procedure:
+                prefix = Prefix.for_skill(skill=skill, system=system, procedure=procedure, tools=tools)
+                if prefix.prefix_hash == record.prefix_hash:
+                    self._pinned[self.key_for(skill, tools)] = prefix
+            return check
+        except Exception:  # noqa: BLE001 - a resume must not fail over its own bookkeeping
+            return None
 
     # ── drift ───────────────────────────────────────────────────────────────
 
@@ -177,6 +258,7 @@ class PrefixPins:
         prefix = Prefix.for_skill(skill=skill, system=system, procedure=procedure, tools=tools)
         self._pinned[key] = prefix
         self._accepted.add(key)
+        self._remember(prefix)
         return prefix
 
     # ── reporting ───────────────────────────────────────────────────────────

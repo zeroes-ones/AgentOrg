@@ -44,6 +44,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import threading
@@ -68,14 +69,23 @@ from .org import (
     Binder,
     BindingError,
     BindingPolicy,
+    Handoff,
+    HandoffError,
+    Ledger,
     Org,
     Router,
     RouteContext,
     RouteClass,
+    build_context_pass_through,
     declared_policy,
+    validate_handoff,
 )
+from .org.handoff import REQUIRED_FIELDS as HANDOFF_REQUIRED_FIELDS
+from .parallel import TERMINAL_STATUSES
 from .prompts import TRAILER_FENCE, PromptBuilder, TaskContext, TrailerError, extract_trailer
-from .skills.bundle import SkillBundle
+from .protocol import EventType
+from .skills.bundle import SkillBundle, SkillError
+from .state import ENGINE_STATE_DIRNAME
 
 __all__ = ["NodeExecutor", "ExecutionError", "ExecutedNode", "ExecutorContext"]
 
@@ -128,6 +138,10 @@ class ExecutorContext:
     # The prefixes pinned for this run. A skill edited mid-run must not silently change the bytes a
     # running session sends, or the cache goes cold with nothing reporting why.
     pins_for_prefix: Any = None
+    # The decision gate ledger. The orchestrator owns the durable one; a caller that injects none
+    # still gets a usable ledger here, because an edge crossing that records nothing is exactly the
+    # gap this wiring closes.
+    ledger: Any = None
     #: The ceiling on one model reply, in tokens. Resolved once, at construction, from the bound
     #: model's declared `max_output`, then the config's `executor.max_output_tokens`, then a floor.
     #:
@@ -214,8 +228,19 @@ class ExecutedNode:
 class NodeExecutor:
     """Implements the library's `execute_node` contract.
 
-    Thread-safe: supervisor fan-out runs several nodes concurrently, and the per-agent session map and
-    the artifact store are both shared.
+    **Thread-safety.** Several nodes genuinely run at once — a fan-out's items, a swarm's voters, and
+    the members of a `parallel:` group (see `engine/parallel.py`) — so this object is shared across
+    threads and the state below is shared with it. That was *claimed* here before it was true: the
+    session map and the artifact store were guarded, but the node registries were plain dicts read by
+    one node while another wrote them, which raises `RuntimeError: dictionary changed size during
+    iteration` rather than returning a wrong answer. Every registry is now guarded by
+    `self.registries`, and the shared stores this class does not own are named where they are used:
+
+    - `ctx.sessions` — guarded by `ctx.lock` (and read atomically at its call sites).
+    - `ctx.store` — `ArtifactStore` serialises per path and atomically replaces, so two writers to
+      *different* artifacts do not interact and two writers to the *same* one serialise.
+    - `ctx.journal` — `EffectJournal` reserves under its own lock before the effect runs, so two
+      threads cannot both be told to apply the same effect.
     """
 
     def __init__(self, context: ExecutorContext) -> None:
@@ -230,6 +255,21 @@ class NodeExecutor:
         # Node id -> the agent that produced its artifact, for the independence refusal.
         self.producers: dict[str, str] = {}
         self.history: dict[str, ExecutedNode] = {}
+        #: Node id -> the typed handoff that node *received*, validated at its boundary. The prompt is
+        #: built from this rather than from run-state, so what a node is told it inherited is what the
+        #: contract actually accepted.
+        self.inbound: dict[str, Handoff] = {}
+        #: Handoff id -> every handoff this process produced, kept for reporting.
+        self.handoffs: dict[str, Handoff] = {}
+        #: Guards the four registries above. Reentrant because a writer may call a reader while the
+        #: lock is already held, and a `RLock` is what keeps that from being a self-deadlock.
+        self.registries = threading.RLock()
+        #: The MCP bridge, connected once per executor rather than once per node. A stdio server is a
+        #: process, so re-handshaking per node would spend more on connect than on work. `None` means
+        #: either nothing is configured or the one attempt failed — `_mcp_attempted` distinguishes
+        #: them, so a failure is reported once per run instead of once per node.
+        self._mcp_bridge: Any = None
+        self._mcp_attempted = False
 
     # ── the runner's entry point ────────────────────────────────────────────
 
@@ -261,8 +301,237 @@ class NodeExecutor:
                 f"node {node_id!r} names no skill and is not a gate, so there is no capability to "
                 "bind. A node that does neither is a manifest defect."
             )
+
+        # A member of a `parallel:` group is the runner's first visit to the group, and this call is
+        # the one place the group can be overlapped at all: the runner dispatches one node at a time,
+        # so the only way its members run concurrently is if this call runs them. See `engine/parallel`.
+        group = self._group_for(node_id, state)
+        if group is not None:
+            return self._run_group(group_id=group, node_id=node_id, state=state, ctx=ctx)
+
         attempt = int(ctx.get("pass") or self._attempt_from_state(node_id, state) or 1)
         return self._run(node_id, node, skill, state, attempt=attempt, ctx=ctx)
+
+    # ── parallel groups ─────────────────────────────────────────────────────
+
+    def _group_for(self, node_id: str, state: dict[str, Any]) -> str | None:
+        """The `parallel:` group this node leads, when overlapping it is opted in and safe.
+
+        Returns None in every case where the group must be left to the runner's sequential walk, and
+        each of those is a deliberate refusal rather than a fallback:
+
+        - the group does not opt in (`concurrent: true` on the `parallel:` block), because a run whose
+          execution order changes by default is a behaviour change disguised as a performance one;
+        - the manifest declares no such group, or this node is not a member of one;
+        - this node is not the *first* member in declared order, so exactly one member drives the
+          group and the others are run by it rather than dispatched again by the runner;
+        - any of the group's members has already reported, which means the runner is mid-group (a
+          resumed run, or a rework pass) and re-running the members would repeat work the runner
+          believes is done.
+        """
+        manifest = self._manifest(state)
+        for block in manifest.get("parallel") or []:
+            if not isinstance(block, dict):
+                continue
+            members = [str(m) for m in (block.get("nodes") or [])]
+            if node_id not in members:
+                continue
+            if not self._parallel_enabled(block):
+                return None
+            # Exactly one member leads. Declared order, not the group's set order, so which member
+            # leads does not depend on how the manifest happened to be written into the dict.
+            if members.index(node_id) != 0:
+                return None
+            reported = (state.get("nodes") or {})
+            if any(str(reported.get(m, {}).get("status") or "") in TERMINAL_STATUSES for m in members):
+                return None
+            return str(block.get("id") or "")
+        return None
+
+    def _parallel_enabled(self, block: dict[str, Any]) -> bool:
+        """Whether this group wants its members overlapped rather than walked in order.
+
+        Opt-in, and the opt-in is the group's own `concurrent:` field rather than a global switch: a
+        plan can mark the one fan-out whose members are genuinely independent and leave every other
+        group — including one whose members share a rate-limited provider — on the runner's own
+        sequential order. A global flag would apply the concurrency to groups the planner never
+        reasoned about, which is the wrong place to put a decision that depends on the group's shape.
+
+        `AGENTORG_PARALLEL_NODES=1` forces it on for every group, which is what an eval or an operator
+        measuring the difference wants; it does not override the safety checks in `plan_group`, which
+        are about correctness rather than preference.
+        """
+        if not bool(block.get("concurrent", False)):
+            return _env_flag("AGENTORG_PARALLEL_NODES")
+        return True
+
+    def _run_group(self, *, group_id: str, node_id: str, state: dict[str, Any],
+                   ctx: dict[str, Any]) -> dict[str, Any]:
+        """Run every member of a group concurrently and return the leader's result for the runner.
+
+        The runner asked about one node and gets one result back, so its traversal, its step budget
+        and its per-node checkpoint are untouched — the overlap is entirely inside this call. The
+        returned result is the leader's own, *augmented* with the group's outcomes rather than
+        replaced by an aggregate: the leader is a real node that did real work and the runner will
+        record it as such, so substituting a synthetic group result would make the recorded node
+        describe something no agent produced.
+
+        A refusal from `plan_group` is a *result*, not an exception. The group still runs — the
+        sequential path is right there — and the node reports that it was not overlapped and why, so
+        a manifest that cannot be parallelised is visible in the run rather than failing it.
+        """
+        from .parallel import ParallelError, find_group, plan_group, run_group
+
+        manifest = self._manifest(state)
+        declared = find_group(manifest, group_id)
+        ceiling = self._group_ceiling()
+        try:
+            plan = plan_group(declared, manifest, ceiling=ceiling)
+        except ParallelError as exc:
+            # Not overlapped, and said so. The node then runs through the ordinary path, which is the
+            # runner's own order — so a refused group degrades to exactly the behaviour it has today.
+            self._log("parallel.refused", level="warning", node_id=node_id,
+                      message=str(exc), detail={"group": group_id})
+            return self._run_sequentially(node_id, state, ctx, group_id=group_id, reason=str(exc))
+
+        # Members that are already recorded are excluded: on a rework pass or a resume the runners
+        # that have reported must not be re-run, or the group would re-spend what it already spent.
+        recorded = state.get("nodes") or {}
+        runnable = [m for m in plan.members
+                    if str(recorded.get(m, {}).get("status") or "") not in TERMINAL_STATUSES]
+        if node_id not in runnable or len(runnable) < 2:
+            self._log("parallel.degraded", node_id=node_id,
+                      detail={"group": group_id, "runnable": runnable,
+                              "reason": "fewer than two members still need to run"})
+            return self._run_sequentially(node_id, state, ctx, group_id=group_id,
+                                          reason="fewer than two members still need to run")
+
+        plan = type(plan)(group_id=plan.group_id, members=runnable, join=plan.join,
+                          ceiling=plan.ceiling, reason=plan.reason)
+        self._log("parallel.start", node_id=node_id,
+                  detail={"group": group_id, "members": runnable, "ceiling": plan.ceiling,
+                          "join": plan.join, "reason": plan.reason})
+
+        def _member(member_id: str) -> dict[str, Any]:
+            """One member, run through the ordinary node path.
+
+            Deliberately the same `_run` the sequential walk uses, with only the node id differing —
+            so a member keeps its own binding, its own skill bundle, its own contract and its own
+            handoff. A member is not a fan-out item: it is a graph node that happens to have siblings,
+            and giving it a special path would be a second, quieter way for a node to execute.
+            """
+            member_node = self._node_for(member_id, state)
+            member_skill = str(member_node.get("skill") or "")
+            if not member_skill:
+                raise ExecutionError(
+                    f"parallel member {member_id!r} names no skill, so it cannot be bound. A group "
+                    "member is a graph node and must declare work like any other."
+                )
+            attempt = int(self._attempt_from_state(member_id, state) or 1)
+            return self._run(member_id, member_node, member_skill, state, attempt=attempt, ctx={})
+
+        outcome = run_group(plan, _member, on_event=self._group_emit)
+
+        # The leader's own result drives the graph. A member that failed is *not* folded into the
+        # leader's status: only the leader's node crosses the runner's edge, so a sibling's failure
+        # must travel as a named diagnostic and open question rather than as a verdict on the leader,
+        # which did nothing wrong.
+        leader = outcome.results.get(node_id)
+        if leader is None:
+            # The leader *did* run and failed. Re-running it would spend its tokens twice, so the
+            # failure is propagated instead — and the original exception rather than a wrapping one,
+            # because the runner's crash path reports it and a wrapper would hide what actually went
+            # wrong. The siblings' outcomes are logged first: they have already been paid for, and a
+            # reader needs to know which of them produced work before this node fell over.
+            reason = outcome.failures.get(node_id) or "the group's leader did not report"
+            self._log("parallel.leader_failed", level="error", node_id=node_id,
+                      message=reason, detail=outcome.as_dict())
+            original = outcome.exceptions.get(node_id)
+            if original is not None:
+                raise original
+            raise ExecutionError(
+                f"the parallel group's leader node {node_id!r} did not report: {reason}"
+            )
+
+        siblings = {m: r for m, r in outcome.results.items() if m != node_id}
+        merged = dict(leader)
+        merged["parallel"] = {
+            "group_id": group_id,
+            "members": list(plan.members),
+            "ceiling": plan.ceiling,
+            "peak_in_flight": outcome.peak_in_flight,
+            "complete": outcome.complete,
+            "siblings": {m: {"status": r.get("status"), "verdict": r.get("verdict")}
+                         for m, r in siblings.items()},
+            "failed": dict(outcome.failures),
+        }
+        if outcome.failures:
+            # Surfaced on the leader's result so the runner records them: the group's own failures
+            # must reach run-state, or a sibling that failed leaves no trace once this call returns.
+            merged["diagnostics"] = list(merged.get("diagnostics") or []) + [
+                f"parallel sibling {m} failed: {e}" for m, e in sorted(outcome.failures.items())
+            ]
+            merged["open_questions"] = list(merged.get("open_questions") or []) + [
+                {"question": f"parallel sibling {m} failed and must be re-run or reviewed: {e}",
+                 "assigned_to": "owner"}
+                for m, e in sorted(outcome.failures.items())
+            ]
+        self._log("parallel.finished", node_id=node_id, detail=outcome.as_dict())
+        return merged
+
+    def _run_sequentially(self, node_id: str, state: dict[str, Any], ctx: dict[str, Any], *,
+                          group_id: str, reason: str) -> dict[str, Any]:
+        """Run one node the ordinary way, carrying the reason its group was not overlapped.
+
+        The fallback for every group that could not be overlapped. It is deliberately the *same* call
+        the runner would have made, so a refused group is indistinguishable from not having the
+        feature — which is what makes enabling it safe.
+        """
+        node = self._node_for(node_id, state)
+        skill = str(node.get("skill") or ctx.get("skill") or "")
+        if not skill:
+            raise ExecutionError(
+                f"node {node_id!r} names no skill and is not a gate, so there is no capability to bind."
+            )
+        attempt = int(ctx.get("pass") or self._attempt_from_state(node_id, state) or 1)
+        result = self._run(node_id, node, skill, state, attempt=attempt, ctx=ctx)
+        diagnostics = list(result.get("diagnostics") or [])
+        diagnostics.append(f"parallel group {group_id!r} ran sequentially: {reason}")
+        return {**result, "diagnostics": diagnostics}
+
+    def _group_ceiling(self) -> int:
+        """How wide a group may overlap: the engine's own bound, from the same knob a fan-out reads."""
+        from .parallel import group_ceiling
+
+        capacity = None
+        try:
+            from .resources import derive_ceiling, detect
+
+            capacity = derive_ceiling(detect())["ceiling"]
+        except Exception:  # noqa: BLE001 - an unmeasurable machine falls back to the configured bound
+            capacity = None
+        return group_ceiling(self.ctx.config, capacity=capacity)
+
+    def _group_emit(self, kind: str, payload: dict[str, Any]) -> None:
+        """Fan a group's own events onto the run's bus, tagged so the UI can group them.
+
+        Best-effort: a group must not fail because an event sink did. The tag matters because a
+        group's members are concurrent, so their spans arrive interleaved — without it a reader cannot
+        tell which node a span belonged to.
+        """
+        bus = self.ctx.bus
+        if bus is None:
+            return
+        try:
+            from .protocol import EventType
+
+            bus.emit(EventType.AGENT_LOG, payload={
+                "stream": "stderr", "level": "info", "event": kind,
+                "text": f"{kind}: {payload.get('group', '')} {payload.get('node', '')}".strip(),
+                "parallel": payload,
+            })
+        except Exception:  # noqa: BLE001 - reporting must never break a group
+            pass
 
     # ── gates ───────────────────────────────────────────────────────────────
 
@@ -376,6 +645,16 @@ class NodeExecutor:
         pins = self.ctx.pins_for_prefix
         if pins is None:
             return
+        # A resumed run re-pins from the store before re-deriving, so a continuation sends the bytes
+        # its predecessor actually sent rather than bytes that merely look the same from here. That
+        # difference is the whole saving: the provider's cache holds the *old* bytes, and a skill
+        # edited between runs would otherwise go cold with nothing reporting why.
+        resumed = pins.resume_from_store(skill=skill, tools=tools, store=self._cache_store(),
+                                         system=system, procedure=procedure)
+        if resumed is not None and getattr(resumed, "known", False) and resumed.unchanged:
+            self._log("prefix.resumed", detail={"skill": skill, "prefix": resumed.prefix_hash,
+                                                "observations": getattr(
+                                                    resumed.recorded, "observations", 0)})
         pins.get_or_pin(skill=skill, system=system, procedure=procedure, tools=tools)
         try:
             drift = pins.check(skill=skill, system=system, procedure=procedure, tools=tools)
@@ -399,13 +678,44 @@ class NodeExecutor:
                 except Exception:  # noqa: BLE001 - reporting must not break the node
                     pass
 
+    def _cache_store(self) -> Any:
+        """The durable cache record, if this run has one.
+
+        Reached through the gateway, which is where the host attaches it — the same object the pin
+        store writes to, so a compaction reads the evidence those two write rather than a second copy
+        that could disagree with it. None when nothing is attached, which `consult_store` reports as
+        having no opinion rather than as a cold prefix.
+        """
+        return getattr(self.ctx.gateway, "cache_store", None)
+
+    def _prefix_hash(self, skill: str = "") -> str:
+        """The digest of the prefix this run has pinned for a skill, or "" when there is none.
+
+        The hash space matters here: only `Prefix.prefix_hash` is comparable against the store's pin
+        records, and a request-shaped digest would answer "never seen" for a prefix that was pinned.
+        """
+        pins = self.ctx.pins_for_prefix
+        if pins is None:
+            return ""
+        try:
+            for key, prefix in pins.pinned_all().items():
+                if not skill or key.startswith(f"{skill}|"):
+                    return str(prefix.prefix_hash)
+        except Exception:  # noqa: BLE001 - a missing hash is "no opinion", not a failure
+            return ""
+        return ""
+
     def _run(self, node_id: str, node: dict[str, Any], skill: str, state: dict[str, Any], *,
              attempt: int, ctx: dict[str, Any]) -> dict[str, Any]:
-        """The full node protocol: bind, project, prompt, call, parse, persist, return.
+        """The full node protocol: bind, project, prompt, call, parse, persist, cross, return.
 
         One agent in the normal case, or several when the node was bound as a swarm. The swarm is
         resolved here rather than in the caller because the binding is what decides it — a node is a
         swarm only if its policy says so.
+
+        The handoff at the end is *one per node*, deliberately: a swarm's voters or a fan-out's items
+        are how this node reached its answer, not separate things that crossed the graph. Emitting a
+        handoff per voter would put edges on the flow board that no successor ever consumed.
         """
         bundle = self._load_skill(skill)
         is_reviewer = self._is_reviewer(skill, node)
@@ -422,26 +732,726 @@ class NodeExecutor:
         inputs = self._inputs_for(node, state)
         findings = self._findings_for(node_id, state) if not is_reviewer else []
 
+        self._emit_node_transition(
+            EventType.NODE_ENTER, node_id,
+            {"phase": str(node.get("phase") or ""), "skill": skill, "attempt": attempt})
+
         # ── fan-out, when the node splits work rather than answers one question ──
         # A node declaring `fanout` with a `{{item}}` template and an `items` list spreads the work
         # across agents. Distinct from the SWARM binding below, which is a *vote*: this splits a job,
         # that decides one. Both are resolved here because the node's own declaration is what chooses
         # between them, and neither is reachable unless something reads it.
         if node.get("fanout") or node.get("items"):
-            return self._run_fanout(node_id=node_id, node=node, skill=skill, state=state,
-                                    attempt=attempt, bundle=bundle, binding=binding,
-                                    inputs=inputs, findings=findings)
-
-        if binding.policy is BindingPolicy.SWARM and len(binding.agents) > 1:
-            return self._run_swarm(node_id=node_id, node=node, skill=skill, state=state,
+            result = self._run_fanout(node_id=node_id, node=node, skill=skill, state=state,
+                                      attempt=attempt, bundle=bundle, binding=binding,
+                                      inputs=inputs, findings=findings)
+            agent_id = binding.primary
+        elif binding.policy is BindingPolicy.SWARM and len(binding.agents) > 1:
+            result = self._run_swarm(node_id=node_id, node=node, skill=skill, state=state,
+                                     attempt=attempt, bundle=bundle, binding=binding,
+                                     is_reviewer=is_reviewer, inputs=inputs, findings=findings,
+                                     pooled=pooled)
+            agent_id = str((result.get("_agent") or {}).get("agent_id") or binding.primary)
+        else:
+            result = self._run_one(node_id=node_id, node=node, skill=skill, state=state,
                                    attempt=attempt, bundle=bundle, binding=binding,
                                    is_reviewer=is_reviewer, inputs=inputs, findings=findings,
-                                   pooled=pooled)
+                                   agent_id=binding.primary, pooled=pooled)
+            agent_id = binding.primary
 
-        return self._run_one(node_id=node_id, node=node, skill=skill, state=state,
-                             attempt=attempt, bundle=bundle, binding=binding,
-                             is_reviewer=is_reviewer, inputs=inputs, findings=findings,
-                             agent_id=binding.primary, pooled=pooled)
+        # Emitted before the crossing, so the exit precedes the handoff the node produced — the order
+        # a reader expects, and the order the timeline renders.
+        self._emit_node_transition(
+            EventType.NODE_EXIT, node_id,
+            {"status": str(result.get("status") or ""), "verdict": str(result.get("verdict") or ""),
+             "summary": str(result.get("summary") or "")[:300], "agent_id": agent_id,
+             "attempt": attempt})
+        return self._cross_node_boundary(node_id=node_id, node=node, state=state, result=result,
+                                         agent=self._agent_or_none(agent_id),
+                                         instruction=ctx.get("instruction") or "",
+                                         attempt=attempt)
+
+    def _agent_or_none(self, agent_id: str) -> Any:
+        """The bound agent, or None when the id cannot be resolved.
+
+        A handoff is still worth producing when the agent record is gone (a roster edited mid-run):
+        the budget fields then come from the run's own counters instead of the agent's, which is a
+        thinner payload rather than a missing one.
+        """
+        try:
+            return self.org.get(agent_id) if agent_id else None
+        except Exception:  # noqa: BLE001 - an unknown agent must not stop the crossing
+            return None
+
+    def _emit_node_transition(self, kind: EventType, node_id: str, payload: dict[str, Any]) -> None:
+        """Emit `node.enter` / `node.exit` for one node. Never raises.
+
+        These two were in the protocol and read by the timeline and the console, but **nothing ever
+        emitted them** — so a run's node transitions were visible only in the runner's checkpoint, and
+        anything watching the event stream saw a run that started, went quiet, and ended. That is
+        exactly the "a run that produced nothing looks like a hang" complaint, one level down.
+
+        Emitted around the *whole* node rather than around the model call, because a node's work is
+        the unit a person reasons about: bind, fan-out or swarm, review, cross. The phase travels so a
+        reader can group transitions without re-deriving the graph.
+        """
+        bus = self.ctx.bus
+        if bus is None:
+            return
+        try:
+            bus.emit(kind, node_id=node_id, payload=dict(payload))
+        except Exception:  # noqa: BLE001 - a display event must never break the node it describes
+            pass
+
+    def _cross_node_boundary(self, *, node_id: str, node: dict[str, Any], state: dict[str, Any],
+                             result: dict[str, Any], agent: Any, instruction: str,
+                             attempt: int) -> dict[str, Any]:
+        """Cross the node's edge: assemble, validate, persist, emit and record one handoff.
+
+        Last, and after the result is shaped, because the payload describes a *finished* node: the
+        artifact hashes, the criteria coverage and the usage figures only exist once the work does.
+
+        A node that did not reach `done` still crosses. `blocked`, `needs_review` and `skipped` are
+        registry statuses, and suppressing them would let a stuck node look like one that had not run
+        at all — which is the opposite of what the registry is for. What does *not* cross is a node
+        whose own contract refusal has already been reported, because that result is the refusal.
+
+        The refusal from the handoff contract is merged into the result rather than raised, so the
+        runner's bounded rework loop handles it and `_derive_stop_reason` still renders a cause.
+        A result that already *is* a refusal is left alone: re-crossing a node whose own contract
+        violation was just reported would report the same failure twice under a second name.
+        """
+        if result.get("verdict") == "contract-violation":
+            return result
+        refusal = self._deliver_handoff(
+            node_id=node_id, node=node, state=state, summary=str(result.get("summary") or ""),
+            artifacts=list(result.get("artifacts") or []),
+            decisions=list(result.get("decisions") or []),
+            # The node's own questions *joined with* what the run has already left open. Taking only
+            # one of the two would mean R6 measured nothing: the ceiling exists because a successor
+            # inherits the whole pile, so the pile is what must be counted.
+            open_questions=self._open_questions_after(result, state),
+            evidence=list(result.get("evidence") or []),
+            findings=list(result.get("findings") or []),
+            status=str(result.get("status") or "done"),
+            next_instruction=instruction, agent=agent, attempt=attempt,
+        )
+        if refusal is None:
+            return result
+        return {**result, **refusal}
+
+    def _open_questions_after(self, result: dict[str, Any],
+                              state: dict[str, Any]) -> list[dict[str, Any]]:
+        """Everything still unresolved once this node has finished.
+
+        Newest first, so a cap on the payload keeps the questions the *current* node just raised rather
+        than the oldest ones the run has been carrying — those are the ones a successor can still act
+        on, and a truncation that kept the stale end would make the ceiling actively harmful.
+        """
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for entry in [*(result.get("open_questions") or []), *(state.get("open_questions") or [])]:
+            if isinstance(entry, dict):
+                text = str(entry.get("question") or entry.get("text") or "")
+            else:
+                text = str(entry)
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            out.append(entry if isinstance(entry, dict) else {"question": text})
+        return out
+
+    # ── the handoff contract at a node boundary ─────────────────────────────
+    #
+    # Everything an agent-to-agent boundary does lives here: assemble the nine registry fields,
+    # validate them at the stage they belong to, persist the result, emit the lifecycle as events, and
+    # record the crossing as a ledger decision. The contract itself is `engine/org/handoff.py` and is
+    # deliberately not reimplemented — this module's job is to *call* it, because a contract no
+    # production code calls is a specification, not a mechanism.
+
+    #: The node statuses the handoff registry allows. A model that answers with something else has
+    #: still done work, so the value is normalised before it crosses rather than the crossing refused.
+    _HANDOFF_STATUSES = ("done", "blocked", "needs_review", "skipped")
+
+    #: The edge an assembly carries when no manifest edge is readable (an injected manifest in a test,
+    #: or a plan whose graph has not been written). Naming the library's own registry here keeps a
+    #: degraded handoff describable rather than anonymous.
+    _DEFAULT_PAYLOAD_NAME = "handoff-v1"
+
+    def _handoff_successor(self, node_id: str, state: dict[str, Any]) -> tuple[str, str]:
+        """Who this node hands to, and on which named payload.
+
+        Read from the manifest's own edges rather than from run-state, because run-state holds only
+        nodes that have *started* and the successor is exactly the node that has not. A node with no
+        outgoing edge is an end node and says so, rather than naming a target it invented.
+        """
+        for edge in self._manifest(state).get("edges") or []:
+            if not isinstance(edge, dict) or str(edge.get("from") or "") != node_id:
+                continue
+            target = str(edge.get("to") or "")
+            if target:
+                return target, str(edge.get("payload") or self._DEFAULT_PAYLOAD_NAME)
+        return "", ""
+
+    def _state_dir(self) -> Path:
+        """`.agent_state/` for this run, whichever form the workspace arrived in.
+
+        Three shapes reach here — a `Workspace`, a bare project path, and a path that already *is* the
+        state directory — so they are resolved in one place rather than at each call site.
+        """
+        workspace = self.ctx.workspace
+        state_dir = getattr(workspace, "state_dir", None)
+        path = Path(state_dir) if state_dir else Path(workspace)
+        if path.name == ENGINE_STATE_DIRNAME:
+            return path
+        return path / ENGINE_STATE_DIRNAME
+
+    # ── the payload: all nine registry fields, or none ──────────────────────
+
+    def _handoff_upstream_summary(self, state: dict[str, Any]) -> str:
+        """The summaries recorded before this node, newest last.
+
+        Taken from run-state because at assembly time this *is* the upstream's own record — the same
+        text the successor would read in the receiving node's intake block.
+        """
+        nodes = state.get("nodes") or {}
+        summaries = [f"{name}: {str(rec.get('summary') or '')[:120]}"
+                     for name, rec in nodes.items()
+                     if isinstance(rec, dict) and rec.get("summary")]
+        return " | ".join(summaries[-3:])
+
+    def _handoff_paths(self, state: dict[str, Any]) -> list[str]:
+        """Paths a successor would need, by reference rather than by inlined body."""
+        return [str(info.get("path")) for info in (state.get("artifacts") or {}).values()
+                if isinstance(info, dict) and info.get("path")]
+
+    def _handoff_context(self, node_id: str, node: dict[str, Any], state: dict[str, Any],
+                         *, problem: str) -> dict[str, Any]:
+        """The five-element delegation context a boundary must carry.
+
+        Built from what is already in hand — the upstream summary, the run's open questions, its
+        artifact index, the node's own declared title and description — rather than from a new model
+        call. The elements may be sparse; they may not be absent, which is why all five go in even when
+        a value is an empty list or a placeholder line. An absent element is what makes a delegate
+        re-discover the problem from scratch and arrive at a different fix.
+        """
+        record = (state.get("nodes") or {}).get(node_id)
+        record = record if isinstance(record, dict) else {}
+        tried = record.get("tried")
+        if not isinstance(tried, list):
+            tried = [q.get("question") if isinstance(q, dict) else str(q)
+                     for q in (state.get("open_questions") or [])]
+        upstream = self._handoff_upstream_summary(state)
+        return build_context_pass_through(
+            problem=(str(node.get("title") or "").strip() or problem[:400]
+                     or f"carry {node_id} to its successor"),
+            tried=[str(item)[:200] for item in tried][:5],
+            logs=(f"{node_id}: {upstream[:400]}" if upstream
+                  else f"{node_id}: no upstream summary recorded for this run"),
+            paths=self._handoff_paths(state),
+            hypothesis=(str(node.get("description") or "").strip()
+                        or "the node's declared completion contract is the test of this handoff"),
+        )
+
+    def _handoff_constraints(self, state: dict[str, Any], session: Session,
+                             inherited: Iterable[dict[str, Any]] = ()) -> list[dict[str, Any]]:
+        """The non-negotiable constraints the receiver must not lose.
+
+        Three sources, and the *inherited* one is what makes rule R2 a real check rather than a
+        formality: what this node received must be handed on. A constraint is protected across a chain
+        only if each hop carries it forward, so reading only this node's own pins would let
+        "NEVER store passwords in plaintext" survive one boundary and vanish at the next — which is
+        precisely the silent loss R2 exists to catch.
+
+        Session pins are next, because they are the text the prompt actually pinned, so the payload
+        describes what was really carried rather than what was hoped for. The run's own injected
+        constraints come last, as the wider floor beneath both.
+        """
+        out: list[dict[str, Any]] = []
+        for entry in inherited:
+            if not isinstance(entry, dict) or not entry.get("non_negotiable"):
+                continue
+            value = str(entry.get("value") or "").strip()
+            if value and not any(c["value"] == value for c in out):
+                out.append({"type": str(entry.get("type") or "constraint"), "value": value,
+                            "source": str(entry.get("source") or "inherited"),
+                            "non_negotiable": True})
+        for text in list(getattr(session, "pinned", []) or []):
+            value = str(text).strip()
+            if value and not any(c["value"] == value for c in out):
+                out.append({"type": "constraint", "value": value, "source": "session",
+                            "non_negotiable": True})
+        for entry in (state.get("constraints") or []):
+            value = str(entry.get("value") if isinstance(entry, dict) else entry).strip()
+            if value and not any(c["value"] == value for c in out):
+                out.append({"type": "constraint", "value": value, "source": "run",
+                            "non_negotiable": True})
+        return out[:24]
+
+    def _verification_evidence(self, evidence: list[Any],
+                               findings: list[dict[str, Any]]) -> dict[str, Any]:
+        """The criterion -> evidence map the registry asks for.
+
+        The runner's `evidence` is a flat list; the registry's `verification_evidence` is a map, and
+        the difference is not decoration: a flat list cannot say *which* criterion an item evidences, so
+        a receiver cannot tell coverage from noise. Anything that names no criterion lands under
+        `_other` rather than being dropped — losing evidence is the failure the registry exists to
+        prevent, and the registry's own rule is that an empty map describes a claim, not a completion.
+        """
+        out: dict[str, Any] = {}
+        other: list[str] = []
+        for entry in evidence:
+            text = str(entry)
+            key, separator, value = text.partition(":")
+            key, value = key.strip(), value.strip()
+            if separator and key and value:
+                existing = out.get(key)
+                if isinstance(existing, list):
+                    existing.append(value)
+                elif existing is None:
+                    out[key] = [value]
+                else:  # a non-list value under this key: keep both rather than overwrite one
+                    out[key] = [str(existing), value]
+                continue
+            other.append(text)
+        if findings:
+            out["findings"] = [f"{f.get('severity', '?')}: {str(f.get('issue') or '')[:160]}"
+                               for f in findings[:10]]
+        if other or not out:
+            out["_other"] = other[:20]
+        return out
+
+    def _inherited_constraints(self, node_id: str) -> list[dict[str, Any]]:
+        """The non-negotiable constraints this node received, if any crossed into it."""
+        with self.registries:
+            handoff = self.inbound.get(node_id) if node_id else None
+        if handoff is None:
+            return []
+        constraints = handoff.payload.get("constraints")
+        return [c for c in constraints if isinstance(c, dict)] if isinstance(constraints, list) else []
+
+    def _handoff_next(self, target: str, instruction: str) -> str:
+        """What the successor should do, from the graph edge and the node's own instruction.
+
+        Derived, never invented: the edge is the authority on *who* is next, so a free-text `next` that
+        contradicted it would be worse than a plain one. The instruction, when there is one, is the
+        node's own statement of what it is for — which is what a successor needs and what a summary
+        alone does not always give.
+        """
+        if instruction:
+            return instruction[:600]
+        if target:
+            return f"consume this handoff as {target}"
+        return "the run ends here; no successor consumes this handoff"
+
+    def _run_budget(self, state: dict[str, Any], session: Session) -> dict[str, Any]:
+        """Budget fields for a handoff built without a bound agent (a first node, or a gate)."""
+        run_budget = state.get("budget") or {}
+        return {
+            "tokens_used": 0,
+            "usd_used": 0.0,
+            "tokens_allocated": 0,
+            "usd_allocated": 0.0,
+            "steps_used": int(run_budget.get("steps_used") or 0),
+            "iterations": int(getattr(session, "attempt", 0) or 0),
+            "session_saturation": round(float(getattr(session, "saturation", 0.0) or 0.0), 4),
+            "context_window": int(getattr(session, "window", 0) or 0),
+        }
+
+    def _agent_budget(self, agent: Any, session: Session, state: dict[str, Any]) -> dict[str, Any]:
+        """Budget fields for a handoff built around a bound agent.
+
+        Both sources are read because neither is complete alone: the executor knows the agent's own
+        allocation and the session's saturation, while the run's step counters are the ones the runner
+        enforces. A figure reported as zero when it was merely unreported would read as free.
+        """
+        out = self._run_budget(state, session)
+        runtime = getattr(agent, "budget", None)
+        out.update({
+            "tokens_used": int(getattr(runtime, "spent_tokens", 0) or 0),
+            "usd_used": round(float(getattr(runtime, "spent_usd", 0.0) or 0.0), 6),
+            "tokens_allocated": int(getattr(runtime, "allocated_tokens", 0) or 0),
+            "usd_allocated": round(float(getattr(runtime, "allocated_usd", 0.0) or 0.0), 6),
+        })
+        return out
+
+    def _build_handoff(self, *, node_id: str, node: dict[str, Any], state: dict[str, Any],
+                       summary: str, artifacts: list[Any] = (), decisions: list[Any] = (),
+                       open_questions: list[Any] = (), evidence: list[Any] = (),
+                       findings: list[dict[str, Any]] | None = None,
+                       origin: str = "", target: str = "", status: str = "done",
+                       next_instruction: str = "", agent: Any = None,
+                       session: Session | None = None,
+                       attempt: int = 1) -> Handoff:
+        """Assemble the typed handoff for one boundary — all nine registry fields, always present.
+
+        **A missing field is a violation, not an omission.** Every key in the library's payload
+        registry is populated unconditionally, including the ones that are legitimately empty for a
+        given node: a receiver that cannot see `open_questions` cannot know what upstream left
+        unresolved, and will re-derive it wrongly. So an empty list is a *value* and an absent key is a
+        *defect*, and the two must not be conflated — which is why nothing here is conditional on the
+        data being non-empty.
+
+        The token cost is bounded by construction rather than by hope: every list is capped and every
+        string truncated, so rule R1 is satisfied by assembly instead of by a refusal the node could not
+        have acted on.
+
+        Nothing here calls a model. Every value is read from data the node's own execution already
+        produced — its trailer, its artifacts, its session, the graph's edge — because a handoff that
+        needed its own calls would be a second, ungoverned spend on the hot path.
+        """
+        session = session if session is not None else Session(
+            agent_id=origin or node_id or "handoff", node_id=node_id, window=1)
+        if status not in self._HANDOFF_STATUSES:
+            status = "done"
+        if not target and node_id:
+            target, _name = self._handoff_successor(node_id, state)
+        payload: dict[str, Any] = {
+            "status": status,
+            "summary": str(summary or "")[:2000],
+            "artifacts": list(artifacts)[:32],
+            "decisions": list(decisions)[:16],
+            "open_questions": list(open_questions),
+            "verification_evidence": self._verification_evidence(list(evidence), list(findings or [])),
+            "context": self._handoff_context(node_id, node, state, problem=str(summary or "")),
+            "budget": (self._agent_budget(agent, session, state) if agent is not None
+                       else self._run_budget(state, session)),
+            "next": self._handoff_next(target, next_instruction),
+            # Constraints travel as their own key rather than folded into the prose: rule R2 compares
+            # them against what upstream carried, and it can only do that if they are structured. What
+            # this node *received* is passed through, which is what makes R2 a check across a chain
+            # rather than against a single hop.
+            "constraints": self._handoff_constraints(
+                state, session, self._inherited_constraints(origin)),
+        }
+        # A guard on this module's own assembly rather than on the data. The registry check would
+        # refuse an incomplete payload at the edge anyway, but a field *this file* forgot to populate
+        # is an engine defect rather than a node's fault, so it is named here — where someone can fix
+        # it — instead of arriving as a contract violation the agent is blamed for.
+        missing = [name for name in HANDOFF_REQUIRED_FIELDS if name not in payload]
+        if missing:
+            self._log("handoff.assembly.defect", level="error", node_id=node_id,
+                      message=f"handoff payload assembled without {', '.join(missing)}",
+                      detail={"missing": missing})
+        return Handoff(payload=payload, origin=origin or node_id, target=target,
+                       attempt=int(attempt or 1))
+
+    # ── validation, refusal, and the mechanisms that read the verdict ───────
+
+    def _refuse_handoff(self, handoff: Handoff, node_id: str, verdict: Any, *, stage: str,
+                        detail: str = "") -> dict[str, Any]:
+        """Report a refused handoff as a contract-shaped refusal the bounded loop can act on.
+
+        **A refusal must not crash the run.** A payload that fails R1, R3, R4, R5 or R6 is a node whose
+        work cannot advance, which is exactly what the runner's bounded rework loop already exists to
+        handle: the node is reported `needs_review` with the rule that fired, and the loop retries or
+        escalates under its own budget. Raising would skip the loop and discard work that was genuinely
+        done, which is a worse outcome than a reported refusal.
+
+        The `contract` log entry is deliberate rather than incidental: `_derive_stop_reason` treats a
+        `contract` entry as a *named cause*, so a run that stops here reports "a node's completion
+        contract was violated — R1: …" instead of the bare unreadable `blocked` this codebase has
+        already been bitten by once.
+        """
+        rule_reason = verdict.reason if not verdict.ok else "the handoff contract refused this transition"
+        reason = f"handoff {stage} refused: {rule_reason}" + (f" ({detail})" if detail else "")
+        self._log("contract", level="warning", node_id=node_id, message=reason,
+                  detail={"stage": stage, "rules": list(verdict.rules),
+                          "handoff_id": handoff.handoff_id, "target": handoff.target})
+        # `from_agent` carries the *node* here rather than a person, because the refusal happens at the
+        # edge and the board resolves ids to names itself. Passing a name that does not exist would be
+        # worse than passing the node the reader can already see.
+        self._emit_handoff(handoff, EventType.HANDOFF_REJECTED, from_agent=handoff.origin)
+        # Only the fields the *contract* owns are returned. The node's own evidence, artifacts and
+        # criteria coverage are preserved by the caller, because the refusal is about the payload, not
+        # about the work: replacing them here would make the runner's own contract check report a
+        # second, vaguer failure that then shadows the rule name in the stop reason.
+        return {
+            "status": "needs_review",
+            "verdict": "contract-violation",
+            "summary": reason[:400],
+            "diagnostics": [f"{rule} at {stage}" for rule in verdict.rules] or [stage],
+            "handoff_id": handoff.handoff_id,
+        }
+
+    def _cross_handoff(self, handoff: Handoff, *, node_id: str, agent: Any,
+                       summary: str) -> dict[str, Any] | None:
+        """Run one handoff through the contract's lifecycle. Returns a refusal dict, or None.
+
+        The order is the contract's own: **propose** (R1/R3/R5/R6 and the registry), then persist,
+        then **accept** (R2/R4/R8), then **deliver** (R7), then **fulfil** (R7 again). R7 is checked
+        *after* acceptance rather than before it, because acceptance is precisely what satisfies the
+        rule — checking it first would refuse every legitimate handoff. The rule is therefore not
+        skipped, it is enforced where it can be true.
+
+        A payload that passes every stage is persisted, emitted and recorded; the receiver's copy is
+        what the next node's prompt is built from. A refusal is returned and never raised, so the
+        caller can hand it to the runner's rework loop rather than killing the run.
+        """
+        agent_name = getattr(agent, "name", "") or ""
+        # Emitted *before* the propose rules are checked, because the proposal genuinely happened: the
+        # state machine's PROPOSED is the state a handoff is in until it is accepted, and the propose
+        # rules are what gate the transition out of it. A board that showed nothing for a refused
+        # proposal would hide the exact event worth seeing.
+        self._emit_handoff(handoff, EventType.HANDOFF_PROPOSED, from_agent=agent_name,
+                           to_agent=self._agent_name(handoff.target))
+
+        verdict = validate_handoff(handoff, stage="propose")
+        if not verdict.ok:
+            return self._refuse_handoff(handoff, node_id, verdict, stage="propose")
+
+        # Persisted only once the proposal is sound: a refused payload on disk would be a record of a
+        # crossing that never happened, which is worse than no record.
+        self._persist_handoff(handoff)
+        with self.registries:
+            self.handoffs[handoff.handoff_id] = handoff
+
+        for stage, transition, event in (
+            ("accept", handoff.accept, EventType.HANDOFF_ACCEPTED),
+            # IN_PROGRESS is a real state between acceptance and delivery, not a formality: it is the
+            # receiver's acknowledgement that it has begun, and the state machine refuses to fulfil a
+            # contract that skipped it. No event is emitted for it because the protocol declares none —
+            # inventing an event type the Swift side cannot mirror is how the trace stops being
+            # replayable.
+            ("accept", handoff.start, None),
+            ("deliver", None, None),
+            ("fulfil", handoff.fulfil, EventType.HANDOFF_FULFILLED),
+        ):
+            if stage == "deliver":
+                # R7 is checked *here* rather than before acceptance, which is the rule's own ordering:
+                # acceptance is precisely what satisfies it, so checking it earlier would refuse every
+                # legitimate handoff. Checked at delivery it is a real check against a state a legal
+                # handoff genuinely reaches.
+                delivery = validate_handoff(handoff, stage="deliver")
+                if not delivery.ok:
+                    return self._refuse_handoff(handoff, node_id, delivery, stage="deliver")
+                continue
+            try:
+                stage_verdict = transition()
+            except HandoffError as exc:
+                # The transition refused and left the state where it was, so the verdict is recomputed
+                # to name the rule rather than reported as a bare state-machine error.
+                return self._refuse_handoff(handoff, node_id,
+                                            validate_handoff(handoff, stage=stage),
+                                            stage=stage, detail=str(exc))
+            # `start` returns None: IN_PROGRESS carries no rules of its own, so there is no verdict to
+            # read — a stage that validated nothing cannot be reported as having validated.
+            if stage_verdict is not None and not stage_verdict.ok:  # pragma: no cover
+                return self._refuse_handoff(handoff, node_id, stage_verdict, stage=stage)
+            if event is not None:
+                self._emit_handoff(handoff, event, from_agent=agent_name,
+                                   to_agent=self._agent_name(handoff.target))
+            if stage == "fulfil":
+                # `verified` means the payload cleared every stage of the contract end to end. It is
+                # emitted from the same verdict the transitions produced rather than from a second,
+                # weaker opinion, so the board's "verified" and the contract cannot disagree.
+                self._emit_handoff(handoff, EventType.HANDOFF_VERIFIED, from_agent=agent_name,
+                                   to_agent=self._agent_name(handoff.target))
+
+        self._record_handoff_gate(handoff, node_id=node_id, agent=agent, summary=summary)
+        # Rewritten now that the state machine has settled. The propose-time write recorded PROPOSED
+        # and nothing updated it, so the file on disk said PROPOSED while the trace and the in-memory
+        # object said FULFILLED — two records of one crossing disagreeing, which is exactly what a
+        # persisted handoff exists to prevent. Found by reading a real run's `.agent_state/handoffs/`
+        # and comparing it to its own trace.
+        #
+        # Written here rather than inside the stage loop so one crossing produces one file, updated
+        # once, rather than a write per transition.
+        self._persist_handoff(handoff)
+        return None
+
+    def _agent_name(self, node_id: str) -> str:
+        """The name of the agent bound to a node, when one is known.
+
+        Best-effort for the board's benefit: the flow board resolves ids to names itself, so an empty
+        answer costs a nicer label and nothing else.
+        """
+        if not node_id:
+            return ""
+        with self.registries:
+            executed = self.history.get(node_id)
+            return executed.agent_name if executed is not None else ""
+
+    # ── persistence, events, and the ledger ────────────────────────────────
+
+    def _persist_handoff(self, handoff: Handoff) -> Path | None:
+        """Write the handoff to `handoffs/<id>.json`, atomically.
+
+        Temp-then-`os.replace` with an fsync, matching every other durable write in the engine: a reader
+        (the flow board, or an operator asking what crossed) must see either the previous complete
+        document or the new one, never a torn one. Failure is logged and returns None rather than
+        raising, because losing the *record* of a crossing is a smaller failure than losing the
+        crossing — and the payload is bounded by assembly, so this can never write an unbounded blob.
+        """
+        target = self._state_dir() / "handoffs" / f"{handoff.handoff_id}.json"
+        tmp = target.with_name(target.name + f".tmp.{os.getpid()}")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(handoff.as_dict(), fh, indent=2, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, target)
+        except OSError as exc:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._log("handoff.persist.failed", level="warning", node_id=handoff.origin,
+                      message=f"could not write {target}: {exc}")
+            return None
+        return target
+
+    def _emit_handoff(self, handoff: Handoff, event: "EventType", *, from_agent: str = "",
+                      to_agent: str = "") -> None:
+        """Emit one `handoff.*` event, in the exact shape the flow board reads.
+
+        `handoff_id`, `from_node`, `to_node` and `summary` are the keys `flow._handoffs` keys and labels
+        rows on, so all four are always present — a board that could not name a crossing would show an
+        edge that moved information as nothing at all, which is the state this wiring exists to end.
+        """
+        bus = self.ctx.bus
+        if bus is None:
+            return
+        try:
+            bus.emit(event, node_id=handoff.origin, payload={
+                "handoff_id": handoff.handoff_id,
+                "from_node": handoff.origin,
+                "to_node": handoff.target,
+                "from_agent": from_agent,
+                "to_agent": to_agent,
+                "state": handoff.state.value,
+                "status": handoff.payload.get("status"),
+                "summary": str(handoff.payload.get("summary") or "")[:400],
+                "artifacts": [str(a.get("path") if isinstance(a, dict) else a)
+                              for a in (handoff.payload.get("artifacts") or [])][:12],
+            })
+        except Exception:  # noqa: BLE001 - the trace must never break a node
+            pass
+
+    def _handoff_gate_name(self, node_id: str, target: str) -> str:
+        """The ledger gate a crossing is recorded at: the edge, named for both of its ends.
+
+        Named for the edge rather than the node because the decision being recorded is *this* crossing;
+        "which node handed what to whom, and on what grounds" is a question about the pair.
+        """
+        return f"handoff:{node_id}->{target}" if target else f"handoff:{node_id}"
+
+    def _record_handoff_gate(self, handoff: Handoff, *, node_id: str, agent: Any,
+                             summary: str) -> None:
+        """Record the crossing as a decision in the ledger.
+
+        A handoff *is* a decision — this node decided its work was good enough to hand on — and without
+        an entry, the answer to "on what grounds did that cross" stops existing the moment the run ends.
+
+        Best-effort by construction: a ledger that refuses (an irreversible decision already stands at
+        this gate) must not stop a crossing the contract has already validated, so the refusal is
+        logged and the handoff stands. It is also recorded as *reversible*, because the successor may
+        reject it and the loop may rework — recording it irreversible would make the second pass
+        impossible, which is a mechanism fighting the machine it was built for.
+        """
+        ledger = self._ledger()
+        try:
+            ledger.record(
+                gate=self._handoff_gate_name(node_id, handoff.target),
+                choice=f"{handoff.payload.get('status')} -> {handoff.target or 'end'}",
+                rationale=(summary or str(handoff.payload.get("summary") or ""))[:400],
+                by=getattr(agent, "id", "") or "",
+                node_id=node_id,
+                attempt=handoff.attempt,
+                reversible=True,
+                confidence="medium",
+                rejected_alternatives=["halt rather than hand on unverified work"],
+            )
+        except Exception as exc:  # noqa: BLE001 - an unrecordable crossing must still cross
+            self._log("handoff.ledger.failed", level="warning", node_id=node_id, message=str(exc))
+
+    def _ledger(self) -> Any:
+        """The decision ledger: the injected one, or this run's own on disk."""
+        ledger = getattr(self.ctx, "ledger", None)
+        if ledger is None:
+            ledger = getattr(self, "_own_ledger", None)
+            if ledger is None:
+                ledger = Ledger(path=self._state_dir() / "ledger.jsonl")
+                self._own_ledger = ledger
+        return ledger
+
+    # ── the two ends ───────────────────────────────────────────────────────
+
+    def _inbound_payload(self, node_id: str) -> dict[str, Any] | None:
+        """What this node was actually handed, or None at the first node.
+
+        The prompt is built from the *validated* handoff rather than from run-state, because the whole
+        point of validating at the boundary is that the receiver may rely on the shape — a prompt fed
+        from unvalidated state would be the same untyped path with extra steps. This is the consuming
+        half of the wiring: node N+1's input is the handoff node N produced.
+        """
+        with self.registries:
+            handoff = self.inbound.get(node_id)
+        return dict(handoff.payload) if handoff is not None else None
+
+    def _handoff_for_consumer(self, handoff: Handoff, node_id: str) -> Handoff | None:
+        """The same payload seen from the receiving end, re-validated before it is consumed.
+
+        A distinct object rather than a mutation: the sender's record stays exactly what it sent (so its
+        checksum still matches the file on disk and `from_dict` round-trips), while the receiver holds a
+        copy addressed to the node that will read it. Mutating one object for both ends is how a
+        persisted handoff ends up describing an edge that never existed.
+
+        Revalidated at `accept` — R4's own stage — rather than trusted because the sender just passed.
+        The receiver is a *different object* in a different place, and R4 exists precisely because state
+        can change between the two; a receiver that skipped the check would be taking the sender's word
+        for the one rule that exists to catch corruption. A violation returns None, so the successor
+        falls back rather than being handed state no rule could verify.
+        """
+        received = Handoff(payload=dict(handoff.payload), origin=handoff.origin, target=node_id,
+                           kind="handoff", attempt=handoff.attempt, checksum=handoff.checksum)
+        verdict = validate_handoff(received, stage="accept", previous=handoff)
+        if verdict.ok:
+            return received
+        # R2 compares against the sender's own payload, so in-process the only reachable failures here
+        # are R4 (the payload changed between the two objects) and R8 (an unmarked override). Both mean
+        # the receiver must not act on this payload, and the mismatch is named rather than swallowed.
+        self._log("contract", level="warning", node_id=node_id,
+                  message=f"received handoff refused at the boundary: {verdict.reason}",
+                  detail={"stage": "accept", "rules": list(verdict.rules),
+                          "handoff_id": handoff.handoff_id})
+        self._emit_handoff(received, EventType.HANDOFF_REJECTED, from_agent=handoff.origin)
+        return None
+
+    def _deliver_handoff(self, *, node_id: str, node: dict[str, Any], state: dict[str, Any],
+                         summary: str,
+                         artifacts: list[Any] = (), decisions: list[Any] = (),
+                         open_questions: list[Any] = (), evidence: list[Any] = (),
+                         findings: list[dict[str, Any]] | None = None, status: str = "done",
+                         next_instruction: str = "", agent: Any = None,
+                         attempt: int = 1) -> dict[str, Any] | None:
+        """Assemble, validate, persist, emit and record the crossing at one node boundary.
+
+        The single entry point the node protocol calls, so there is exactly one place an edge is
+        crossed and no second, quieter path can develop. Returns a refusal dict when the payload may
+        not advance, or None when it crossed — the caller merges the refusal into its own result rather
+        than catching an exception.
+        """
+        session = self.ctx.sessions.get(f"{getattr(agent, 'id', '')}:{node_id}") if agent else None
+        handoff = self._build_handoff(
+            node_id=node_id, node=node, state=state, summary=summary, artifacts=artifacts,
+            decisions=decisions, open_questions=open_questions, evidence=evidence,
+            findings=findings, origin=node_id, status=status,
+            next_instruction=next_instruction, agent=agent, session=session, attempt=attempt,
+        )
+        refusal = self._cross_handoff(handoff, node_id=node_id, agent=agent, summary=summary)
+        if refusal is not None:
+            return refusal
+        successor, _name = self._handoff_successor(node_id, state)
+        if successor:
+            # Only a *crossed* handoff becomes the successor's input. A refused one must not, or the
+            # successor would be prompted with state the contract has just rejected.
+            received = self._handoff_for_consumer(handoff, successor)
+            if received is not None:
+                with self.registries:
+                    self.inbound[successor] = received
+        return None
 
     # ── the pool ────────────────────────────────────────────────────────────
 
@@ -506,6 +1516,29 @@ class NodeExecutor:
         except Exception as exc:  # noqa: BLE001 - the node's result stands regardless
             self._log("pool.settle.failed", level="warning", node_id=node_id, message=str(exc))
 
+    def _renew_pooled(self, pooled: Any, agent: Any, node_id: str) -> None:
+        """Extend the lease on the pooled task this node claimed.
+
+        `TaskPool.renew` is the heartbeat `DEFAULT_LEASE_S` always assumed and nothing ever sent:
+        without a caller the lease is a countdown from the claim that no live worker can reset, so a
+        node that legitimately runs longer than 900s has its task reclaimed by `_expire_leases`,
+        handed to a *second* worker, and executed twice — while this worker's `complete` then fails
+        as "not claimed by agent" and its output is discarded as a warning. The pool side was fixed
+        first; this is the caller that makes the fix reachable.
+
+        Called once after the model call and once per tool step. The second site matters because the
+        post-call renewal cannot cover a node that then spends minutes inside tools — the lease would
+        lapse mid-loop exactly as it could mid-call. Never raises: a lease problem is a warning, not a
+        reason to lose the work this node has already done.
+        """
+        if pooled is None or self.ctx.pool is None:
+            return
+        try:
+            self.ctx.pool.renew(pooled.id, agent)
+        except Exception as exc:  # noqa: BLE001 - a lease problem must not kill the node
+            self._log("pool.renew.failed", level="warning", node_id=node_id,
+                      agent_id=agent.id, message=str(exc))
+
     def _run_one(self, *, node_id: str, node: dict[str, Any], skill: str, state: dict[str, Any],
                  attempt: int, bundle: Any, binding: Any, is_reviewer: bool,
                  inputs: dict[str, Any], findings: list[dict[str, Any]],
@@ -547,7 +1580,9 @@ class NodeExecutor:
                     or self._instruction_for(node_id, node, skill, state,
                                              resolved_inputs=inputs)),
                 inputs=inputs,
-                handoff=self._handoff_payload(state),
+                # The *validated* handoff when one crossed into this node, and the run-state adapter
+                # only when nothing did. Reading run-state first would be the untyped path again.
+                handoff=self._inbound_payload(node_id) or self._handoff_payload(state),
                 recalled=prepared["recall"],
                 findings=findings,
                 attempt=attempt,
@@ -556,6 +1591,10 @@ class NodeExecutor:
                 is_reviewer=is_reviewer,
                 may_delegate=bool(self.ctx.config and
                                   getattr(self.ctx.config.delegation, "max_depth", 0)),
+                # The refusal a bounded rework pass is answering, as the runner reported it. Without
+                # it a retry is the identical prompt — and an identical prompt fails identically, so
+                # the whole window would be spent proving the first attempt.
+                contract_rework=dict(self._rework_context(state)),
             ),
             agent_name=agent.name,
             agent_skill=skill,
@@ -570,7 +1609,11 @@ class NodeExecutor:
 
         # ── the call, through the journal so a retry does not re-spend ──
         response = self._call(agent, prompt, node_id=node_id, attempt=attempt, session=session,
-                              bundle=bundle, node=node)
+                              bundle=bundle, node=node, pooled=pooled)
+        # Heartbeat immediately after the call. Everything above this line (context assembly, the
+        # prompt, the model call) can take longer than the 900s lease, and the tool loop renews per
+        # step on top of this — see `_renew_pooled`.
+        self._renew_pooled(pooled, agent, node_id)
         reply = response["text"]
         usage = response["usage"]
 
@@ -637,11 +1680,12 @@ class NodeExecutor:
         any guarantee: every subagent is still held to the skill's criteria and checklist.
 
         Results are merged conservatively: the artifacts of every successful item are kept (they are
-        different files, which is the point), and the node is `done` only when *every* item succeeded.
+        different files, which is the point), their usage is summed so the node's cost is the items'
+        cost rather than a zero, and the node is `done` only when *every* item succeeded.
         One failed item makes the whole node `needs_review` with the failures named, because a
         partially-reviewed change set that reported "done" would be a lie.
         """
-        from .fanout import FanoutError, plan_fanout, run_fanout
+        from .fanout import FanoutError, ItemOutcome, plan_fanout, run_fanout
 
         template = str(node.get("fanout") or "")
         items = [str(i) for i in (node.get("items") or [])]
@@ -662,30 +1706,48 @@ class NodeExecutor:
         self._log("fanout.start", node_id=node_id,
                   detail={"items": len(plan), "agents": voters, "max_parallel": max_parallel})
 
-        def _one(item: Any, agent_id: str) -> tuple[str, str, int]:
-            """Run one item as a full node execution. Injected so the plan owns only the policy."""
+        def _one(item: Any, agent_id: str) -> ItemOutcome:
+            """Run one item as a full node execution. Injected so the plan owns only the policy.
+
+            `_run_one` rather than the node entry point, deliberately: fan-out items are one node's
+            internal fan, so each item must *not* cross the graph edge. One handoff per node is emitted
+            by the caller once the items are aggregated, or the board would show twenty edges where the
+            graph has one.
+
+            An `ItemOutcome` rather than a bare `(output, error, tokens)` tuple: the items' `artifacts`
+            and `usage` are part of what a fan-out produced, and the tuple cannot carry them — so the
+            aggregate was summed from nothing and a downstream node was told a fan-out that wrote
+            twenty files had produced none.
+            """
             result = self._run_one(node_id=node_id, node=node, skill=skill, state=state,
                                    attempt=attempt, bundle=bundle, binding=binding,
                                    is_reviewer=True, inputs=inputs, findings=findings,
                                    agent_id=agent_id, instruction_override=item.prompt)
             usage = result.get("usage") or {}
             tokens = int(usage.get("tokens_in") or 0) + int(usage.get("tokens_out") or 0)
+            artifacts = list(result.get("artifacts") or [])
+            # Both branches carry the artifacts and usage, because both are facts about an item that
+            # really ran: a failed item still spent tokens and may still have written files. The
+            # aggregate keeps its own rule (`plan.summary()` sums over *successful* items only), so a
+            # failure's spend does not inflate the node's total.
             if str(result.get("status")) == "done":
-                return (str(result.get("summary") or ""), "", tokens)
-            return ("", str(result.get("summary") or result.get("status") or "not done"), tokens)
+                return ItemOutcome(output=str(result.get("summary") or ""), tokens=tokens,
+                                   artifacts=artifacts, usage=dict(usage))
+            return ItemOutcome(error=str(result.get("summary") or result.get("status") or "not done"),
+                               tokens=tokens, artifacts=artifacts, usage=dict(usage))
 
         run_fanout(plan, _one, agents=voters, max_parallel=max_parallel)
         summary = plan.summary()
         self._log("fanout.result", node_id=node_id, detail=summary)
 
-        winner = next((r for r in (self.history.get(node_id, None),) if r is not None), None)
-        base = self._fanout_result(node_id=node_id, plan=plan, summary=summary,
+        # Nothing is merged from `self.history`. `history[node_id]` is written once *per item* by
+        # `_run_one` → `_remember`, so it holds only whichever item finished last — and the
+        # `base.setdefault("artifacts", [])` that read it was a no-op on the key `base` had just been
+        # given, so it preserved nothing while claiming to. `summary` is the fan-out's own aggregate,
+        # summed over every successful item, so it *is* the record of what the items produced; merging
+        # the last item's artifacts back in would name one item's output twice.
+        return self._fanout_result(node_id=node_id, plan=plan, summary=summary,
                                    skill=skill, bundle=bundle, inputs=inputs)
-        if winner is not None:
-            # The node's own recorded result carries the artifacts and usage; the fan-out detail is
-            # added to it rather than replacing it, so nothing the executor already recorded is lost.
-            base.setdefault("artifacts", [])
-        return base
 
     def _fanout_items_from(self, state: dict[str, Any], node: dict[str, Any]) -> list[str]:
         """Items derived from an upstream artifact list, when the node names no explicit items.
@@ -735,8 +1797,13 @@ class NodeExecutor:
                         + (f", {summary['failed']} failed" if failures else ""))[:400],
             "evidence": [f"item {i.index}: {i.item}" for i in plan.items if i.ok][:20],
             "criteria_met": [],
-            "artifacts": [],
-            "usage": {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0},
+            # The aggregate `plan.summary()` computed, not a placeholder. These are the two fields
+            # that were hardcoded zeros: the node's own result is the sum of its items, and a
+            # downstream node reading `artifacts: []` was being told a twenty-file fan-out produced
+            # nothing. Key names are `summary()`'s: `artifacts` is the flattened list of successful
+            # items' artifact refs, `usage` is `tokens_in`/`tokens_out`/`cost_usd` summed over them.
+            "artifacts": list(summary.get("artifacts") or []),
+            "usage": dict(summary.get("usage") or {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0}),
             "fanout": {
                 "count": summary["count"],
                 "succeeded": summary["succeeded"],
@@ -930,11 +1997,20 @@ class NodeExecutor:
 
         Reads run-state first, so a resumed run knows the producer even though the in-memory map was
         lost. Falls back to the in-memory record.
+
+        The copies are taken *while holding* the registry lock, because a concurrent sibling node
+        writes `history` as it finishes: iterating the live dict here raised
+        `dictionary changed size during iteration`. Holding the lock across the whole scan also makes
+        the answer a consistent snapshot, which is what the independence refusal needs — a producer
+        read from half-updated state could name an agent that is about to be replaced.
         """
-        for other_id, exec_result in self.history.items():
+        with self.registries:
+            history = list(self.history.items())
+            producers = list(self.producers.items())
+        for other_id, exec_result in history:
             if other_id != node_id and not exec_result.findings:
                 return exec_result.agent_id
-        for other_id, agent_id in self.producers.items():
+        for other_id, agent_id in producers:
             if other_id != node_id:
                 return agent_id
         return None
@@ -1003,15 +2079,29 @@ class NodeExecutor:
         # Compact when warranted, then re-measure: one pass may not be enough, and the rotation
         # decision must be based on the post-compaction figure rather than the pre- one.
         if projection.must_compact:
+            # The durable store is consulted, not merely written to. Its verdict decides *which* run of
+            # turns to drop, and a compaction that breaks a prefix the store called warm is recorded
+            # against it — without that, the miss appears in `savings.jsonl` with nothing to attribute
+            # it to, which is how the cache came to be measured and never used.
             result = compact(session, compact_at=compact_at, evict_at=evict_at,
-                             overflow_at=overflow_at)
+                             overflow_at=overflow_at,
+                             cache_store=self._cache_store(), cache_prefix_hash=self._prefix_hash(),
+                             cache_skill=bundle.name)
             if result.effective:
                 compacted = 1
+                detail = {"band": result.band_before.value,
+                          "recovered": result.recovered,
+                          "preserved_verbatim": result.pinned_after,
+                          "aligned": result.aligned,
+                          "prefix_chars_kept": result.prefix_chars_kept}
                 self._log("session.compact", node_id=node_id, agent_id=agent_id,
-                          session_id=session.session_id,
-                          detail={"band": result.band_before.value,
-                                  "recovered": result.recovered,
-                                  "preserved_verbatim": result.pinned_after})
+                          session_id=session.session_id, detail=detail)
+                if result.invalidated_prefix is not None:
+                    # A line of its own, because "the cache went cold" is the statement worth being able
+                    # to grep for when a bill arrives.
+                    self._log("session.cache_invalidated", level="warning", node_id=node_id,
+                              agent_id=agent_id, session_id=session.session_id,
+                              detail=result.invalidated_prefix)
                 projection = project(session, system=system, skill_body=skill_body, pinned=pinned,
                                      recall=recall, new_message=new_message,
                                      reserve=session.output_reserve)
@@ -1091,6 +2181,13 @@ class NodeExecutor:
             if constraint.get("value"):
                 fresh.pin(str(constraint["value"]))
         fresh.rotation_count = session.rotation_count + 1
+        # Link the outgoing session to its replacement, so a fan-out *sibling* that is still mid-turn
+        # does not lose its exchange. Every item bound to one agent shares one `Session` object, so
+        # when one item rotates it the others' `append` lands on a sealed session whose transcript has
+        # already been serialized — it either raises `SessionError` or is silently lost. With the link,
+        # `append`/`pin`/`begin_phase` follow the rotation instead, which is what actually happened:
+        # the agent's thread moved on while the sibling finished its turn.
+        session.adopt_successor(fresh)
 
         self._log("session.rotate", node_id=node_id, agent_id=agent_id,
                   session_id=fresh.session_id,
@@ -1102,7 +2199,8 @@ class NodeExecutor:
     # ── the call ────────────────────────────────────────────────────────────
 
     def _call(self, agent: Any, prompt: Any, *, node_id: str, attempt: int, session: Session,
-              bundle: SkillBundle, node: dict[str, Any] | None = None) -> dict[str, Any]:
+              bundle: SkillBundle, node: dict[str, Any] | None = None,
+              pooled: Any = None) -> dict[str, Any]:
         """Make the model call, guarded by the effect journal.
 
         The journal matters here for a subtle reason: a retry of the same attempt must not re-spend. If
@@ -1111,12 +2209,15 @@ class NodeExecutor:
         A node that declares `tools: true` runs the **agentic loop** instead of one call: the model
         reads files, then writes, then answers. That is what lets an agent work on a real project
         rather than only on the artifacts a previous node handed it.
+
+        `pooled` is the claimed task, threaded through only so the tool loop can renew its lease per
+        step — a node that spends minutes inside tools would otherwise let the lease lapse.
         """
         from .providers.base import ChatRequest, Message, Role
 
         if node is not None and self._tools_enabled(node):
             return self._call_with_tools(agent, prompt, node_id=node_id, attempt=attempt,
-                                         session=session, bundle=bundle, node=node)
+                                         session=session, bundle=bundle, node=node, pooled=pooled)
 
         request = ChatRequest(
             model=agent.model,
@@ -1162,7 +2263,7 @@ class NodeExecutor:
 
         read_only = bool(node.get("read_only")) or not (self.ctx.config is None) and bool(
             getattr(getattr(self.ctx.config, "executor", None), "tools_read_only", False))
-        return ToolRegistry(
+        registry = ToolRegistry(
             workspace_root=self.ctx.workspace,
             agent=agent,
             # The workspace's own writer, so containment and atomicity have one implementation.
@@ -1174,7 +2275,67 @@ class NodeExecutor:
             # Only when subagents are enabled for this run: otherwise `task`/`fleet` would be offered
             # with no way to collect a child, which is worse than not offering them at all.
             subagents=self._subagent_runner(agent, node),
+            # Passed unconditionally: `sandbox.enabled` is what decides whether `run_command` is
+            # advertised, and keeping that decision in one place means this call site cannot
+            # accidentally offer a shell the operator did not turn on.
+            sandbox=getattr(self.ctx.config, "sandbox", None),
+            # Same pattern, same reason: `system.enabled` decides whether the machine tools are
+            # advertised at all. This keyword was missing while the tools existed, so every one of them
+            # was inert in a real run — the registry supported them, the executor never offered them,
+            # and nothing on screen said why. Passing the section unconditionally keeps that decision
+            # in `SystemConfig` rather than at this call site.
+            system=getattr(self.ctx.config, "system", None),
         )
+        # MCP tools, when any server is configured. Wired here rather than at the call site because
+        # this is the one place every node's registry is built, so a node cannot accidentally get a
+        # registry without the servers every other node has. `attach` cannot raise and returns None
+        # when nothing is configured, so an unreachable server costs this node a diagnostic and not
+        # its run — the same rule the sandbox and the lifecycle hooks follow.
+        #
+        # A read-only node is given no MCP tools: a server exposes capabilities the engine cannot
+        # vet for containment, so offering one to an agent whose whole purpose is to *inspect* would
+        # hand it a way to change things. The refusal is silent only in the sense that it needs no
+        # diagnostic — a reviewer that never had the tools is not a failure.
+        if not read_only:
+            self._attach_mcp(registry)
+        return registry
+
+    def _attach_mcp(self, registry: Any) -> None:
+        """Offer this node's configured MCP servers' tools, best-effort.
+
+        Cached on the executor so a run with N nodes connects to each server once rather than N
+        times: a stdio server is a process, and spawning one per node would spend more on handshakes
+        than on work. The bridge is closed with the executor (`close`), so a run does not leave
+        orphaned server processes behind.
+        """
+        config = getattr(self.ctx.config, "mcp", None)
+        if config is None or not getattr(config, "enabled", False):
+            return
+        cached = getattr(self, "_mcp_bridge", None)
+        if cached is None:
+            if getattr(self, "_mcp_attempted", False):
+                return                      # one failure per run, not one per node
+            self._mcp_attempted = True
+            try:
+                from .mcp import attach
+
+                cached = attach(config, registry, diagnostics=self.ctx.diagnostics)
+            except Exception as exc:  # noqa: BLE001 - an optional capability must not stop a run
+                if self.ctx.diagnostics is not None:
+                    try:
+                        self.ctx.diagnostics.warning(
+                            "mcp.attach.failed", message=f"{type(exc).__name__}: {exc}")
+                    except Exception:  # noqa: BLE001
+                        pass
+                cached = None
+            self._mcp_bridge = cached
+            return
+        # Already connected: install the same tools on this node's registry. Registering is how the
+        # bridge exposes them, so a later node gets them without a second handshake.
+        try:
+            cached.install(registry)
+        except Exception:  # noqa: BLE001 - the first node's tools stand; this one just misses them
+            pass
 
     def _subagent_runner(self, agent: Any, node: dict[str, Any]) -> Any:
         """The isolated-subagent dispatcher for this node, or None when it is not enabled.
@@ -1212,17 +2373,29 @@ class NodeExecutor:
         )
 
     def _parent_token_budget(self) -> int:
-        """The parent's remaining budget, which a fleet is carved from."""
-        ledger = getattr(self.ctx, "ledger", None) or getattr(self, "ledger", None)
-        try:
-            snapshot = ledger.snapshot() if ledger is not None else {}
-        except Exception:  # noqa: BLE001 - a missing ledger means "unknown", not zero spend
+        """The tokens this run may still spend, which a fleet is carved from.
+
+        Read from the run's own :class:`~engine.gateway.CostLedger` — the object that actually saw
+        the provider's counters — rather than a decision ledger, which has no token totals at all.
+        The ledger records spend, not a remainder, so the remainder is the gateway's ceiling minus
+        what it has charged; neither the `remaining_tokens` key nor a `snapshot()` on the decision
+        ledger ever existed, and both used to make this return a confident zero.
+
+        `0` is the fleet's own sentinel for "nothing carveable" (`SubagentRunner._budget_for`), so it
+        is returned when no ceiling applies or the ceiling is spent — never as a stand-in for a
+        figure nobody measured. An unmeasured call contributes no tokens to the ledger, so a run with
+        unreported usage yields a remainder that is an upper bound; the fleet's carve only uses it as
+        a share, which is why that bound is acceptable here and is stated rather than hidden.
+        """
+        gateway = self.ctx.gateway
+        ledger = getattr(gateway, "ledger", None)
+        if ledger is None:
             return 0
-        remaining = snapshot.get("remaining_tokens") if isinstance(snapshot, dict) else None
-        try:
-            return int(remaining) if remaining is not None else 0
-        except (TypeError, ValueError):
+        ceiling = int(getattr(gateway, "run_max_tokens", 0) or 0)
+        if ceiling <= 0:
             return 0
+        spent = int(getattr(ledger, "total_tokens", 0) or 0)
+        return max(0, ceiling - spent)
 
     def _run_child_in_context(self, *, prompt: str, skill: str, child_id: str, agent_id: str,
                               depth: int, budget: int) -> tuple[str, str, int, int, int]:
@@ -1267,11 +2440,23 @@ class NodeExecutor:
         folding a child id or its task into the system prompt is the exact mistake `prefix.py` names as
         costing 58% on every swarm.
         """
-        try:
-            bundle = self.ctx.skills.bundle(skill) if skill else None
-        except Exception:  # noqa: BLE001 - an unknown skill yields a generic child, not a crash
-            bundle = None
-        body = getattr(bundle, "body", "") if bundle is not None else ""
+        body = ""
+        if skill:
+            try:
+                bundle = self.ctx.skills.bundle(skill)
+            except SkillError as exc:
+                # A name nobody holds is a real case — the delegation design calls authoring one a
+                # rung — so it yields a generic child. It is *reported*, not swallowed: a child that
+                # ran without the procedure it was hired for looks identical to one that followed it,
+                # and the loss would be invisible in the very run it degrades. The catch is narrowed
+                # to `SkillError` on purpose: a missing `bundle` capability used to raise
+                # `AttributeError` into a bare `except Exception`, which is how this defect survived
+                # with every child silently generic.
+                self._log("subagent.skill_missing", level="warning",
+                          message=f"subagent bound to unknown skill {skill!r}: {exc}",
+                          detail={"skill": skill})
+            else:
+                body = str(getattr(bundle, "body", "") or "")
         return (f"You are a subagent working under a parent agent. Do the task you are given and "
                 f"report what you found concisely. Your context is your own.\n\n{body}")
 
@@ -1291,7 +2476,7 @@ class NodeExecutor:
 
     def _call_with_tools(self, agent: Any, prompt: Any, *, node_id: str, attempt: int,
                          session: Session, bundle: SkillBundle,
-                         node: dict[str, Any]) -> dict[str, Any]:
+                         node: dict[str, Any], pooled: Any = None) -> dict[str, Any]:
         """Run the node through the agentic loop and normalise the outcome for the trailer parser.
 
         The loop's final text is returned in the same shape a single call would produce, so everything
@@ -1322,10 +2507,24 @@ class NodeExecutor:
                 return False, f"the run budget ceiling was reached: {exc}"
             return True, ""
 
+        def _on_step(step: Any) -> None:
+            # Renew the pooled task's lease on every tool step. The post-call heartbeat in `_run_one`
+            # only covers the time up to the *model call*; a node that then spends minutes inside
+            # tools — reading, writing, running a command — would outlive its lease between heartbeats
+            # and be handed to a second worker while this one is still running it.
+            self._renew_pooled(pooled, agent, node_id)
+            self._log("node.tool_step", node_id=node_id, agent_id=agent.id, detail=step)
+
+        # The repetition guard the config declares. Passed here rather than hardcoded so
+        # `goal.repeat_call_reminders` governs the loop it describes — it was documented and never
+        # read, so a model stuck on one call spent the whole bound re-issuing it, which for an
+        # unattended run is the quietest possible failure.
+        goal_cfg = getattr(self.ctx.config, "goal", None)
+        repeat_reminders = tuple(getattr(goal_cfg, "repeat_call_reminders", ()) or ())
+
         loop = AgentLoop(complete=_complete, tools=registry, max_steps=max_steps,
                          can_continue=_gate, max_output_tokens=self.ctx.max_output_tokens,
-                         on_step=lambda step: self._log("node.tool_step", node_id=node_id,
-                                                        agent_id=agent.id, detail=step))
+                         repeat_reminders=repeat_reminders, on_step=_on_step)
         self._log("node.tools.start", node_id=node_id, agent_id=agent.id,
                   detail={"tools": registry.names(), "max_steps": max_steps})
         outcome = loop.run(system=prompt.system, user=prompt.text)
@@ -2049,6 +3248,18 @@ class NodeExecutor:
                 continue
         return 3
 
+    def _rework_context(self, state: dict[str, Any]) -> dict[str, Any]:
+        """The contract refusal this attempt is answering, or `{}` on a first attempt.
+
+        Held in run-state by the runner, which owns the rework window: it knows the rule that fired,
+        the attempt number and the questions that broke the ceiling, and it writes them before
+        dispatching the retry. Reading them here rather than re-deriving them is the same rule the
+        handoff contract follows — the executor renders the refusal, it does not have a second
+        opinion about what the refusal was.
+        """
+        context = state.get("_contract_rework")
+        return dict(context) if isinstance(context, dict) else {}
+
     def _phase_for(self, state: dict[str, Any]) -> str:
         """The current phase, from run-state."""
         return str(state.get("phase") or "EXECUTE")
@@ -2088,9 +3299,10 @@ class NodeExecutor:
         findings = record.get("findings")
         if isinstance(findings, list) and findings:
             return findings
-        for exec_result in self.history.values():
-            if exec_result.findings:
-                return exec_result.findings
+        with self.registries:
+            for exec_result in list(self.history.values()):
+                if exec_result.findings:
+                    return exec_result.findings
         return []
 
     def _handoff_payload(self, state: dict[str, Any]) -> dict[str, Any] | None:
@@ -2168,8 +3380,9 @@ class NodeExecutor:
     def _open_questions(self) -> list[dict[str, Any]]:
         """Open questions accumulated, for a rotation handoff."""
         out: list[dict[str, Any]] = []
-        for exec_result in self.history.values():
-            out.extend(getattr(exec_result, "open_questions", []) or [])
+        with self.registries:
+            for exec_result in list(self.history.values()):
+                out.extend(getattr(exec_result, "open_questions", []) or [])
         return out[:3]
 
     def _ledger_decisions(self) -> list[dict[str, Any]]:
@@ -2179,8 +3392,9 @@ class NodeExecutor:
         does. Passing them keeps a rotated session consistent with the run's decision history.
         """
         out: list[dict[str, Any]] = []
-        for exec_result in self.history.values():
-            out.extend(getattr(exec_result, "decisions", []) or [])
+        with self.registries:
+            for exec_result in list(self.history.values()):
+                out.extend(getattr(exec_result, "decisions", []) or [])
         return out[:8]
 
     def _system_prompt(self, bundle: SkillBundle) -> str:
@@ -2212,7 +3426,12 @@ class NodeExecutor:
         cost = usage.get("cost_usd")
 
         if agent.budget.allocated_tokens or agent.budget.allocated_usd:
-            agent.budget.charge(usd=cost or 0.0, tokens=tokens)
+            # A read-modify-write on a shared per-agent budget. Two concurrent siblings of one node
+            # (two voters, two fan-out items, two group members) bind to the same agent, so an
+            # unguarded `+=` loses one of the two charges and the budget under-reports what was spent
+            # — the one number the design forbids flattering.
+            with self.registries:
+                agent.budget.charge(usd=cost or 0.0, tokens=tokens)
         self._emit_node_span(node_id, agent, result, usage, bundle, session)
 
         monitor = getattr(self.ctx, "health", None)
@@ -2298,12 +3517,14 @@ class NodeExecutor:
             rotated=int(prepared.get("rotated") or 0),
             compacted=int(prepared.get("compacted") or 0),
         )
-        self.history[node_id] = executed
-        # An open_questions / decisions list is not carried on ExecutedNode; attach for the handoff.
-        executed.open_questions = list(trailer.get("open_questions") or [])
-        executed.decisions = list(trailer.get("decisions") or [])
-        if not executed.findings:
-            self.producers[node_id] = agent.id
+        with self.registries:
+            self.history[node_id] = executed
+            # An open_questions / decisions list is not carried on ExecutedNode; attach for the
+            # handoff.
+            executed.open_questions = list(trailer.get("open_questions") or [])
+            executed.decisions = list(trailer.get("decisions") or [])
+            if not executed.findings:
+                self.producers[node_id] = agent.id
 
     def record_review(self, node_id: str, findings: list[dict[str, Any]]) -> None:
         """Record a rejection so the next developer pass receives it.
@@ -2311,9 +3532,10 @@ class NodeExecutor:
         Called by the orchestrator after writing `review_feedback.json`, so the executor's in-memory
         view and the on-disk dossier agree.
         """
-        executed = self.history.get(node_id)
-        if executed is not None:
-            executed.findings = list(findings)
+        with self.registries:
+            executed = self.history.get(node_id)
+            if executed is not None:
+                executed.findings = list(findings)
 
     # ── telemetry and logging helpers ───────────────────────────────────────
 
@@ -2401,15 +3623,29 @@ class NodeExecutor:
 
     def summary(self) -> dict[str, Any]:
         """Per-node outcomes, for the UI and the completion view."""
-        return {
-            node_id: executed.as_dict() for node_id, executed in sorted(self.history.items())
-        }
+        with self.registries:
+            return {
+                node_id: executed.as_dict()
+                for node_id, executed in sorted(self.history.items())
+            }
 
     def session_report(self) -> list[dict[str, Any]]:
         """Every live session, with its saturation and rotation count."""
         with self.ctx.lock:
             return [session.as_dict(include_turns=False)
                     for session in self.ctx.sessions.values()]
+
+
+def _env_flag(name: str) -> bool:
+    """Whether an environment variable is set to a truthy value.
+
+    Read here rather than through the config because `Config` is parsed once per process and this
+    switch is deliberately *not* a config field: `executor.parallel_nodes` would apply concurrency to
+    every group in every run, including ones the planner never reasoned about. The manifest's own
+    `concurrent:` field is where that decision belongs, and this exists for the eval and the operator
+    who want to force it on for a measurement.
+    """
+    return str(os.environ.get(name, "")).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _ref_from_record(record: dict[str, Any]) -> ArtifactRef:

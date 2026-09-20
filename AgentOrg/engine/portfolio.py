@@ -59,7 +59,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 __all__ = [
-    "PortfolioError", "Principal", "OrgEntry", "Portfolio",
+    "PortfolioError", "Principal", "OrgEntry", "Portfolio", "workspace_for",
     "PORTFOLIO_FILENAME", "PORTFOLIO_VERSION", "DEFAULT_PRINCIPAL_ID",
 ]
 
@@ -174,9 +174,37 @@ class OrgEntry:
         )
 
     @property
-    def workspace_path(self) -> Path:
-        """The org's folder as a `Path`, expanded. Empty when the entry names no folder."""
-        return Path(self.path).expanduser() if self.path else Path()
+    def workspace_path(self) -> Path | None:
+        """The org's folder as a `Path`, expanded, or `None` when the entry names no folder.
+
+        `None`, deliberately, and never `Path("")` or `Path()`: both of those normalise to `Path(".")`,
+        and `str(Path("."))` is `"."` — **truthy**. Callers guard with `if not str(path)`, so a
+        `Path(".")` slips straight past that guard and resolves the org to the process's current
+        working directory (for the console, the engine's own source tree) instead of the managed
+        project its slug names. `None` is the one value those guards actually catch; a future reader
+        who "simplifies" this back to returning `Path()` reintroduces exactly that wrong-directory bug.
+        """
+        return Path(self.path).expanduser() if self.path else None
+
+
+def workspace_for(entry: OrgEntry, *, root: os.PathLike | str | None = None) -> Any:
+    """The workspace an org runs in: its own folder, or a managed project keyed on its slug.
+
+    One resolver, because four call sites — the CLI, the console server, the fleet and the system
+    console — each used to reimplement "org folder, else managed project", and a rule with four copies
+    drifts: they disagreed about where the managed project lived and all of them read the path-less
+    org as `.`. Reading `entry.workspace_path` here is what makes the fallback fire, because that
+    property is `None` — not the truthy `Path('.')` — when no folder is named.
+
+    `root` overrides the managed projects root; omitted, it is the engine's own `projects/`. It is
+    ignored for an org that names a folder, whose folder is used as-is.
+    """
+    from .state import Workspace
+
+    path = entry.workspace_path
+    if path is None:
+        return Workspace.for_project(entry.slug, root=root)
+    return Workspace.attach(path)
 
 
 @dataclass
@@ -354,14 +382,30 @@ class Portfolio:
 
         Read-only, and tolerant: a moved or missing folder is reported as `missing` rather than
         raised, because a register is exactly the place to record "this one needs fixing".
+
+        `exists`/`has_state`/`state_dir` are computed from the workspace a run would actually use
+        (`workspace_for`), not from the raw `path` field, so this view cannot disagree with the
+        runtime about where an org lives. A path-less org is `managed` — it runs in `projects/<slug>`
+        — and is **not** counted as `missing`: "no folder of its own yet" and "the folder it named has
+        gone" are different facts, and only the second is something to fix.
         """
+        from .state import StateError
+
         orgs: list[dict[str, Any]] = []
         for entry in self.orgs:
-            path = entry.workspace_path
-            exists = bool(path) and path.is_dir()
-            state_dir = path / ".agent_state" if exists else None
+            managed = entry.workspace_path is None
+            try:
+                runtime_path = workspace_for(entry).path
+                exists = runtime_path.is_dir()
+            except StateError:
+                # A named folder that has gone: `attach` refuses it, which is precisely the `missing`
+                # case this method exists to report rather than raise.
+                runtime_path = entry.workspace_path
+                exists = False
+            state_dir = runtime_path / ".agent_state" if exists else None
             orgs.append({
                 **entry.as_dict(),
+                "managed": managed,
                 "exists": exists,
                 "has_state": bool(state_dir and state_dir.is_dir()),
                 "state_dir": str(state_dir) if state_dir else "",
@@ -372,7 +416,7 @@ class Portfolio:
             "orgs": orgs,
             "counts": {"orgs": len(self.orgs),
                        "enabled": sum(1 for o in self.orgs if o.enabled),
-                       "missing": sum(1 for o in orgs if not o["exists"])},
+                       "missing": sum(1 for o in orgs if not o["exists"] and not o["managed"])},
         }
 
     def rollup(self, *, per_org: Iterable[dict[str, Any]] = ()) -> dict[str, Any]:

@@ -144,7 +144,13 @@ def _derive_stop_reason(state: dict[str, Any], outcome: Any,
         loop_entry = next((e for e in reversed(log)
                            if isinstance(e, dict) and e.get("action") == "escalate"), None)
         detail = str((loop_entry or {}).get("detail") or "").strip() if loop_entry else ""
-        return f"run ended: {reason}" + (f" — {detail}" if detail else "")
+        # The escalating node, when the entry names one. A contract rework that spends its window
+        # logs its exhaustion *at the node*, and "which node could not fix its payload" is the first
+        # thing a person needs — a reason that says only what happened, not where, sends them to the
+        # checkpoint to find out. A budget escalate logs `node: None`, which reads as it always did.
+        node = str((loop_entry or {}).get("node") or "").strip() if loop_entry else ""
+        prefix = f"{node}: " if node else ""
+        return f"{prefix}run ended: {reason}" + (f" — {detail}" if detail else "")
 
     if getattr(outcome, "killed", False):
         return "the run was aborted"
@@ -337,6 +343,17 @@ class Run:
         return run
 
 
+#: What an auto-created helper may touch: read anywhere in the project, write anywhere inside it.
+#:
+#: One definition, used both to *classify* the helper's risk and to *create* it, because those two
+#: must describe the same agent — a cap computed from a different capability set than the one granted
+#: would bound a fiction. `write:src/**` rather than `write:*` is what keeps this a normal grant: the
+#: tool layer contains it to the project (`ToolRegistry._resolve` refuses absolute, `~` and `..`
+#: paths, and anything resolving outside the workspace), so it does not reach beyond what the run was
+#: pointed at.
+_AUTO_HELPER_CAPABILITIES: tuple[str, ...] = ("read:*", "write:src/**")
+
+
 class Orchestrator:
     """Sequences a run and holds the Owner's authority.
 
@@ -509,8 +526,9 @@ class Orchestrator:
           roster entry to clean up. With `persist_hires` it is saved to the roster root, so the
           capability is reusable and visible in `agents`.
         - **how risky a hire.** `auto_hire_max_tier` (config) caps the delegation tier. Every node in a
-          plan is *work*, not a privileged operation, so the default tier is the safest one — a helper
-          that reads and writes inside the project. Anything above it is left for the Owner.
+          plan is *work*, not a privileged operation, so the helper's own grant — read the project,
+          write inside it — is the safest tier there is. Above the cap the gap is *reported* with its
+          tier and the reason, so it reaches the Owner as a staffing gap rather than as a silent hire.
         """
         from .org.agent import AgentKind, AgentLevel, AgentSpec, Budget, new_agent_id
         from .skills.roles import is_verifier
@@ -551,6 +569,33 @@ class Orchestrator:
                 detail={"provider": provider, "model": model, "context_window": window})
             return {"gaps": gaps, "created": created}
 
+        # The risk ceiling for an auto-created helper, resolved once. `goal.auto_hire_max_tier` caps
+        # the delegation tier the engine may grant itself; above it a helper is *reported* rather than
+        # created, so the gap reaches the Owner as a staffing gap instead of as a silent hire.
+        #
+        # Classified by the desk's own `classify_tier` rather than by a second opinion here, because
+        # the two must not be able to disagree about what tier a helper is — the cap is only
+        # meaningful if the thing it bounds is the same thing the desk would have judged had this
+        # gone through `evaluate`.
+        max_tier = int(getattr(self.config.goal, "auto_hire_max_tier", 0) or 0)
+        helper_tier, helper_tier_why = self._helper_tier(skill="", provider=provider, model=model,
+                                                         window=window)
+        if self._tier_rank(helper_tier) > max_tier:
+            self.diagnostics.warning(
+                "goal.autostaff.capped",
+                message=f"staffing gaps left for the Owner: a helper for these skills would be "
+                        f"{helper_tier.value}, above the auto-hire cap T{max_tier}",
+                detail={"tier": helper_tier.value, "cap": f"T{max_tier}",
+                        "why": helper_tier_why, "gaps": [g.get("skill") for g in gaps]})
+            self._emit(EventType.HUMAN_GATE, {
+                "run_id": run.run_id, "kind": "policy", "gate_id": "auto-hire-tier",
+                "waiting_on": "owner",
+                "why": f"an auto-created helper would be {helper_tier.value}, above the "
+                       f"configured cap T{max_tier}",
+                "tier": helper_tier.value, "cap": f"T{max_tier}",
+                "gaps": [{"node_id": g.get("node_id"), "skill": g.get("skill")} for g in gaps]})
+            return {"gaps": gaps, "created": created}
+
         for gap in gaps:
             skill = str(gap.get("skill") or "")
             if not skill:
@@ -569,7 +614,7 @@ class Orchestrator:
                 role="reviewer" if is_verifier(skill) else "worker",
                 level=AgentLevel.SENIOR,
                 team="Platform",
-                capabilities=["read:*", "write:src/**"],
+                capabilities=list(_AUTO_HELPER_CAPABILITIES),
                 budget=Budget(),
                 max_concurrency=1,
                 # `goal` origin, not `owner`: this employee was created by the engine on the goal's
@@ -599,6 +644,45 @@ class Orchestrator:
             self._persist_helpers(created)
         # Re-measure, so the graph shown to the Owner reflects the helpers just created.
         return {"gaps": self.binder.staffing_gaps(plan.manifest), "created": created}
+
+    def _helper_tier(self, *, skill: str, provider: str, model: str,
+                     window: int | None) -> tuple[Any, str]:
+        """The delegation tier a helper created for a gap would land in, and why.
+
+        Built from the same shape `_auto_staff` is about to create, so the cap governs the real
+        thing: the helper's own capabilities, budget and kind. A synthetic requisition is used
+        because `HiringDesk.evaluate` runs the *full* approval path (budget partitioning, ladder
+        evidence, lineage) — all of which are for an agent *asking* to delegate, whereas auto-staffing
+        is the engine filling a gap on the goal's authority. What matters here is one question: how
+        risky is the hire, which is what `classify_tier` answers.
+        """
+        from .org.delegation import Requisition
+
+        request = Requisition(
+            requester_id="goal", requester_name="goal", kind="helper", skill=skill or "helper",
+            provider=provider, model=model, context_window=window,
+            capabilities=list(_AUTO_HELPER_CAPABILITIES),
+            requested_tokens=0, requested_usd=0.0,
+        )
+        try:
+            return self.desk.classify_tier(request)
+        except Exception as exc:  # noqa: BLE001 - an unclassifiable hire is not an auto-approvable one
+            from .org.delegation import ApprovalTier
+
+            return ApprovalTier.T3, f"could not classify this helper ({exc}); treated as the most \
+gated tier rather than the least"
+
+    @staticmethod
+    def _tier_rank(tier: Any) -> int:
+        """A tier's ordinal, so a cap can be compared rather than string-matched.
+
+        Read off the enum's own value (`T0`..`T3`) so a new tier added below the cap is admitted and
+        one added above it is not — the property a numeric comparison buys and a membership test
+        would lose.
+        """
+        text = str(getattr(tier, "value", tier) or "").strip().upper()
+        digits = "".join(ch for ch in text if ch.isdigit())
+        return int(digits) if digits else 3
 
     def _auto_staff_window(self, provider: str, model: str) -> tuple[int | None, int | None]:
         """The context window (and max output) for an auto-created helper.
@@ -680,6 +764,26 @@ class Orchestrator:
         if goal is None:
             return None
         return goal.policy.effective()
+
+    def _contract_rework_attempts(self, run: Run) -> int:
+        """How many times a contract refusal outside a loop may be retried for this run.
+
+        Read from the *goal's posture*, because it decides who recovers: an unattended goal repairs
+        its own payload, a supervised one asks. `run` is accepted so the decision has somewhere to
+        record itself as the run grows one, but nothing is read from it yet — the posture is the only
+        input, and inventing a second one (a per-run override) before it is asked for would be a knob
+        with no caller.
+
+        With no goal at all (a plain `run --manifest`), the config answers — the same polarity the
+        rest of the engine uses: the goal's authority when there is a goal, and the configured
+        default when there is not.
+        """
+        section = getattr(self.config, "executor", None)
+        width = max(0, int(getattr(section, "contract_rework", 0) or 0))
+        policy = self._effective_goal_policy()
+        if policy is None:
+            return width
+        return width if policy.unattended else 0
 
 
     def approve(self, run: Run | None = None) -> Run:
@@ -845,6 +949,12 @@ class Orchestrator:
             heartbeat_s=float(self.config.concurrency.heartbeat_s),
             grace_s=float(self.config.concurrency.grace_s),
         )
+        # Who recovers from a contract refusal is the goal's decision, so the posture sets the width
+        # here — the one place the run's host is built. An unattended goal gets the bounded window
+        # (a refused payload is a fixable defect, and fixing it is the whole point of being able to
+        # leave the run alone); a supervised one gets `None`, which resolves to the config's 0 and
+        # escalates on the first refusal exactly as it always did.
+        host.with_contract_rework(self._contract_rework_attempts(run))
         with self._lock:
             self._host = host
 
@@ -903,9 +1013,11 @@ class Orchestrator:
         policy = goal.policy.effective()
         max_rounds = self._goal_max_rounds()
         for round_index in range(1, max_rounds + 1):
-            # Fold what this round cost, so "no ceiling" never means "no idea".
-            tokens, requests, cost = self._round_spend(run)
-            goal.record_round(tokens=tokens, requests=requests, cost_usd=cost)
+            # Fold what this round cost, so "no ceiling" never means "no idea". A round whose cost was
+            # never reported is folded as unreported rather than as zero — the ledger's own rule.
+            tokens, requests, cost, unknown_calls = self._round_spend(run)
+            goal.record_round(tokens=tokens, requests=requests, cost_usd=cost,
+                              unknown_cost_calls=unknown_calls)
 
             decision = self._consume_goal_decision(run)
             if decision is not None:
@@ -952,7 +1064,7 @@ class Orchestrator:
                                                  "autonomous": not policy.human_gate})
             outcome = self._host.resume_run(
                 manifest_path=run.manifest_path, run_id=run.run_id, workflow=run.slug,
-                project=run.slug, goal_active=True)
+                project=run.slug, goal_active=True, extra_args=extra)
             self._settle(run, outcome)
         return outcome
 
@@ -979,6 +1091,11 @@ class Orchestrator:
         if policy.human_gate or not policy.auto_approve:
             return False
         if not self._gate_is_auto_approvable(gate):
+            # A terminal gate is the one case a goal may still answer, and only when the posture says
+            # so. Everything else that reaches here is genuinely the Owner's: an unknown gate kind, or
+            # a policy class the config already answered with `confirm`.
+            if str(gate.kind or "").strip().lower() == "human" and policy.unattended:
+                return self._release_terminal_gate(run, gate)
             self._emit(EventType.HUMAN_GATE, {
                 "run_id": run.run_id, "gate_id": gate.gate_id, "kind": gate.kind,
                 "reason": gate.reason, "waiting_on": "owner",
@@ -1008,7 +1125,10 @@ class Orchestrator:
 
         Three cases, and each is a *refusal* first:
 
-        - `kind: human` is terminal authority (release, close, spend) and is never auto-approved.
+        - `kind: human` is terminal authority (release, close, spend). It is not auto-approvable
+          *here* — `_auto_pass` routes it to `_release_terminal_gate`, which applies the extra
+          evidence and safety checks an unattended release requires. Keeping it out of this predicate
+          means "mechanically decidable" and "the goal released it" stay distinguishable facts.
         - `kind: agent` is a bounded reroute — the runner already computed the decision, so the goal
           only records it.
         - `kind: policy` is a route class the *config* already answered, so it is passed only when the
@@ -1025,6 +1145,146 @@ class Orchestrator:
         if kind == "policy":
             return self._policy_permits_escalation()
         return False
+
+    #: Stop reasons that must never be released by a goal. A guardrail block or a contract violation
+    #: is a safety control *firing*, and autonomy may decide that work is done — it may not decide that
+    #: a control which fired was wrong. Matched as substrings against `run.stop_reason`.
+    _UNRELEASABLE_STOP_REASONS: tuple[str, ...] = (
+        "guardrail", "contract", "error",
+    )
+
+    def _release_terminal_gate(self, run: Run, gate: GateRequest) -> bool:
+        """Release the terminal gate on the goal's authority, or refuse and park.
+
+        This is the one decision that makes an unattended goal able to *finish*, and it is deliberately
+        the most guarded path in the file. Four refusals, each with its own reason so the trace says
+        which one fired:
+
+        1. **The evidence must be present.** The gate declares `requires` — for the composed plan that
+           is one `<node>.summary` per reviewer. A release with no evidence is an approval of nothing,
+           so the gate parks exactly as it always did. Note that these are *node summary* specs, not
+           artifact names, so they are resolved against the run's node records rather than against the
+           artifact index (which the gate's `present` list holds, and which therefore never intersects
+           `requires` — a release keyed on that intersection would refuse forever).
+        2. **No safety control may have fired.** See `_UNRELEASABLE_STOP_REASONS`.
+        3. **No node may be blocked.** A blocked node is a stated, concrete failure; releasing over it
+           would record "done" against a run that said it could not proceed.
+        4. **The ledger must accept the record.** The release is written as a decision so "who released
+           this, and why" is answerable afterwards. If the ledger refuses (an irreversible decision
+           already stands for this gate), the run parks rather than releasing unrecorded.
+        """
+        evidence = self._gate_evidence(run, gate)
+        if not evidence["complete"]:
+            self._emit(EventType.HUMAN_GATE, {
+                "run_id": run.run_id, "gate_id": gate.gate_id, "kind": gate.kind,
+                "reason": gate.reason, "waiting_on": "owner",
+                "why": "the gate's evidence is not present, so there is nothing for the goal to "
+                       "release",
+                "missing": evidence["missing"]})
+            self.diagnostics.info(
+                "goal.release.refused",
+                message=f"{gate.gate_id}: evidence missing ({', '.join(evidence['missing']) or 'none'})")
+            return False
+
+        stop_reason = str(run.stop_reason or "")
+        fired = next((name for name in self._UNRELEASABLE_STOP_REASONS
+                      if name in stop_reason.lower()), "")
+        if fired:
+            self._emit(EventType.HUMAN_GATE, {
+                "run_id": run.run_id, "gate_id": gate.gate_id, "kind": gate.kind,
+                "reason": gate.reason, "waiting_on": "owner",
+                "why": f"a safety control fired ({fired}); the goal may not release this",
+                "stop_reason": stop_reason})
+            self.diagnostics.warning(
+                "goal.release.refused",
+                message=f"{gate.gate_id}: a {fired} control fired, so the Owner must decide")
+            return False
+
+        blocked = evidence["blocked_nodes"]
+        if blocked:
+            self._emit(EventType.HUMAN_GATE, {
+                "run_id": run.run_id, "gate_id": gate.gate_id, "kind": gate.kind,
+                "reason": gate.reason, "waiting_on": "owner",
+                "why": "a node ended blocked, so the work is not done",
+                "blocked": blocked[:5]})
+            self.diagnostics.warning(
+                "goal.release.refused",
+                message=f"{gate.gate_id}: node(s) blocked: {', '.join(blocked[:3])}")
+            return False
+
+        try:
+            self.ledger.record(
+                gate=gate.gate_id, choice="released", by="goal",
+                rationale=("unattended goal released the terminal gate; evidence present: "
+                           + (", ".join(evidence["present"]) or "none")),
+                reversible=True, confidence="medium",
+            )
+        except Exception as exc:  # noqa: BLE001 - an unrecordable release must not happen
+            self._emit(EventType.HUMAN_GATE, {
+                "run_id": run.run_id, "gate_id": gate.gate_id, "kind": gate.kind,
+                "reason": gate.reason, "waiting_on": "owner",
+                "why": f"the release could not be recorded in the ledger: {exc}"})
+            self.diagnostics.warning("goal.release.refused", message=str(exc))
+            return False
+
+        try:
+            self.decide(True, run=run,
+                        note="released by the unattended goal; evidence present",
+                        by="goal")
+        except OrchestratorError:
+            return False
+        self._emit(EventType.POLICY_CHANGED, {
+            "run_id": run.run_id, "gate_id": gate.gate_id, "approved": True,
+            "by": "goal", "kind": gate.kind, "posture": "unattended",
+            "why": "the goal's posture is unattended and the gate's evidence is present"})
+        self.diagnostics.info(
+            "goal.release",
+            message=f"released terminal gate {gate.gate_id} on the goal's authority")
+        return True
+
+    def _gate_evidence(self, run: Run, gate: GateRequest) -> dict[str, Any]:
+        """What the gate asked for, what is present, and whether that is enough to release.
+
+        Two evidence shapes, because the engine has two:
+
+        - A **node-summary spec** (`<node>.summary`, what the composed plan's terminal gate declares)
+          resolves against `run.outcome["nodes"]` and counts as present when the named node finished
+          and wrote a non-empty summary.
+        - Anything else is an **artifact name**, resolved against the run's artifact index — the same
+          index the executor uses for `requires`/`present` (`executor.Executor._gate`).
+
+        `complete` is true only when every declared requirement is satisfied. A gate that declares
+        nothing is treated as incomplete rather than trivially complete: a release needs something to
+        point at, and "the gate required nothing" is not evidence that the work is done.
+        """
+        outcome = run.outcome if isinstance(run.outcome, dict) else {}
+        nodes = outcome.get("nodes") if isinstance(outcome.get("nodes"), dict) else {}
+        artifacts = {str(name) for name in (outcome.get("artifacts") or [])}
+
+        requires = [str(r) for r in (gate.requires or [])]
+        present: list[str] = []
+        missing: list[str] = []
+        for requirement in requires:
+            if requirement.endswith(".summary"):
+                node = requirement[: -len(".summary")]
+                record = nodes.get(node) if isinstance(nodes, dict) else None
+                summary = str((record or {}).get("summary") or "").strip() \
+                    if isinstance(record, dict) else ""
+                (present if summary else missing).append(requirement)
+            else:
+                (present if requirement in artifacts else missing).append(requirement)
+
+        blocked_nodes = [
+            str(name) for name, record in (nodes.items() if isinstance(nodes, dict) else [])
+            if isinstance(record, dict) and str(record.get("status")) == "blocked"
+        ]
+        return {
+            "requires": requires,
+            "present": present,
+            "missing": missing,
+            "complete": bool(requires) and not missing,
+            "blocked_nodes": blocked_nodes,
+        }
 
     def _policy_permits_escalation(self) -> bool:
         """Whether the policy matrix lets the org proceed on an escalation without asking.
@@ -1058,19 +1318,78 @@ class Orchestrator:
         return False
 
 
-    def _round_spend(self, run: Run) -> tuple[int, int, float]:
-        """The tokens, requests and cost this round's ledger recorded.
+    def cost_snapshot(self, run: Run | None = None) -> dict[str, Any] | None:
+        """The run's cost picture, as the process that spent the money recorded it.
 
-        Read from the ledger rather than estimated: an accounting figure the engine invented would be
-        worse than no figure, because it would be believed.
+        The :class:`~engine.gateway.CostLedger` that saw the provider's counters lives in the runner
+        subprocess, so this process cannot hold the object — the same split that keeps credentials out
+        of workers puts the ledger beyond reach. What the gateway *did* persist is its own
+        `ledger.snapshot()` on every `llm.response`, and the bus writes those to the run's
+        `trace.jsonl`. Reading the last one is therefore reading the real ledger's numbers rather than
+        re-deriving them; `None` means no readable trace, which is "unknown" and never a zero.
+
+        The keys are the ledger's own vocabulary — `total_usd`, `total_tokens`, `calls`,
+        `unknown_cost_calls`, `cost_complete` — so a caller cannot ask for a fact under a name the
+        ledger never wrote (`remaining_tokens`, `nodes`, `runs`). `cost_complete` is False whenever a
+        call was unmeasured, which makes `total_usd` a floor; that distinction is the reason this
+        method exists rather than a bare number.
         """
+        resolved = run or self._run
+        if resolved is None:
+            return None
+        trace_path = getattr(getattr(resolved, "workspace", None), "trace_path", None)
+        if trace_path is None:
+            return None
+        path = Path(trace_path)
         try:
-            snapshot = self.ledger.snapshot()
-        except Exception:  # noqa: BLE001 - a missing ledger must not stop the loop
-            return 0, 0, 0.0
-        nodes = int(snapshot.get("nodes") or 0)
-        runs = int(snapshot.get("runs") or 0)
-        return int(snapshot.get("tokens") or 0), nodes or runs, float(snapshot.get("cost_usd") or 0.0)
+            if not path.is_file():
+                return None
+            from .bus import load_trace
+
+            events = load_trace(path)
+        except Exception:  # noqa: BLE001 - an unreadable trace is "unknown", not zero spend
+            return None
+        for event in reversed(events):
+            if getattr(event, "type_value", "") != EventType.LLM_RESPONSE.value:
+                continue
+            payload = getattr(event, "payload", None) or {}
+            budget = payload.get("budget") if isinstance(payload, dict) else None
+            if isinstance(budget, dict):
+                return budget
+        # A readable trace with no model call: the run genuinely spent nothing, and that is a fact
+        # rather than a gap. Stated with explicit zeros so it stays distinguishable from `None`.
+        return {"total_usd": 0.0, "total_tokens": 0, "calls": 0,
+                "unknown_cost_calls": 0, "cost_complete": True}
+
+    def _round_spend(self, run: Run) -> tuple[int, int, float | None, int]:
+        """What the round just finished spent, from the ledger the spending process kept.
+
+        Read from that ledger rather than estimated: an accounting figure the engine invented would be
+        worse than no figure, because it would be believed. The figure comes from the run's trace (see
+        :meth:`cost_snapshot`) and the *round's* share is the cumulative total minus what the goal has
+        already recorded, because `Goal.record_round` accumulates.
+
+        Returns `(tokens, requests, cost_usd, unknown_cost_calls)`. `cost_usd` is `None` when the run
+        left no readable trace, which the caller records as unreported rather than as `$0.00`; a
+        readable run that made no call returns a genuine zero. `unknown_cost_calls` is the ledger's
+        count of calls whose cost the provider never reported, diffed to this round, so a partly
+        measured round reports its floor *and* the fact that it is one.
+        """
+        snapshot = self.cost_snapshot(run)
+        if snapshot is None:
+            return 0, 0, None, 0
+        recorded = getattr(self._goal, "spend", None) if self._goal is not None else None
+        already_tokens = int(recorded.tokens) if recorded is not None else 0
+        already_requests = int(recorded.requests) if recorded is not None else 0
+        already_cost = float(recorded.cost_usd) if recorded is not None else 0.0
+        already_unknown = int(recorded.unknown_cost_calls) if recorded is not None else 0
+        # A trace that reset underneath a resumed goal can read lower than what was recorded; clamping
+        # at zero reports no new spend rather than a negative one the caller would then subtract.
+        tokens = max(0, int(snapshot.get("total_tokens") or 0) - already_tokens)
+        requests = max(0, int(snapshot.get("calls") or 0) - already_requests)
+        cost = max(0.0, float(snapshot.get("total_usd") or 0.0) - already_cost)
+        unknown = max(0, int(snapshot.get("unknown_cost_calls") or 0) - already_unknown)
+        return tokens, requests, cost, unknown
 
     def _consume_goal_decision(self, run: Run) -> Any:
         """Read (and remove) the agent's verdict, written by `update_goal` in the subprocess."""
@@ -1100,9 +1419,15 @@ class Orchestrator:
     def goal_status(self) -> dict[str, Any]:
         """The goal picture for the console and the CLI."""
         if self._goal is None:
+            default = self._default_goal_policy()
             return {"objective": "", "state": GoalState.CLEARED.value, "live": False, "open": False,
                     "budget_enabled": False, "token_budget": 0, "pause_reason": "",
-                    "summary": "", "blocked_reason": "", "slice": {}, "spend": {}, "history": []}
+                    "summary": "", "blocked_reason": "", "slice": {}, "spend": {}, "history": [],
+                    # Even with no objective set, the posture the *next* goal will inherit is reported,
+                    # so the console renders one consistent control instead of an empty state that
+                    # looks like a different feature.
+                    "posture": default.posture.value, "unattended": default.unattended,
+                    "decides_gates": default.auto_approve, "staffs_gaps": default.auto_hire}
         return self._goal.public()
 
     def goal_set(self, objective: str, *, armed: bool = True, by: str = "cli",
@@ -1112,9 +1437,10 @@ class Orchestrator:
         Arming is the deliberate act that begins spending, so `goal set` on an already-open objective
         replaces it only when asked — otherwise an in-flight objective would be silently overwritten.
 
-        `policy` is the goal's autonomy: whether it may pass gates and staff its own gaps. Omitting it
-        uses the configured default (autonomous), so the common case needs no argument; passing
-        `GoalPolicy(human_gate=True)` is the "I want to be involved" choice, stated per goal.
+        `policy` is the goal's autonomy: whether it may pass gates, release its terminal gate, and
+        staff its own gaps. Omitting it uses the configured default (unattended), so the common case
+        needs no argument; passing `GoalPolicy(posture=Posture.SUPERVISED)` is the "I want to be
+        involved" choice, stated per goal.
         """
         from .goal import GoalPolicy
 
@@ -1145,19 +1471,21 @@ class Orchestrator:
     def _default_goal_policy(self) -> Any:
         """The autonomy a new goal gets from configuration, in one place.
 
-        `goal.auto_pass_auto_gates` and `goal.auto_hire_missing` are the two config switches; a goal
-        inherits them at creation and may then overrule them per objective. Inheriting rather than
-        consulting the config live is deliberate: a goal's authority should not change under it because
-        someone edited credentials.json mid-run.
+        `goal.default_posture` is the headline setting, and `goal.auto_pass_auto_gates` /
+        `goal.auto_hire_missing` are the narrower switches beneath it. A goal inherits all three at
+        creation and may then overrule them per objective. Inheriting rather than consulting the
+        config live is deliberate: a goal's authority should not change under it because someone
+        edited credentials.json mid-run.
         """
-        from .goal import GoalPolicy
+        from .goal import GoalPolicy, Posture
 
         cfg = getattr(self.config, "goal", None)
+        posture = str(getattr(cfg, "default_posture", "unattended") or "unattended").strip().lower()
         return GoalPolicy(
             auto_approve=bool(getattr(cfg, "auto_pass_auto_gates", True)),
             auto_hire=bool(getattr(cfg, "auto_hire_missing", True)),
             persist_hires=bool(getattr(cfg, "persist_auto_hires", False)),
-            human_gate=False,
+            posture=Posture.SUPERVISED if posture == "supervised" else Posture.UNATTENDED,
         )
 
     def goal_pause(self) -> Goal:
@@ -1447,13 +1775,42 @@ class Orchestrator:
         self._log_phase(run)
 
     def _detect_gate(self, state: dict[str, Any]) -> GateRequest | None:
-        """Find a gate the run reached and is waiting on."""
+        """Find a gate the run reached and is waiting on.
+
+        A gate node that has already been *decided* is not waiting on anything, and saying otherwise
+        makes a released run unresumable: the runner keeps the gate's verdict (`awaiting_owner`) even
+        after the release marks its status `done`, so a detector keyed on the verdict alone re-parked
+        the run on the very gate that had just been approved, for ever. `done` is therefore checked
+        first — it is the state a decided node reaches, and no pending decision can carry it.
+
+        **A stalled node is not a gate.** This detector used to mint a human gate from any node whose
+        status was `needs_review`, and the manifest was consulted only for the *wording* of a gate it
+        had already decided to raise. So a node that failed a handoff rule — `R6: 9 open questions
+        exceed the 3 ceiling`, a fixable payload problem — parked a run that had `--posture unattended`
+        at node one, with every downstream node still `pending`.
+
+        The two readings are separated by which one carries the declaration:
+
+        - `verdict == "awaiting_owner"` **is** the declaration. The executor emits it only after
+          reading the manifest's `kind: human` for that node, so it parks whatever the manifest says
+          now — requiring a re-read would make a decided gate depend on a file being present.
+        - `status == "needs_review"` is ambiguous on its own: a model saying "I am not done", an
+          uncovered criterion, and a refused handoff all produce it. It parks when the manifest
+          declares the node a gate, **or** when the run has genuinely stopped there and this node is
+          the reason — see `_stalled_node`. While the run is still moving, a refused node is being
+          repaired, and parking on it would gate a run that is about to fix itself.
+        """
         for name, record in (state.get("nodes") or {}).items():
             if not isinstance(record, dict):
                 continue
+            status = str(record.get("status") or "")
             verdict = str(record.get("verdict") or "")
-            if verdict == "awaiting_owner" or record.get("status") == "needs_review":
-                declaration = self._gate_declaration(name)
+            if status == "done":
+                continue
+            declaration = self._gate_declaration(name)
+            awaiting_owner = verdict == "awaiting_owner"
+            if awaiting_owner or (status == "needs_review"
+                                  and (declaration is not None or self._stalled_node(state, name))):
                 return GateRequest(
                     gate_id=name, kind=str((declaration or {}).get("kind") or "human"),
                     reason=str((declaration or {}).get("description")
@@ -1471,6 +1828,31 @@ class Orchestrator:
                 dossier={"outcome": state.get("outcome"), "log_tail": (state.get("log") or [])[-5:]},
             )
         return None
+
+    def _stalled_node(self, state: dict[str, Any], node: str) -> bool:
+        """Whether the run has genuinely stopped at `node`, rather than still working through it.
+
+        This is the line between "the run needs a person" and "the run is mid-repair". A refused node
+        is `needs_review` in *both* cases — the runner keeps the failed attempt in its checkpoint while
+        the bounded rework retries it — so the status alone cannot tell them apart. The runner's own
+        phase can: `execute` is its word for "a node is running", and it stays `execute` for the whole
+        of a rework window, which is exactly the period during which this node must not gate anything.
+
+        The node id is not consulted, and that is deliberate rather than an omission. What the check
+        answers is "has the run stopped", and the caller has already established that *this* node is
+        the not-done one; when the frontier empties there is exactly one such node, which is the node
+        the original code parked on. Reading the node's own `max_iterations` instead would let a
+        field about the payload decide a question about the graph, and it is usually `1` here.
+
+        The effect is the behaviour that had to be preserved: a refusal that ends the run still parks
+        as a human gate, named for the node, exactly as it did before — while a refusal the rework is
+        still working through does not gate anything.
+
+        The phase answers it alone, because `execute` is set by the runner's own traversal loop and
+        is never restored to anything else by a rework pass — so a checkpoint read mid-node is the
+        one case with no stop to report, whatever the node's record says.
+        """
+        return str(state.get("phase") or "") != "execute"
 
     def _gate_declaration(self, node_id: str) -> dict[str, Any] | None:
         """The manifest's declaration for a gate node."""
@@ -1623,62 +2005,90 @@ class Orchestrator:
         looks like a crash rather than a refusal. Pruning it is not a loss: the node is finished, its
         artifact is recorded, and the remaining graph is exactly the work still to do.
 
-        The edit is textual because the manifest is Safe YAML this engine wrote, and a parse-and-
-        re-emit would churn every unrelated line; a header records why `start` moved. The rewritten
-        manifest is validated by the runner on the next spawn, so a bad edit is refused loudly rather
-        than executed.
+        This parses and re-emits rather than editing lines, because the graph is a *structure* and a
+        line-oriented edit has to re-derive it: an earlier textual version dropped the released node's
+        edge block by scanning for the next `- from:`, which does not exist when the released node was
+        the last edge — so the scan ran past the `edges:` list into `end:`, `loops:` and `gates:`,
+        truncating the manifest. The result was a graph with a `start` that no edge could reach and a
+        `gates:` header with nothing under it. Re-emitting is also what every other manifest write in
+        this engine does, so the rewritten file is the same shape as the planned one.
+
+        Whatever comes out is validated by the library's own validator on the next spawn, so a bad
+        rewrite is refused loudly rather than executed.
         """
         try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
+            manifest = self._read_manifest(path)
+        except Exception as exc:  # noqa: BLE001 - an unreadable manifest is not rewritable
+            self.diagnostics.warning("gate.manifest.rewrite.unreadable", message=str(exc))
             return
-        lines = text.splitlines()
-        out: list[str] = []
-        index = 0
-        dropped = False
-        while index < len(lines):
-            line = lines[index]
-            # Drop the released node's block: from its `- id:` to the next `- id:`.
-            if re.match(rf"\s*- id:\s*{re.escape(released)}\s*$", line):
-                dropped = True
-                index += 1
-                continue
-            if dropped and re.match(r"\s*- id:\s*\S+", line):
-                dropped = False
-            if dropped:
-                index += 1
-                continue
-            # Repoint `start`.
-            if line.startswith("start:"):
-                out.append(f"start: {successor}")
-                index += 1
-                continue
-            # Drop any edge that mentions the released node, in either direction.
-            if re.match(rf"\s*- from:\s*{re.escape(released)}\s*$", line) or \
-                    re.match(rf"\s*- to:\s*{re.escape(released)}\s*$", line):
-                # An edge block is `- from: …` then indented keys; drop until the next `- from:`
-                # (or a non-indented section header).
-                is_from = "from:" in line
-                index += 1
-                while index < len(lines):
-                    nxt = lines[index]
-                    if re.match(r"\s*- from:\s*", nxt):
-                        break
-                    if nxt and not nxt.startswith((" ", "\t")):
-                        break
-                    index += 1
-                if not is_from:
-                    # A `- to:` line inside a block whose `- from:` was kept: the whole block is in
-                    # `out` already, so remove it.
-                    while out and not re.match(r"\s*- from:\s*", out[-1]):
-                        out.pop()
-                    if out:
-                        out.pop()
-                continue
-            out.append(line)
-            index += 1
-        if not dropped and not any(l.startswith("start:") for l in lines):
+        if not isinstance(manifest, dict):
             return
+
+        gates = [g for g in (manifest.get("gates") or [])
+                 if str(g.get("id")) != released]
+        nodes = [n for n in (manifest.get("nodes") or [])
+                 if str(n.get("id")) != released]
+        # Both directions: an edge *into* the released node has nothing left to deliver to, and one
+        # *out of* it describes a handoff that has already been recorded on the released node.
+        edges = [e for e in (manifest.get("edges") or [])
+                 if str(e.get("from")) != released and str(e.get("to")) != released]
+        ends = [e for e in (manifest.get("end") or []) if str(e) != released]
+
+        # Prune everything `successor` can no longer reach. Removing the released node orphans its
+        # ancestors, and the library's own validator refuses a graph with unreachable nodes — which
+        # surfaced as `the runner exited 1`, a message that says nothing about the real cause. Walking
+        # the remaining edges forward from `successor` keeps exactly the work still to do.
+        #
+        # Gates are seeded into the reachable set rather than derived from it. A gate is a graph
+        # *endpoint*: the composed plan lists it in `nodes:` as well, but a hand-written manifest like
+        # the gate-probe fixture declares it only under `gates:`, with no edge leaving it. Treating
+        # "no outgoing edge" as "unreachable" would delete the very gate the release just decided.
+        reachable: set[str] = {successor}
+        reachable |= {str(g.get("id")) for g in gates}
+        frontier = [successor]
+        adjacency: dict[str, list[str]] = {}
+        for edge in edges:
+            adjacency.setdefault(str(edge.get("from")), []).append(str(edge.get("to")))
+        while frontier:
+            current = frontier.pop()
+            for nxt in adjacency.get(current, []):
+                if nxt not in reachable:
+                    reachable.add(nxt)
+                    frontier.append(nxt)
+
+        declared = {str(n.get("id")) for n in nodes} | {str(g.get("id")) for g in gates}
+        if successor not in declared:
+            self.diagnostics.warning(
+                "gate.manifest.rewrite.skipped",
+                message=f"cannot advance past {released}: successor {successor!r} is not declared "
+                        "in the remaining graph")
+            return
+
+        pruned_nodes = [n for n in nodes if str(n.get("id")) in reachable]
+        pruned_edges = [e for e in edges
+                        if str(e.get("from")) in reachable and str(e.get("to")) in reachable]
+        kept_gates = [g for g in gates if str(g.get("id")) in reachable]
+
+        rewritten = dict(manifest)
+        rewritten["start"] = successor
+        rewritten["nodes"] = pruned_nodes
+        rewritten["edges"] = pruned_edges
+        rewritten["end"] = [e for e in ends if str(e) in reachable] or [successor]
+        if "gates" in manifest:
+            rewritten["gates"] = kept_gates
+        # A loop naming the released node would re-enter a node that is no longer in the graph.
+        if rewritten.get("loops"):
+            kept_loops = []
+            for loop in rewritten["loops"]:
+                members = [str(n) for n in (loop.get("nodes") or [])
+                           if str(n) in reachable and str(n) != released]
+                if not members:
+                    continue
+                trimmed = dict(loop)
+                trimmed["nodes"] = members
+                kept_loops.append(trimmed)
+            rewritten["loops"] = kept_loops
+
         header = (
             f"# `start` moved to {successor} after {released} was approved at a gate, and the\n"
             f"# finished node was pruned. The library runner seeds its frontier from `start` and\n"
@@ -1686,7 +2096,7 @@ class Orchestrator:
             f"# node instead of parking on it again; pruning keeps the graph reachable for the\n"
             f"# library's own validator.\n")
         try:
-            path.write_text(header + "\n".join(out) + "\n", encoding="utf-8")
+            path.write_text(header + emit_safe_yaml(rewritten), encoding="utf-8")
         except OSError as exc:  # noqa: BLE001
             self.diagnostics.warning("gate.manifest.rewrite.failed", message=str(exc))
 

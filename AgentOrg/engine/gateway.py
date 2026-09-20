@@ -252,7 +252,8 @@ class Gateway:
                  catalog: ModelCatalog | None = None, *, bus: Any = None,
                  estimator: TokenEstimator | None = None,
                  ledger: CostLedger | None = None,
-                 run_id: str | None = None) -> None:
+                 run_id: str | None = None,
+                 cache_store: Any = None) -> None:
         self.config = config
         self.providers = dict(providers)
         self.catalog = catalog
@@ -260,9 +261,15 @@ class Gateway:
         self.estimator = estimator or TokenEstimator()
         self.ledger = ledger or CostLedger()
         self.run_id = run_id
+        # The durable cache record, when a workspace is available to hold one. Optional because a
+        # gateway can be built without a workspace (a test, a probe) and cache bookkeeping is not
+        # worth refusing a call over. See `_record_cache`.
+        self.cache_store = cache_store
         self.run_max_usd = float(config.budget.run_max_usd)
         self.run_max_tokens = int(config.budget.run_max_tokens)
         self._skipped: list[str] = []
+        #: The first store failure, kept so it is reported once rather than on every call.
+        self._cache_store_warning: str = ""
 
     def note_skipped(self, skipped: list[str]) -> None:
         """Record providers the registry could not build, so callers can surface them."""
@@ -489,6 +496,8 @@ class Gateway:
         # is per-gateway state: two runs do not share a prefix, and comparing across them would
         # report a change that never happened.
         diagnostics = self._observe_cache_shape(effective, response.usage)
+        self._record_cache(diagnostics, response.usage, cost, provider_id=pid, model=model,
+                           agent_id=agent_id, node_id=node_id, session_id=session_id)
 
         payload = response.as_dict()
         payload.update({"agent_id": agent_id, "estimated_prompt_tokens": estimate.tokens,
@@ -521,6 +530,53 @@ class Gateway:
         return tracker.observe(system=system, schemas=list(getattr(request, "tools", []) or []),
                                usage=usage)
 
+    def _record_cache(self, diagnostics: Any, usage: Any, cost: Cost, *, provider_id: str = "",
+                      model: str = "", agent_id: str | None = None, node_id: str | None = None,
+                      session_id: str | None = None) -> None:
+        """Persist this call's shape observation and its cache counters, if a store is attached.
+
+        Three rules, all of them about the run surviving:
+
+        - **A store failure is a warning, never an exception.** The provider call already succeeded
+          and the response is about to be returned; dying now would discard a paid-for answer over
+          bookkeeping. Same posture as the diagnostics log and the telemetry exporter.
+        - **The observation is persisted *as observed*.** An unreported hit rate travels through the
+          store as absent (`None`), never as 0 — the honesty rule the whole cache layer keeps, and a
+          file is no more entitled to invent a zero than a display is.
+        - **The warning is reported once.** A store that fails for every call in a hundred-call run
+          would otherwise fill the log with the same line and bury the fact it is reporting.
+        """
+        store = self.cache_store
+        if store is None:
+            return
+        try:
+            # No `chars` here: all this site knows is the *token* estimate of the tool block, and a
+            # token count written into a character field would make a later `verify_prefix(chars=…)`
+            # report a mismatch that is really a unit error. The executor's pin records the real
+            # character count for the same prefix, and the record keeps whichever landed first.
+            store.remember_prefix(prefix_hash=diagnostics.prefix_hash, run_id=self.run_id or "",
+                                  source="gateway")
+            store.record_shape(diagnostics, turn=self.ledger.calls, run_id=self.run_id or "",
+                               agent_id=agent_id or "", node_id=node_id or "")
+            store.record_usage(usage, cost, provider_id=provider_id, model=model,
+                               agent_id=agent_id or "", node_id=node_id or "",
+                               session_id=session_id or "", run_id=self.run_id or "")
+        except Exception as exc:  # noqa: BLE001 - cache bookkeeping must never break a call
+            self._warn_cache_store(exc)
+
+    def _warn_cache_store(self, exc: Exception) -> None:
+        """Report a store failure to the log, once, and to the event stream.
+
+        Emitted as a warning on the same bus as everything else so a person watching the run sees it
+        without having to be told to go looking in a file.
+        """
+        message = f"cache store write failed ({type(exc).__name__}: {exc})"
+        if self._cache_store_warning:
+            return
+        self._cache_store_warning = message
+        self._emit(EventType.AGENT_LOG, {"stream": "stderr", "level": "warning", "text": message},
+                   agent_id=None, node_id=None)
+
     def cache_summary(self) -> dict[str, Any]:
         """This gateway's aggregate cache picture, or an all-None summary when nothing reported."""
         tracker = getattr(self, "_shape_tracker", None)
@@ -528,6 +584,23 @@ class Gateway:
             return {"turns": 0, "cache_reported": False, "cache_hit_tokens": None,
                     "cache_miss_tokens": None, "cache_hit_rate": None}
         return tracker.summary()
+
+    def durable_cache_summary(self) -> dict[str, Any]:
+        """The store's picture across every run in this workspace, or an empty one when unattached.
+
+        Distinct from :meth:`cache_summary`, which is this process only: the question a restarted run
+        raises is the durable one, and a summary that quietly answered the in-process version would
+        look identical and mean something else.
+        """
+        store = self.cache_store
+        if store is None:
+            return {"attached": False, "prefixes": 0, "shapes": 0, "savings_records": 0,
+                    "cache_reported": False, "cache_hit_tokens": None, "cache_miss_tokens": None,
+                    "cache_write_tokens": None, "cache_hit_rate": None, "cache_saving_usd": None}
+        try:
+            return {"attached": True, **store.summary()}
+        except Exception as exc:  # noqa: BLE001 - a summary must never break a caller
+            return {"attached": True, "error": str(exc)}
 
     def stream(self, request: ChatRequest, *, provider_id: str | None = None,
                agent_id: str | None = None, node_id: str | None = None,
@@ -556,12 +629,19 @@ class Gateway:
                 self.ledger.charge(cost, agent_id=agent_id)
                 self.reconcile(effective, estimate.tokens, chunk.usage, provider_id=pid,
                                model=model, agent_id=agent_id)
+                # A streamed call is a call: the shape observed here is the same prefix, and the
+                # terminal chunk carries the same cache counters. Recording it only for `complete`
+                # would make the durable history depend on which call surface the caller used.
+                diagnostics = self._observe_cache_shape(effective, chunk.usage)
+                self._record_cache(diagnostics, chunk.usage, cost, provider_id=pid, model=model,
+                                   agent_id=agent_id, node_id=node_id, session_id=session_id)
                 self._emit(EventType.LLM_RESPONSE, {
                     "provider_id": pid, "model": model, "agent_id": agent_id,
                     "stream": True, "finish_reason": chunk.finish_reason.value,
                     "usage": chunk.usage.as_dict(), "cost": cost.as_dict(),
                     "latency_ms": (time.time() - started) * 1000.0,
                     "budget": self.ledger.snapshot(),
+                    "cache": diagnostics.as_dict(),
                 }, agent_id=agent_id, node_id=node_id, session_id=session_id)
             yield chunk
 

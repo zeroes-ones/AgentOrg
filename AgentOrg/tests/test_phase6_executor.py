@@ -509,6 +509,93 @@ def test_a_reviewer_is_never_bound_to_its_producer(tmp_path, config, skills, lib
     assert result["_agent"]["agent_id"] != producer
 
 
+# ── subagents: their budget and their procedure ──────────────────────────────
+
+
+def test_parent_token_budget_reads_the_real_cost_ledger(tmp_path, config, skills, library):
+    """The parent's remainder comes from the ledger that saw the calls, not from a zero.
+
+    The three cost sites used to ask the *decision* ledger for a `snapshot()` it never had, take the
+    exception branch, and report `0` — a fabricated figure the round's own docstring forbids.
+    """
+    from engine.providers.base import ChatRequest, Message, Role
+
+    executor, _, _ = _executor(tmp_path, config, skills, library)
+    gateway = executor.ctx.gateway
+    gateway.complete(
+        ChatRequest(model="fake-model", messages=[Message.text_message(Role.USER, "hi")]),
+        provider_id="fake", agent_id="ag_1", node_id="dev",
+    )
+    assert gateway.ledger.total_tokens > 0, "the fixture call must actually report tokens"
+    assert executor._parent_token_budget() == gateway.run_max_tokens - gateway.ledger.total_tokens
+    assert executor._parent_token_budget() not in (0,), "a real remainder must not read as zero"
+
+
+def test_parent_token_budget_is_zero_only_when_the_ceiling_is_spent(tmp_path, config, skills, library):
+    executor, _, _ = _executor(tmp_path, config, skills, library)
+    executor.ctx.gateway.ledger.total_tokens = executor.ctx.gateway.run_max_tokens
+    assert executor._parent_token_budget() == 0
+
+
+def test_a_child_bound_to_a_skill_receives_its_body(tmp_path, config, skills, library):
+    """A child must follow the procedure it was hired for, not only the generic sentence.
+
+    `_child_system` called a `bundle()` no skill source defined; the bare `except Exception` hid the
+    `AttributeError`, so every child ran with an empty body.
+    """
+    executor, _, _ = _executor(tmp_path, config, skills, library)
+    system = executor._child_system("code-reviewer")
+    body = skills.load("code-reviewer").body.strip()
+    assert body, "the fixture skill must have a body to lose"
+    assert body[:200] in system, "the skill's own procedure text must reach the child"
+    assert system.startswith("You are a subagent working under a parent agent.")
+
+
+def test_an_unknown_skill_yields_a_generic_child(tmp_path, config, skills, library):
+    """A name nobody holds is a real case: the child is still run, just without a procedure."""
+    executor, _, _ = _executor(tmp_path, config, skills, library)
+    system = executor._child_system("no-such-skill-anywhere")
+    assert system.endswith("\n\n"), "an unknown skill contributes no body"
+    assert "no-such-skill-anywhere" not in system
+
+
+def test_a_missing_bundle_capability_is_not_swallowed(tmp_path, config, skills, library):
+    """A genuine programming error must surface, not turn into a silently generic child.
+
+    This is the exact shape that hid the defect: an `AttributeError` from a method that does not
+    exist. Narrowing the catch to `SkillError` makes it loud again.
+    """
+    executor, _, _ = _executor(tmp_path, config, skills, library)
+
+    class SourceWithoutBundle:
+        pass
+
+    executor.ctx.skills = SourceWithoutBundle()
+    with pytest.raises(AttributeError):
+        executor._child_system("code-reviewer")
+
+
+def test_a_child_prefers_the_owners_skill_over_the_library_copy(tmp_path, config, library):
+    """Overlay-first: a project skill sharing a library name must be what the child receives."""
+    from engine.skills.overlay import OverlaySkillSource
+
+    project = tmp_path / "ownerproj"
+    custom = project / ".agentorg" / "skills" / "code-reviewer"
+    custom.mkdir(parents=True)
+    (custom / "SKILL.md").write_text(
+        "---\nname: code-reviewer\nworkflow:\n  completion:\n    criteria:\n"
+        "      - the owner's own rule\n---\n# Owner Reviewer\nMARKER-OWNER-SKILL\n",
+        encoding="utf-8",
+    )
+    source = OverlaySkillSource(FilesystemSkillSource(library), project=project,
+                                include_global=False)
+    assert source.has("code-reviewer")
+    assert "MARKER-OWNER-SKILL" in source.bundle("code-reviewer").body
+
+    executor, _, _ = _executor(tmp_path, config, source, library)
+    assert "MARKER-OWNER-SKILL" in executor._child_system("code-reviewer")
+
+
 # ── the guardrail ────────────────────────────────────────────────────────────
 
 
@@ -1006,4 +1093,80 @@ def test_a_rotated_session_is_actually_used_for_the_call(tmp_path, config, skill
     executor, _, _ = _executor(tmp_path, config, skills, library, manifest=manifest)
     # The ordinary path — no rotation — must keep working unchanged.
     result = executor.execute_node("dev", _state(), {"pass": 1})
+    assert result["status"] in ("done", "needs_review"), result.get("summary")
+
+
+# ── a fan-out's result is the sum of its items, not zeroed placeholders ──────
+#
+# The fan-out side was fixed first (`FanoutItem.artifacts`/`.usage`, aggregated by `plan.summary()`),
+# but the executor still returned `ItemOutcome`-less tuples and then hardcoded `"artifacts": []` and
+# `{"tokens_in": 0, ...}` into the node result. So a node that wrote twenty files told every downstream
+# node it had produced none, and the fan-out's token spend was invisible — while the docstring claimed
+# the artifacts were kept. These two tests pin the wiring at each end: the item outcome the executor
+# hands the plan, and the aggregate it reads back.
+
+
+def test_a_fanout_node_carries_its_items_artifacts_and_usage(tmp_path, config, skills, library):
+    """A fan-out's result must report what its items produced and what they cost."""
+    items = ["src/a.ts", "src/b.ts", "src/c.ts"]
+    manifest = {"nodes": [{"id": "reviewall", "skill": "code-reviewer", "phase": "REVIEW",
+                           "fanout": "Review {{item}} for regressions.", "items": items,
+                           "inputs": [], "outputs": ["review-report"]}]}
+    executor, _, _ = _executor(tmp_path, config, skills, library, manifest=manifest)
+    result = executor.execute_node("reviewall", _state(), {"pass": 1})
+
+    assert result["status"] == "done", result.get("summary")
+    # The fixture provider answers every item with one artifact and 900/200 tokens, so the aggregate
+    # is per-item and the numbers are exact — a zero, a single item's figure or a doubled one fails.
+    assert len(result["artifacts"]) == len(items), (
+        f"a fan-out of {len(items)} must carry its items' artifacts, got {result['artifacts']!r}")
+    assert all(entry.get("path") for entry in result["artifacts"])
+    assert result["usage"]["tokens_in"] == 900 * len(items), result["usage"]
+    assert result["usage"]["tokens_out"] == 200 * len(items), result["usage"]
+    # And the docstring's claim is now true rather than aspirational.
+    assert result["fanout"]["succeeded"] == len(items)
+
+
+def test_a_pooled_node_renews_the_lease_of_the_task_it_claimed(tmp_path, config, skills, library):
+    """Without a caller, `TaskPool.renew` could never fire and a slow node lost its task mid-flight.
+
+    The pool side already had `renew`; the executor never called it. A recording stub is enough to
+    hold the wiring: the node must renew the lease of the task it claimed, and still settle it.
+    """
+    from engine.pool import PoolTask
+
+    class RecordingPool:
+        """The methods the executor calls, recording the lease heartbeats."""
+
+        def __init__(self, task):
+            self.task = task
+            self.renewed: list[str] = []
+            self.completed: list[str] = []
+
+        def claim(self, agent, *, task_id=None):
+            return self.task
+
+        def renew(self, task_id, agent, *, lease_s=None):
+            self.renewed.append(task_id)
+            return self.task
+
+        def complete(self, task_id, agent, *, output=""):
+            self.completed.append(task_id)
+            return self.task
+
+        def fail(self, task_id, agent, *, reason=""):
+            return self.task
+
+    manifest = {"nodes": [{"id": "dev", "skill": "backend-developer", "outputs": ["change"],
+                           "from_pool": True}]}
+    executor, _, _ = _executor(tmp_path, config, skills, library, manifest=manifest)
+    pool = RecordingPool(PoolTask(id="task_1", description="backfill the new column"))
+    executor.ctx.pool = pool
+
+    result = executor.execute_node("dev", _state(), {"pass": 1})
+
+    assert pool.renewed == ["task_1"], (
+        "a pooled node must renew its lease while it works, or the task returns to the pool and a "
+        f"second worker runs it; renewals seen: {pool.renewed!r}")
+    assert pool.completed == ["task_1"], "and it must still settle the task it claimed"
     assert result["status"] in ("done", "needs_review"), result.get("summary")

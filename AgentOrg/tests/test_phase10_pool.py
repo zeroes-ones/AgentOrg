@@ -111,6 +111,146 @@ def test_a_live_lease_is_respected(tmp_path, dba):
     assert pool.summary()["claimable"] == 0, "a live lease must hold"
 
 
+# ── renewal: a slow worker is not a dead worker ──────────────────────────────
+
+
+def test_a_renewed_lease_keeps_the_task_with_the_worker_running_it(tmp_path, dba):
+    """F3.1: the lease was set once at claim and nothing could extend it.
+
+    A node that legitimately runs longer than `DEFAULT_LEASE_S` had its task reclaimed by
+    `_expire_leases` and handed to a second worker while the first was still working — the same task
+    executed twice, and the first worker's result then refused as "not claimed by agent".
+    """
+    clock = [1000.0]
+    pool = TaskPool(tmp_path / "p.json", now=lambda: clock[0])
+    pool.create("migrate", required_skills=["database-designer"], task_id="task_slow")
+    pool.claim(dba, task_id="task_slow", lease_s=10)
+    second = agent("ag_dba2", "Dax", ["database-designer"])
+
+    clock[0] = 1008.0
+    pool.renew("task_slow", dba, lease_s=10)          # the heartbeat a running node sends
+    clock[0] = 1015.0                                  # past the *original* deadline
+    assert pool.summary()["claimable"] == 0, "a renewed lease must hold"
+    assert pool.claim(second) is None, "a second worker must not be handed a task still running"
+    assert pool.tasks["task_slow"].claimed_by == "ag_dba"
+
+
+def test_a_renewal_after_the_deadline_keeps_a_task_nobody_else_took(tmp_path, dba):
+    """The recovery case: the deadline passed, but no other worker has the task."""
+    clock = [1000.0]
+    pool = TaskPool(tmp_path / "p.json", now=lambda: clock[0])
+    pool.create("migrate", required_skills=["database-designer"], task_id="task_slow")
+    pool.claim(dba, task_id="task_slow", lease_s=10)
+    clock[0] = 9999.0
+    pool.renew("task_slow", dba, lease_s=10)
+    assert pool.tasks["task_slow"].state == TaskState.CLAIMED
+    assert pool.tasks["task_slow"].claimed_by == "ag_dba"
+    assert pool.summary()["claimable"] == 0
+
+
+def test_a_renewal_is_refused_for_a_task_another_worker_holds(tmp_path, dba):
+    """The task was genuinely taken; stealing it back is the duplicate this prevents."""
+    clock = [1000.0]
+    pool = TaskPool(tmp_path / "p.json", now=lambda: clock[0])
+    pool.create("migrate", required_skills=["database-designer"], task_id="task_slow")
+    pool.claim(dba, task_id="task_slow", lease_s=10)
+    clock[0] = 2000.0
+    winner = agent("ag_dba2", "Dax", ["database-designer"])
+    assert pool.claim(winner) is not None
+    with pytest.raises(PoolError, match="held by"):
+        pool.renew("task_slow", dba)
+    assert pool.tasks["task_slow"].claimed_by == "ag_dba2", "the live claim stands"
+
+
+def test_a_renewal_is_refused_for_a_worker_that_never_held_the_task(tmp_path, dba):
+    """Otherwise `renew` is a claim with no capability check behind it."""
+    pool = TaskPool(tmp_path / "p.json")
+    pool.create("migrate", required_skills=["database-designer"], task_id="task_slow")
+    with pytest.raises(PoolError, match="claim it again"):
+        pool.renew("task_slow", dba)
+    assert pool.tasks["task_slow"].state == TaskState.POOL
+
+
+# ── concurrency: one task, one worker, whatever the writer count ─────────────
+
+
+def test_concurrent_claims_hand_each_task_to_exactly_one_worker(tmp_path):
+    """F3.2: `claim` was `eligible()` then mutate, with no lock — so both callers could win.
+
+    Repeated rounds because a check-then-act race is a window rather than a certainty: the assertion
+    is the invariant ("one task, one holder"), which must hold every round.
+    """
+    import threading
+
+    for round_index in range(8):
+        pool = TaskPool(tmp_path / f"pool{round_index}.json")
+        for n in range(4):
+            pool.create(f"task {n}", required_skills=["database-designer"])
+        workers = [agent(f"ag_{n}", f"A{n}", ["database-designer"]) for n in range(10)]
+        barrier = threading.Barrier(len(workers))
+        claimed: list[tuple[str, str]] = []
+        guard = threading.Lock()
+
+        def pull(spec):
+            barrier.wait()
+            task = pool.claim(spec)
+            if task is not None:
+                with guard:
+                    claimed.append((spec.id, task.id))
+
+        threads = [threading.Thread(target=pull, args=(spec,)) for spec in workers]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        by_task: dict[str, set[str]] = {}
+        for agent_id, task_id in claimed:
+            by_task.setdefault(task_id, set()).add(agent_id)
+        assert len(claimed) == 4, f"round {round_index}: four tasks, {len(claimed)} claims"
+        for task_id, holders in by_task.items():
+            assert len(holders) == 1, f"round {round_index}: {task_id} was given to {holders}"
+
+
+def test_two_pools_over_one_file_do_not_revert_each_others_work(tmp_path):
+    """F3.3: the whole document is rewritten per save, so the second writer used to erase the first.
+
+    This is the runner subprocess (`host.py:396`) and the orchestrator (`serve.py:1159`) over one
+    `.agent_state/pool.json`: both build the pool at their own start, then each saves its whole
+    document, so whichever saved last won and the other's claim, offer or completion vanished.
+    """
+    path = tmp_path / "pool.json"
+    orchestrator = TaskPool(path)
+    runner = TaskPool(path)                 # both loaded before either wrote anything
+    orchestrator.create("from the orchestrator", required_skills=["database-designer"],
+                        task_id="task_a")
+    runner.create("from the runner", required_skills=["database-designer"], task_id="task_b")
+    seen = TaskPool(path)
+    assert set(seen.tasks) == {"task_a", "task_b"}, "neither writer may erase the other"
+
+
+def test_a_claim_from_a_stale_copy_is_refused(tmp_path, dba):
+    """Two instances, one file: the second must not hand out a task the first already claimed."""
+    path = tmp_path / "pool.json"
+    first = TaskPool(path)
+    first.create("migrate", required_skills=["database-designer"], task_id="task_one")
+    second = TaskPool(path)                 # its in-memory copy still says POOL
+    other = agent("ag_dba2", "Dax", ["database-designer"])
+    assert first.claim(dba, task_id="task_one") is not None
+    assert second.claim(other) is None, "a stale copy must not hand out a claimed task"
+    with pytest.raises(PoolError, match="not claimable"):
+        second.claim(other, task_id="task_one")
+
+
+def test_release_records_who_refused_it(tmp_path, dba):
+    """The refusal used to be written with `claimed_by` already cleared, so it always named nobody."""
+    pool = TaskPool(tmp_path / "pool.json")
+    task = pool.create("migrate", required_skills=["database-designer"])
+    pool.claim(dba, task_id=task.id)
+    pool.release(task.id, reason="need more context")
+    assert pool.tasks[task.id].refusals[0]["agent"] == "ag_dba"
+
+
 # ── offers: accountability and a refusal reason ──────────────────────────────
 
 

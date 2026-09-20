@@ -28,6 +28,13 @@ DESIGN
 - **Handoffs are first class.** The board does not flatten a handoff into a log line: each row carries
   what it received and what it sent on, because "the information moved from A to B and B did this with
   it" is the whole point of a typed handoff.
+- **A stop explains itself, and says what resolves it.** A row that did not finish carries the runner's
+  own sentence for why — its `summary` when it wrote one, and otherwise the entry the node's *own* `log`
+  recorded. That fallback is not decoration: an edge guardrail refuses the payload *before* a summary is
+  attached to the node record, so the reason for a `guardrail-blocked` node exists only in the log, and
+  a board that read the record alone printed the token and stopped. The token is never dropped — the
+  row's `verdict` still carries it — but it is never the whole answer either, so the board also says
+  what it means and names the command that applies.
 
 Usage:
     from engine.flow import build_flow
@@ -45,7 +52,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-__all__ = ["FlowRow", "FlowHandoff", "build_flow", "FLOW_VERSION"]
+# The separator between a `next` command and the reason it is the next one, imported rather than
+# re-spelled: `systemcli` already puts the same string in a `next` field and in the line the terminal
+# prints, and a second spelling of it would be the drift this codebase keeps paying for.
+from .systemcli import NEXT_SEP
+
+__all__ = ["FlowRow", "FlowHandoff", "build_flow", "is_stuck", "why_stopped", "stop_report",
+           "recovery_command", "FLOW_VERSION"]
 
 #: Bumped when the board's shape changes incompatibly, so a cached consumer can tell.
 FLOW_VERSION = "1.0.0"
@@ -67,7 +80,10 @@ _HANDOFF_EVENTS = {
 }
 
 #: What each node status means for the board's tone, so "on track" and "stuck" are not a guess by the
-#: UI. Keyed by the status the runner writes.
+#: UI. Keyed by the status the runner writes — a *verdict* is not a status, so the tone of a
+#: `guardrail-blocked` node comes from the status the runner writes beside it (`blocked`, hence `bad`).
+#: `is_stuck` below names the verdict too, so a checkpoint that carried the verdict alone is still
+#: counted and still toned as bad news rather than as silence.
 _STATUS_TONE = {
     "done": "good",
     "pass": "good",
@@ -79,6 +95,79 @@ _STATUS_TONE = {
     "awaiting_owner": "warn",
     "blocked": "bad",
     "failed": "bad",
+}
+
+#: How serious a stop the *verdict* names, for a row whose status tones as "no news".
+#:
+#: The runner writes `status=blocked` and `verdict=guardrail-blocked` in the same step, so this is a
+#: safety net rather than the normal path — but without it a checkpoint that carried only the verdict
+#: rendered as a grey row beside a headline that called that same node stuck.
+_VERDICT_TONE: dict[str, str] = {
+    "guardrail-blocked": "bad",
+    "contract-violation": "warn",
+    "awaiting_owner": "warn",
+}
+
+#: The statuses that mean "this node stopped short", and the verdicts that say the same thing when the
+#: status does not carry it. One predicate (`is_stuck`) reads both, so the board's `stuck` figure, the
+#: row's tone and the headline that names the node cannot disagree with one another.
+#:
+#: The app has its own rule — `status == "blocked" || verdict == "guardrail-blocked"`
+#: (`macos/Sources/AgentOrgKit/RunStateBrowser.swift:55`) — and the engine's differs in both directions,
+#: which is deliberate and stated here because the two are read side by side:
+#:
+#: - the engine *counts more*: `needs_review` and `failed` are work that cannot advance either, and a
+#:   board that dropped them would contradict its own headline. The app's `blockedCount` is one figure
+#:   in a list where "blocked" is the single thing to scan, so it is narrower on purpose.
+#: - the engine now *also* counts the `guardrail-blocked` verdict, which the app counts and the engine
+#:   did not. For a checkpoint the runner wrote the two arrive together (`workflow-runner.py` sets
+#:   `status=blocked` and `verdict=guardrail-blocked` in the same step), so this is a safety net rather
+#:   than a second rule — but it is what stops the engine under-counting a node the app flags.
+#:
+#: `awaiting_owner` is kept as a status because `_STATUS_TONE` already toned it and the `stuck` count
+#: already had it; in practice the executor emits it as a *verdict* on a `needs_review` gate node
+#: (`engine/executor.py:566`), so the verdict form is the one that actually fires.
+_STUCK_STATUSES: tuple[str, ...] = ("blocked", "failed", "needs_review", "awaiting_owner")
+_STUCK_VERDICTS: tuple[str, ...] = ("guardrail-blocked", "awaiting_owner")
+
+#: The runner's own log `action`s that mean "this node stopped", mapped to the cause each one names.
+#:
+#: An explicit map rather than a substring search of the prose: the reason is a *field* the runner
+#: wrote, and matching wording would make the board's answer depend on how a sentence happens to be
+#: phrased. The same three actions are what `orchestrator._STOP_ACTIONS` names for a whole *run*; this is
+#: the per-node reading of them, plus `escalate`, which the runner writes when a bounded retry (a
+#: contract rework, a loop pass, a budget) is spent and is then the only record of why.
+#:
+#: `contract-warning` carries a reason and is deliberately *not* here: it never stops a node, so
+#: treating it as a cause would explain a stop that did not happen.
+_CAUSE_ACTIONS: dict[str, str] = {
+    "guardrail": "the payload it handed on was refused at the edge",
+    "contract": "its result did not satisfy the completion contract",
+    "error": "the node raised an error",
+    "escalate": "the step was escalated instead of finishing",
+}
+
+#: How a stop is *said*: the token the runner recorded, and the one short phrase that means it.
+#:
+#: Keyed by both spellings because the two arrive independently — a verdict on the node record
+#: (`guardrail-blocked`) and an action on the log entry (`guardrail`) — and a reader must get the same
+#: sentence whichever of the two was written. This is the Python counterpart of the app's `EngineWord`
+#: (`macos/Sources/AgentOrg/NowPane.swift:83`), and it follows the same rule: a short phrase per token,
+#: and **nothing** for a token this build does not know. An invented word would be the confident-wrong
+#: output the rest of the engine avoids, and `FlowRow.verdict` still carries the token itself, so an
+#: unmapped one shows through rather than being lost.
+#:
+#: `guardrail-blocked` is the token this exists for. It is not self-explanatory: the node *finished its
+#: work* and the artifact it produced was refused at the handoff because it did not satisfy the
+#: contract. It is a contract failure at the edge — not a crash, and not a permission denial.
+_STOP_WORDS: dict[str, str] = {
+    "guardrail-blocked": "the work finished, but what it handed on was refused at the edge — "
+                         "a contract failure, not a crash",
+    "guardrail": "the payload it handed on was refused at the edge",
+    "contract-violation": "its result did not satisfy the node's completion contract",
+    "contract": "its result did not satisfy the completion contract",
+    "error": "the node raised an error",
+    "escalate": "the step was escalated instead of finishing",
 }
 
 
@@ -138,7 +227,10 @@ class FlowRow:
     #: True when a reviewer judged this node's work and the verdict came back here ("handoff back").
     judged_by: list[str] = field(default_factory=list)
     artifacts: list[str] = field(default_factory=list)
-    #: Why the node is not done, when it is not — the runner's own words, never a guess.
+    #: Why the node is not done, when it is not — the runner's own words, never a guess. Its `summary`
+    #: when the runner wrote one, and otherwise the sentence its own `log` entry carries: a guardrail
+    #: block refuses the payload *before* a summary can be attached to the record, so reading the record
+    #: alone left this empty and the board printed the verdict token as though it were the reason.
     blocked_by: str = ""
     is_gate: bool = False
     gate_kind: str = ""
@@ -155,6 +247,194 @@ class FlowRow:
             "blocked_by": self.blocked_by,
             "is_gate": self.is_gate, "gate_kind": self.gate_kind,
         }
+
+
+# ── why a node stopped, and what resolves it ─────────────────────────────────
+#
+# The reading of the checkpoint's `log` lives here rather than beside each reader, because the board and
+# the activity timeline must explain the *same* entry the same way. `activity` imports these; nothing
+# here imports `activity`.
+
+def is_stuck(status: str, verdict: str) -> bool:
+    """Whether a node with this status and verdict stopped short and something must change first.
+
+    A *finished* node is never stuck, whatever verdict it still carries. `awaiting_owner` is exactly the
+    trap this guard exists for: the runner keeps a gate node's verdict after a release marks its status
+    `done`, and a released gate is not waiting on anyone — the same false positive
+    `orchestrator._detect_gate` was fixed for, which re-parked a released run on the gate that had just
+    been approved.
+    """
+    if status in ("done", "pass", "skipped"):
+        return False
+    return status in _STUCK_STATUSES or verdict in _STUCK_VERDICTS
+
+
+def _row_tone(status: str, verdict: str) -> str:
+    """The board's colour for one row.
+
+    The status decides, *except* where it tones as "no news" and the verdict says the node stopped —
+    see `_VERDICT_TONE`.
+    """
+    tone = _STATUS_TONE.get(status, "")
+    if tone in ("good", "bad", "warn"):
+        return tone
+    return _VERDICT_TONE.get(verdict) or tone or "info"
+
+
+def _stop_entry(log: Any, node_id: str) -> dict[str, Any]:
+    """The newest log entry that explains this node stopping, or None. Newest, because the runner
+    appends one entry per attempt and the last thing it recorded is the stop that stands."""
+    for entry in reversed(list(log or [])):
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("action") or "") in _CAUSE_ACTIONS \
+                and str(entry.get("node") or "") == node_id:
+            return entry
+    return None
+
+
+def why_stopped(node_id: str, record: dict[str, Any], log: Any) -> str:
+    """Why this node is not done, in the runner's own words — or "" when it recorded no reason.
+
+    Three sources, in order of specificity, and never a guess at any of them:
+
+    1. The node record's `summary`, which is the agent's own sentence about its own result.
+    2. The entry the node's *own* log carries, which is where the reason lives when there is no summary.
+    3. The gloss for the token, so a row that would otherwise repeat `guardrail-blocked` says what the
+       token means instead.
+
+    Empty is an honest answer — the caller falls back to the token, which is what the engine actually
+    recorded. Inventing a sentence here would be the confident-wrong output this engine refuses
+    everywhere else.
+    """
+    record = record if isinstance(record, dict) else {}
+    summary = str(record.get("summary") or "").strip()
+    if summary:
+        return summary
+    verdict = str(record.get("verdict") or "").strip()
+    entry = _stop_entry(log, node_id)
+    action = str((entry or {}).get("action") or "")
+    detail = str((entry or {}).get("detail") or "").strip()
+    # The verdict's own gloss wins over the action's when both are known: `guardrail-blocked` says what
+    # happened to the *result*, which is what a person is looking at, where `guardrail` names the
+    # mechanism. Either way the detail is the runner's sentence verbatim.
+    gloss = _STOP_WORDS.get(verdict) or _STOP_WORDS.get(action, "")
+    if gloss and detail:
+        return f"{gloss}: {detail}"
+    return detail or gloss
+
+
+def stop_report(nodes: dict[str, Any], log: Any) -> list[dict[str, Any]]:
+    """Every stop the log records for a node that is *still* stopped, oldest first.
+
+    One dict per stop — `node`, `action`, `word` (the plain-English cause), `why` (the runner's own
+    sentence, glossed by the token when that is all there was), `tone` and `at`. Only nodes that are
+    still stopped are promoted, which keeps this a handful of lines rather than the run's whole log.
+
+    Public because `activity` puts the same stops on its timeline: a second reading of the same actions
+    would be a second thing to keep true, and this is the reading that decides what counts as a cause.
+    """
+    nodes = nodes if isinstance(nodes, dict) else {}
+    stopped = {name for name, record in nodes.items()
+               if isinstance(record, dict)
+               and is_stuck(str(record.get("status") or "pending"),
+                             str(record.get("verdict") or ""))}
+    out: list[dict[str, Any]] = []
+    for entry in (log if isinstance(log, list) else []):
+        if not isinstance(entry, dict):
+            continue
+        action = str(entry.get("action") or "")
+        node = str(entry.get("node") or "")
+        if action not in _CAUSE_ACTIONS or node not in stopped:
+            continue
+        out.append({
+            "node": node,
+            "action": action,
+            "word": _CAUSE_ACTIONS[action],
+            "why": why_stopped(node, nodes.get(node) or {}, log),
+            # The runner's sentence on its own, for a reader that already has the cause in the title —
+            # the timeline prints `word` as the title, so repeating the gloss inside the detail would say
+            # the same thing twice on one line.
+            "detail": str(entry.get("detail") or "").strip(),
+            # An error or a refused payload is the run failing; an escalation is the run stopping to
+            # ask. The tone says which, so the timeline does not paint every stop the same colour.
+            "tone": "bad" if action in ("guardrail", "error") else "warn",
+            "at": str(entry.get("ts") or ""),
+        })
+    return out
+
+
+def recovery_command(slug: str, checkpoint: dict[str, Any], state_dir: Path | None, *,
+                     node: str = "") -> dict[str, str]:
+    """The command that actually resolves a stopped run, and the reason it is the one — as data.
+
+    **Derived from the state, and checked against what the engine will accept.** A guardrail block
+    leaves the node's work produced and its payload refused at the edge, so the recovery is another
+    attempt at that node — and the three verbs that look like recoveries do not apply to this state:
+
+    - `reassign <node> --agent <name>` and `takeover <node>` change *who* does the work, not whether the
+      contract is met, and both are refused outright when there is no resumable run to pin: `cmd_reassign`
+      and `cmd_takeover` answer `no run found for '<slug>'` (or `the run is <terminal>`) and stop. That is
+      this workspace's state — its `run_state.json` is the *runner's* checkpoint, so there is no
+      orchestrator run here to reassign or take over.
+    - `abort` ends the run and is refused by the same two guards, so offering it would be offering a
+      refusal.
+    - re-running the graph is the one command that applies either way — it is even where all three of
+      those refusals point a person ("`engine.cli run --slug <slug> --manifest <file>`").
+
+    A goal may not release this either, and that is by design rather than an oversight: a guardrail block
+    is a safety control *firing*, and `orchestrator._UNRELEASABLE_STOP_REASONS` refuses to let autonomy
+    decide the control was wrong. So the retry belongs to a person, which is what this returns.
+
+    Empty `command` means no manifest could be named, and then nothing is offered: a next move naming a
+    file this workspace does not have is the refusal to come, not a next move.
+
+    `node` only names the subject of the reason ("gives `pm` another attempt"); the command is the same
+    either way, so both readers can say one sentence rather than paraphrasing each other.
+    """
+    slug = slug or str(checkpoint.get("slug") or checkpoint.get("workflow") or "")
+    manifest = next((path for path in _manifest_candidates(state_dir, checkpoint) if path.is_file()),
+                    None)
+    if not slug or manifest is None:
+        return {"command": "", "why": ""}
+    who = node or "the stopped node"
+    return {
+        "command": f"engine.cli run --slug {slug} --manifest {manifest}",
+        "why": f"nothing is driving this graph, so re-running it gives {who} another attempt at the "
+               f"payload the edge refused",
+    }
+
+
+def _next_line(rows: list[FlowRow], checkpoint: dict[str, Any], state_dir: Path | None) -> str:
+    """The board's `next`: the whole line, separator included, or "" when there is no move to name.
+
+    Shaped like `systemcli`'s `next` field (see `NEXT_SEP`) so the `--json` value and the terminal line
+    are the same sentence, and a caller that wants only the command takes the text before the separator.
+    It is derived from the state just reported rather than fixed: a command that could not be applied to
+    *this* board would be advice that fails, which is worse than a board that says only what it knows.
+    """
+    stuck = next((row for row in rows if is_stuck(row.status, row.verdict)), None)
+    if stuck is None:
+        return ""
+    recovery = recovery_command(str(checkpoint.get("slug") or checkpoint.get("workflow") or ""),
+                                checkpoint, state_dir, node=stuck.node_id)
+    if not recovery["command"]:
+        return ""
+    return f"{recovery['command']}{NEXT_SEP}{recovery['why']}"
+
+
+def clip(text: str, limit: int) -> str:
+    """Cut a reason to `limit` characters at a word boundary, and show that it was cut.
+
+    The board's one line is read at a glance, so it is bounded — but a bound that cuts mid-word reads
+    as a typo, and the reason now carries a gloss *and* the runner's sentence, so a cut needs to look
+    like one. Public because `activity` writes the same kind of one-line summary about the same run:
+    two truncations of one sentence that disagree end up looking like two different sentences.
+    """
+    if len(text) <= limit:
+        return text
+    head = text[:limit].rsplit(" ", 1)[0].rstrip(" ,;:.—-")
+    return f"{head or text[:limit].rstrip()}…"
 
 
 # ── path resolution ──────────────────────────────────────────────────────────
@@ -260,18 +540,32 @@ def _run_context_path(workspace: Any, state_dir: Path | None) -> Path | None:
     return None
 
 
-def _read_manifest(state_dir: Path | None, checkpoint: dict[str, Any]) -> dict[str, Any]:
-    """The manifest for this run, from the checkpoint's path or from the project folder."""
+def _manifest_candidates(state_dir: Path | None, checkpoint: dict[str, Any]) -> list[Path]:
+    """Where this run's manifest is expected, most specific first: the path the checkpoint recorded, then
+    the project's own `<name>.yaml`.
+
+    One resolution, shared by the board's read and by the command its `next` line suggests, so a next
+    move can never name a different file from the one the board was built from.
+    """
+    candidates: list[Path] = []
     path = str(checkpoint.get("manifest_path") or "")
     if path:
-        document = _read_manifest_file(Path(path))
-        if document:
-            return document
-    if state_dir is None:
-        return {}
-    project_root = state_dir.parent
-    manifest_name = str(checkpoint.get("slug") or checkpoint.get("workflow") or "")
-    for candidate in ([project_root / f"{manifest_name}.yaml"] if manifest_name else []):
+        candidates.append(Path(path))
+    if state_dir is not None:
+        manifest_name = str(checkpoint.get("slug") or checkpoint.get("workflow") or "")
+        if manifest_name:
+            candidates.append(state_dir.parent / f"{manifest_name}.yaml")
+    return candidates
+
+
+def _read_manifest(state_dir: Path | None, checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """The manifest for this run, from the checkpoint's path or from the project folder.
+
+    A recorded path that does not parse falls through to the project's own file rather than ending the
+    search: a stale `manifest_path` on a resumed run is common, and the file beside the checkpoint is
+    the one the runner itself would read.
+    """
+    for candidate in _manifest_candidates(state_dir, checkpoint):
         document = _read_manifest_file(candidate)
         if document:
             return document
@@ -418,7 +712,7 @@ def build_flow(workspace: Any, *, run_status: dict[str, Any] | None = None,
     # different file, and different shape) uses top-level `nodes`. Both are read, because a Flow board
     # that showed "No work is assigned yet" for a run that had just produced a PRD is worse than
     # showing nothing — it contradicts the run.
-    nodes = checkpoint.get("nodes") or (checkpoint.get("outcome") or {}).get("nodes") or {}
+    nodes = _node_records(checkpoint)
     manifest_nodes = _manifest_nodes(checkpoint)
     # The run context is the orchestrator's own record of what it decided: the binding per node and the
     # roster it ran with. It is the richest source of "who is on what", so it is read first and the
@@ -451,6 +745,10 @@ def build_flow(workspace: Any, *, run_status: dict[str, Any] | None = None,
         "goal": str(checkpoint.get("run_goal") or checkpoint.get("goal") or ""),
         "phase": str(checkpoint.get("phase") or "idle"),
         "headline": _headline(rows, handoffs, checkpoint),
+        # The move that resolves what this board is showing, in the same shape `systemcli` puts in its
+        # `next` field — one line, command first, so the app and `serve` show one sentence rather than
+        # each inventing its own. Empty when there is nothing a person needs to do.
+        "next": _next_line(rows, checkpoint, state_dir),
         "rows": [row.as_dict() for row in rows],
         "handoffs": [h.as_dict() for h in handoffs],
         "counts": counts,
@@ -484,6 +782,30 @@ def _merge_binding_diagnostics(bindings: dict[str, dict[str, Any]],
             "policy": str(detail.get("policy") or ""),
             "agents": [agent_id],
         }
+
+
+def _node_records(checkpoint: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """The checkpoint's per-node records, from either shape, or {} when it carries none.
+
+    Two shapes are in play and only one of them is a table of records: the runner's `nodes` (and the
+    engine's `outcome.nodes` once the runner's outcome has been folded in) is `{node: record}`, while a
+    run the orchestrator has only *adopted* writes `outcome.nodes` as a **list of node ids**. Reading
+    that list as a table raised `'list' object has no attribute 'get'` out of the board for every fresh
+    run, and an exception is not an answer — the module's own rule is that a shape it cannot use yields
+    a board with the nodes it can name (from the manifest) rather than an error.
+    """
+    sources = [checkpoint.get("nodes")]
+    outcome = checkpoint.get("outcome")
+    sources.append(outcome.get("nodes") if isinstance(outcome, dict) else None)
+    found: dict[str, dict[str, Any]] = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        table = {str(k): v for k, v in source.items() if isinstance(v, dict)}
+        if table:
+            return table
+        found = found or table
+    return found
 
 
 def _manifest_nodes(checkpoint: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -622,6 +944,8 @@ def _rows(nodes: dict[str, Any], manifest_nodes: dict[str, dict[str, Any]],
     or a resumed run from an older build) is appended rather than dropped.
     """
     artifacts = checkpoint.get("artifacts") if isinstance(checkpoint.get("artifacts"), dict) else {}
+    # The runner's log, read once: it is the only place a guardrail block's reason is written.
+    log = checkpoint.get("log")
     rows: list[FlowRow] = []
     seen: set[str] = set()
 
@@ -632,6 +956,8 @@ def _rows(nodes: dict[str, Any], manifest_nodes: dict[str, dict[str, Any]],
         agent_id = str(binding.get("agent_id") or "")
         agent = agents.get(agent_id, {})
         status = str(record.get("status") or "pending")
+        verdict = str(record.get("verdict") or "")
+        stopped = is_stuck(status, verdict)
         is_gate = str(declaration.get("type") or "") == "gate" or "gate" in node_id
         gate_kind = str(declaration.get("kind") or "") if is_gate else ""
         row = FlowRow(
@@ -641,15 +967,16 @@ def _rows(nodes: dict[str, Any], manifest_nodes: dict[str, dict[str, Any]],
             agent_name=str(agent.get("name") or binding.get("agent_name") or ""),
             title=str(declaration.get("title") or agent.get("title") or ""),
             status=status,
-            verdict=str(record.get("verdict") or ""),
-            tone=_STATUS_TONE.get(status, "info"),
+            verdict=verdict,
+            # A status that tones as "no news", on a row that stopped, is bad news rather than silence —
+            # see `_row_tone`.
+            tone=_row_tone(status, verdict),
             phase=str(declaration.get("phase") or ""),
             iterations=int(record.get("iterations") or 0),
             summary=str(record.get("summary") or ""),
             artifacts=sorted(a for a, meta in artifacts.items()
                              if isinstance(meta, dict) and meta.get("node") == node_id),
-            blocked_by=str(record.get("summary") or "") if status in ("blocked", "failed",
-                                                                     "needs_review") else "",
+            blocked_by=why_stopped(node_id, record, log) if stopped else "",
             is_gate=is_gate,
             gate_kind=gate_kind,
         )
@@ -692,6 +1019,11 @@ def _rows(nodes: dict[str, Any], manifest_nodes: dict[str, dict[str, Any]],
 
 def _counts(rows: list[FlowRow]) -> dict[str, int]:
     """The tallies the board shows, computed once so the UI does not.
+
+    `stuck` reads the same predicate the headline's sentence does, so the figure and the sentence can
+    never disagree about which rows stopped — and it counts the `guardrail-blocked` verdict on a row
+    whose status does not say so, which is the clause the app's own count has
+    (`macos/Sources/AgentOrgKit/RunStateBrowser.swift:55`).
     """
     counts = {"total": len(rows), "done": 0, "working": 0, "waiting": 0, "stuck": 0, "gates": 0}
     for row in rows:
@@ -699,12 +1031,15 @@ def _counts(rows: list[FlowRow]) -> dict[str, int]:
             counts["gates"] += 1
         if row.status in ("done", "pass"):
             counts["done"] += 1
+        # Asked before "working"/"waiting", because a row can be *both* — a checkpoint that carries a
+        # guardrail verdict on a status that reads as waiting is a node that stopped, and counting it as
+        # waiting would be the figure contradicting the row's own tone and the headline's sentence.
+        elif is_stuck(row.status, row.verdict):
+            counts["stuck"] += 1
         elif row.status in ("running", "working"):
             counts["working"] += 1
         elif row.status in ("pending", "queued"):
             counts["waiting"] += 1
-        elif row.status in ("blocked", "failed", "needs_review", "awaiting_owner"):
-            counts["stuck"] += 1
     return counts
 
 
@@ -718,10 +1053,16 @@ def _headline(rows: list[FlowRow], handoffs: list[FlowHandoff],
         owner = working[0].agent_name or working[0].node_id
         return f"{owner} is working on {working[0].node_id} " \
                f"({len(working)} of {len(rows)} in flight)."
-    stuck = [r for r in rows if r.status in ("blocked", "failed", "needs_review")]
+    stuck = [r for r in rows if is_stuck(r.status, r.verdict)]
     if stuck:
+        # The runner's own sentence for the stop, with the verdict token glossed when that was the only
+        # thing recorded. The token is still never lost — it stays on the row's `verdict` — but it is
+        # never the whole answer either, which it was: `pm is stuck — guardrail-blocked` says nothing
+        # about what happened or what to do. The bound is wider than the old 120 because the sentence is
+        # now a gloss *and* the runner's words, and a cut that dropped the specifics would restore the
+        # problem this exists to fix. `clip` cuts on a word boundary so it reads as truncated.
         reason = stuck[0].blocked_by or stuck[0].verdict or "no reason recorded"
-        return f"{stuck[0].node_id} is stuck — {reason[:120]}"
+        return f"{stuck[0].node_id} is stuck — {clip(reason, 160)}"
     breaches = [h for h in handoffs if h.state in ("breached", "rejected")]
     if breaches:
         return f"{len(breaches)} handoff(s) need attention."

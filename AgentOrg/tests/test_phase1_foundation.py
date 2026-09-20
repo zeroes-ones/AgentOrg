@@ -39,8 +39,26 @@ EXAMPLE = pathlib.Path(__file__).resolve().parent.parent / "credentials.example.
 def test_library_resolves_and_asserts_capabilities():
     lib = resolve()
     assert lib.files.runner.is_file()
-    assert lib.files.templates.is_dir()
-    assert lib.verified
+    assert lib.files.schema.is_dir()
+    assert lib.capabilities_verified
+    # Resolving with no pin compares no content, so the pin facts must stay false. Asserting them
+    # here is the point: a single "verified" flag was true on this path, which reads as "hash
+    # checked" on a checkout where not one hash was compared.
+    assert not lib.pinned
+    assert not lib.commit_pinned and not lib.manifest_pinned
+
+
+def test_library_registers_no_directory_it_never_reads():
+    """`workflow/templates`, `.skills-compiled`, `evals/golden` and `evals/tier3-behavioral` serve
+    the library's own skill and eval toolchain. This engine opens none of them, so registering them
+    would put a path in every diagnostic — and, for a required one, refuse startup over a directory
+    no line of code touches."""
+    lib = resolve()
+    registered = set(lib.files.__dataclass_fields__)
+    reported = lib.files.as_dict()
+    for unread in ("templates", "compiled", "golden", "behavioral"):
+        assert unread not in registered
+        assert unread not in reported
 
 
 def test_library_finds_skills_and_rejects_bad_names():
@@ -62,8 +80,10 @@ def test_library_manifest_detects_tampering():
     manifest = lib.build_manifest()
     assert manifest, "manifest must not be empty"
     recorded = dict(manifest)
-    # A clean manifest verifies.
-    resolve(expected_manifest=recorded)
+    # A clean manifest verifies — and the flag says which fact was checked.
+    matched = resolve(expected_manifest=recorded)
+    assert matched.manifest_pinned and matched.pinned
+    assert "content pin matched" in matched.verification_summary()
     # Any changed hash is reported, and the offending path is named.
     key = next(iter(recorded))
     tampered = dict(recorded)

@@ -45,19 +45,41 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+try:  # pragma: no cover - platform probe
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no flock
+    fcntl = None  # type: ignore[assignment]
+
 __all__ = ["TaskPool", "PoolTask", "PoolError", "TaskState", "validate_output"]
 
 
 class PoolError(RuntimeError):
     """A pool operation that cannot be honoured, named so the caller can act on it."""
+
+
+def _guarded(method: Any) -> Any:
+    """Run a pool method inside `_entered()` — the locks plus a refresh from disk.
+
+    Applied by decorator rather than by re-indenting every body, because the *point* is that no
+    operation may escape the guard: a method someone adds later without it is exactly the race this
+    closes, and a decorator makes the guard visible in one line at the definition site.
+    """
+    @functools.wraps(method)
+    def wrapper(self: "TaskPool", *args: Any, **kwargs: Any) -> Any:
+        with self._entered():
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 class TaskState:
@@ -73,6 +95,12 @@ class TaskState:
 
 #: How long a claim is valid without a progress heartbeat. Long enough for a slow local model, short
 #: enough that a dead worker's task returns to the pool within one useful interval.
+#:
+#: "Heartbeat" means :meth:`TaskPool.renew`, and it is the *caller's* job to send it: before renewal
+#: existed, this deadline was set once at claim and never extended, so a node that legitimately ran
+#: longer than 900s had its task reclaimed and handed to a second worker while it was still working on
+#: it — the same task executed twice, and the first worker's result refused as "not claimed by agent".
+#: A worker doing long work renews; one that has died cannot.
 DEFAULT_LEASE_S = 900.0
 
 
@@ -97,6 +125,11 @@ class PoolTask:
     claimed_by: str | None = None
     offered_to: str | None = None
     lease_until: float | None = None
+    #: The last agent to hold this task, kept across a lapse. Without it a worker whose lease expired
+    #: while it was still running could not prove it was the one running the task, so a late
+    #: `renew` could either be refused (losing the claim) or accepted from anyone (a back door to a
+    #: claim with no capability check).
+    last_claimant: str = ""
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     output: str = ""
@@ -112,7 +145,8 @@ class PoolTask:
             "output_schema": self.output_schema, "tags": list(self.tags),
             "parent_id": self.parent_id, "depends_on": list(self.depends_on),
             "claimed_by": self.claimed_by, "offered_to": self.offered_to,
-            "lease_until": self.lease_until, "created_at": self.created_at,
+            "lease_until": self.lease_until, "last_claimant": self.last_claimant,
+            "created_at": self.created_at,
             "updated_at": self.updated_at, "output": self.output,
             "failure_reason": self.failure_reason, "refusals": list(self.refusals),
         }
@@ -136,14 +170,120 @@ class TaskPool:
         alternative (an append-only log) needs a compaction policy for no benefit at this scale.
     now:
         Injectable clock, so lease expiry is testable without sleeping.
+
+    Concurrency
+    -----------
+    Three writers can reach one pool, and all three used to be able to hand the same task to two
+    workers:
+
+    - **two threads on one instance** (two `parallel:` members both pulling from the pool) — a plain
+      `eligible()` then mutate is a check-then-act race;
+    - **two instances over one file** — the runner subprocess builds a pool over
+      `.agent_state/pool.json` (`host.py:396`) while the orchestrator builds one over the same file
+      (`serve.py:1159`), and each rewrote the whole document from its own copy, so one process's
+      claim reverted the other's;
+    - **the same worker twice** — a lease set once at claim with nothing to extend it, so a slow node
+      outlived its own lease and was handed to a second worker mid-flight.
+
+    So every operation runs inside `_entered()`: this process's `RLock`, then an `fcntl` lock on
+    `<pool>.lock` for other processes, then a refresh from disk when another process has written
+    since this instance last read or wrote. Renewal (`renew`) is the third half: the lease is a
+    deadline the *holder* extends, which is what makes "the worker died" and "the worker is slow"
+    different states instead of the same one.
     """
 
     def __init__(self, path: Path | str | None = None, *, now: Any = time.time) -> None:
         self.path = Path(path) if path is not None else None
         self._now = now
         self.tasks: dict[str, PoolTask] = {}
+        #: Guards `self.tasks` for threads of this process. Reentrant because `claim` calls `eligible`
+        #: and `_expire_leases`, and a helper that cannot be called from a guarded method forces one of
+        #: the two to be wrong.
+        self._lock = threading.RLock()
+        #: `(mtime_ns, size)` of the document this instance last read or wrote. The whole document is
+        #: rewritten on every save, so a write from another process silently reverts anything this
+        #: instance is holding in memory unless it is noticed and re-read.
+        self._stamp: tuple[int, int] | None = None
+        #: Non-zero while an `flock` is held, which keeps a nested call from deadlocking against itself.
+        self._file_depth = 0
         if self.path is not None and self.path.is_file():
             self._load()
+
+    # ── concurrency ─────────────────────────────────────────────────────────
+
+    @contextlib.contextmanager
+    def _entered(self) -> Any:
+        """Serialize an operation across threads and processes, and refresh a stale copy.
+
+        Held for the *whole* operation rather than around the file write alone: the race is
+        check-then-act (`eligible()` then mutate), and a lock that only covered the write would still
+        let two workers both decide they may claim the same task.
+        """
+        with self._lock:
+            with self._file_flock():
+                self._sync()
+                yield
+
+    @contextlib.contextmanager
+    def _file_flock(self) -> Any:
+        """Hold an exclusive lock on `<pool>.lock` for the duration of the operation.
+
+        `fcntl` is absent on Windows; there the in-process lock still applies and the cross-process
+        case falls back to reload-before-mutate, which narrows the window without closing it. Saying
+        so here rather than pretending is the point: a lock that silently degrades is worse than one
+        whose limits are written down.
+        """
+        if self.path is None or fcntl is None:
+            yield
+            return
+        if self._file_depth:
+            # flock is per open file description, so taking it twice on two descriptions within one
+            # process blocks against ourselves. Nested calls reuse the outer hold.
+            self._file_depth += 1
+            try:
+                yield
+            finally:
+                self._file_depth -= 1
+            return
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = lock_path.open("a+")
+        except OSError:
+            # A lock file we cannot create is not a reason to refuse the work; the in-process lock and
+            # the reload still apply.
+            yield
+            return
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            self._file_depth = 1
+            try:
+                yield
+            finally:
+                self._file_depth = 0
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+    def _sync(self) -> None:
+        """Re-read the document when another process has written it since we last looked.
+
+        Called under both locks, before every operation. Skipping this is how two processes each
+        holding a copy of the whole document lose each other's work: the second to save overwrites the
+        first's claim, offer or completion, and the first's `save()` had already reported success.
+        """
+        if self.path is None or not self.path.is_file():
+            return
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return
+        stamp = (stat.st_mtime_ns, stat.st_size)
+        if stamp == self._stamp:
+            return
+        self._load()
 
     # ── persistence ─────────────────────────────────────────────────────────
 
@@ -154,20 +294,38 @@ class TaskPool:
             raise PoolError(f"task pool at {self.path} is unreadable: {exc}") from exc
         self.tasks = {str(t["id"]): PoolTask.from_dict(t)
                       for t in document.get("tasks") or []}
+        self._stamp = self._file_stamp()
+
+    def _file_stamp(self) -> tuple[int, int] | None:
+        if self.path is None:
+            return None
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
 
     def save(self) -> None:
         """Write the pool atomically. A torn write would lose the hardest-to-describe work."""
         if self.path is None:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        document = {"tasks": [t.as_dict() for t in sorted(self.tasks.values(),
-                                                          key=lambda t: t.id)]}
-        tmp = self.path.with_name(self.path.name + f".tmp.{os.getpid()}")
-        tmp.write_text(json.dumps(document, indent=2, sort_keys=True), encoding="utf-8")
-        os.replace(tmp, self.path)
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            document = {"tasks": [t.as_dict() for t in sorted(self.tasks.values(),
+                                                              key=lambda t: t.id)]}
+            # The temp name carries the pid (another process must not write over ours mid-rename) and a
+            # short random suffix (two threads of one process must not either, which is what a bare pid
+            # allowed).
+            tmp = self.path.with_name(f"{self.path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:6]}")
+            tmp.write_text(json.dumps(document, indent=2, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, self.path)
+            # Record what *we* wrote, so the next `_sync` does not mistake our own write for another
+            # process's and re-read the file we just produced.
+            self._stamp = self._file_stamp()
 
     # ── creating work ───────────────────────────────────────────────────────
 
+    @_guarded
     def create(self, description: str, *, priority: int = 50,
                required_skills: Iterable[str] = (), required_capabilities: Iterable[str] = (),
                output_schema: dict[str, Any] | None = None, tags: Iterable[str] = (),
@@ -204,6 +362,7 @@ class TaskPool:
         return [d for d in task.depends_on
                 if d in self.tasks and self.tasks[d].state not in (TaskState.DONE,)]
 
+    @_guarded
     def eligible(self, agent: Any, *, now: float | None = None) -> list[PoolTask]:
         """Every task this agent may claim, best-first.
 
@@ -212,10 +371,11 @@ class TaskPool:
         by someone else both make a task ineligible, so two workers cannot do the same thing.
 
         Expired leases are reclaimed first, so a read never reports a task as held when it is in fact
-        claimable — the kind of stale answer that makes a pool view untrustworthy.
+        claimable — the kind of stale answer that makes a pool view untrustworthy. `now` is the moment
+        that judgement is made at, so a caller can ask about a hypothetical moment (a test, a plan)
+        rather than only about this instant.
         """
-        self._expire_leases()
-        moment = now or self._now()
+        self._expire_leases(now=now)
         out: list[PoolTask] = []
         for task in self.tasks.values():
             if task.state != TaskState.POOL:
@@ -244,6 +404,7 @@ class TaskPool:
             return False
         return True
 
+    @_guarded
     def claim(self, agent: Any, *, task_id: str | None = None,
               lease_s: float = DEFAULT_LEASE_S) -> PoolTask | None:
         """Take the best eligible task, or a specific one. Returns None when nothing is claimable.
@@ -275,38 +436,88 @@ class TaskPool:
 
         task.state = TaskState.CLAIMED
         task.claimed_by = agent_id
+        task.last_claimant = agent_id
         task.offered_to = None
         task.lease_until = self._now() + float(lease_s)
         task.updated_at = self._now()
         self.save()
         return task
 
+    @_guarded
+    def renew(self, task_id: str, agent: Any, *, lease_s: float | None = None) -> PoolTask:
+        """Extend the lease on a task this agent is still working on.
+
+        This is the heartbeat `DEFAULT_LEASE_S` assumed and nothing provided. Without it a lease is a
+        countdown from the claim that no live worker can reset, so a node that legitimately runs for
+        longer than the lease has its task reclaimed by `_expire_leases`, handed to a second worker,
+        and executed twice — while the first worker's `complete` then fails with "not claimed by
+        agent" and its output is discarded as a warning.
+
+        A renewal that arrives *after* the deadline but before anyone else has taken the task still
+        restores the claim, because the alternative is refusing the one caller that can prove it was
+        running the work (`last_claimant`). A renewal for a task another agent holds is refused: that
+        task has genuinely been taken, and stealing it back is the duplicate this prevents.
+        """
+        task = self._require(task_id)
+        agent_id = getattr(agent, "id", str(agent))
+        holder = task.claimed_by or task.offered_to
+        if task.state == TaskState.DONE or task.state == TaskState.FAILED:
+            raise PoolError(f"task {task_id!r} is {task.state} and cannot be renewed")
+        if task.state == TaskState.BACKLOG:
+            raise PoolError(f"task {task_id!r} is parked in the backlog, not held by anyone")
+        if holder is not None and holder != agent_id:
+            raise PoolError(f"task {task_id!r} is held by {holder!r}, not {agent_id!r}")
+        if holder is None and task.last_claimant != agent_id:
+            # Nobody holds it and this agent never did: it lapsed and was re-claimed and released by
+            # someone else, or the caller never had it. Renewing here would be an uncapability-checked
+            # claim, so it is refused and the caller is told what to do instead.
+            raise PoolError(
+                f"task {task_id!r} returned to the pool and was not claimed by {agent_id!r}; "
+                "claim it again rather than renewing it"
+            )
+        task.state = TaskState.CLAIMED
+        task.claimed_by = agent_id
+        task.offered_to = None
+        task.last_claimant = agent_id
+        task.lease_until = self._now() + float(lease_s if lease_s is not None else DEFAULT_LEASE_S)
+        task.updated_at = self._now()
+        self.save()
+        return task
+
+    @_guarded
     def release(self, task_id: str, *, reason: str = "") -> PoolTask:
         """Return a claimed task to the pool, so a worker that cannot finish it is not a dead end."""
         task = self._require(task_id)
         if task.state not in (TaskState.CLAIMED, TaskState.OFFERED):
             raise PoolError(f"task {task_id!r} is {task.state}, not held")
+        # Read the holder before clearing it. The refusal used to be recorded with `claimed_by`
+        # already set to None, so the one field that says *who* refused was always null.
+        holder = task.claimed_by or task.offered_to or ""
         task.state = TaskState.POOL
         task.claimed_by = None
+        task.last_claimant = holder
         task.offered_to = None
         task.lease_until = None
         task.updated_at = self._now()
         if reason:
-            task.refusals.append({"agent": task.claimed_by, "reason": reason,
-                                  "at": self._now()})
+            task.refusals.append({"agent": holder, "reason": reason, "at": self._now()})
         self.save()
         return task
 
-    def _expire_leases(self) -> list[str]:
+    def _expire_leases(self, *, now: float | None = None) -> list[str]:
         """Return every task whose lease lapsed to the pool.
 
         This is what stops a worker that died mid-task from stranding it forever — the failure mode a
-        plain "assigned" flag produces.
+        plain "assigned" flag produces. The previous holder is remembered in `last_claimant` rather
+        than forgotten, so a worker that was merely slow can still prove it was running the task and
+        renew it (`renew`) instead of having to re-claim behind someone else's back.
         """
+        moment = now or self._now()
         expired: list[str] = []
         for task in self.tasks.values():
-            if task.state == TaskState.CLAIMED and task.lease_expired(now=self._now()):
+            if task.state == TaskState.CLAIMED and task.lease_expired(now=moment):
                 task.state = TaskState.POOL
+                task.last_claimant = task.claimed_by or task.last_claimant
                 task.claimed_by = None
                 task.lease_until = None
                 task.updated_at = self._now()
@@ -317,6 +528,7 @@ class TaskPool:
 
     # ── offers ──────────────────────────────────────────────────────────────
 
+    @_guarded
     def offer(self, task_id: str, agent_id: str) -> PoolTask:
         """Put a task in front of one agent, who must accept or refuse it.
 
@@ -332,6 +544,7 @@ class TaskPool:
         self.save()
         return task
 
+    @_guarded
     def accept(self, task_id: str, agent: Any, *, lease_s: float = DEFAULT_LEASE_S) -> PoolTask:
         task = self._require(task_id)
         agent_id = getattr(agent, "id", str(agent))
@@ -343,11 +556,13 @@ class TaskPool:
             raise PoolError(f"agent {agent_id!r} does not satisfy task {task_id!r}")
         task.state = TaskState.CLAIMED
         task.claimed_by = agent_id
+        task.last_claimant = agent_id
         task.lease_until = self._now() + float(lease_s)
         task.updated_at = self._now()
         self.save()
         return task
 
+    @_guarded
     def reject(self, task_id: str, agent: Any, *, reason: str) -> PoolTask:
         """Refuse an offer, recording why. The reason is the point — a silent refusal teaches nothing."""
         task = self._require(task_id)
@@ -363,6 +578,7 @@ class TaskPool:
 
     # ── completing ──────────────────────────────────────────────────────────
 
+    @_guarded
     def complete(self, task_id: str, agent: Any, *, output: str = "") -> PoolTask:
         """Finish a task, refusing a completion whose output does not match its schema.
 
@@ -387,6 +603,7 @@ class TaskPool:
         self.save()
         return task
 
+    @_guarded
     def fail(self, task_id: str, agent: Any, *, reason: str) -> PoolTask:
         task = self._require(task_id)
         agent_id = getattr(agent, "id", str(agent))
@@ -399,6 +616,7 @@ class TaskPool:
         self.save()
         return task
 
+    @_guarded
     def to_backlog(self, task_id: str) -> PoolTask:
         """Park a task deliberately, as opposed to it lapsing."""
         task = self._require(task_id)
@@ -410,6 +628,7 @@ class TaskPool:
         self.save()
         return task
 
+    @_guarded
     def from_backlog(self, task_id: str) -> PoolTask:
         task = self._require(task_id)
         if task.state != TaskState.BACKLOG:
@@ -427,6 +646,7 @@ class TaskPool:
             raise PoolError(f"no pooled task {task_id!r}")
         return task
 
+    @_guarded
     def summary(self) -> dict[str, Any]:
         """Counts by state, for the pool view. Includes `claimable`, which is what a worker asks.
 
@@ -447,6 +667,7 @@ class TaskPool:
             "failed": counts.get(TaskState.FAILED, 0),
         }
 
+    @_guarded
     def children(self, task_id: str) -> list[PoolTask]:
         """Tasks created from another — how a decomposed tree is walked."""
         return sorted((t for t in self.tasks.values() if t.parent_id == task_id),

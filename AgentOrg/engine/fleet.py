@@ -200,15 +200,17 @@ class Fleet:
         from .bus import EventBus
         from .orchestrator import Orchestrator
         from .people import HireError, People
-        from .state import Workspace
+        from .portfolio import workspace_for
 
         path = entry.workspace_path
-        if not str(path):
-            # No folder named: a managed workspace keyed on the slug, under the default projects root.
-            workspace = Workspace.for_project(entry.slug)
-        else:
+        if path is not None:
+            # An org that names a folder: create it first, because `Workspace.attach` refuses a
+            # directory that does not exist and a fleet run is allowed to bring its own project into
+            # being. A path-less org names nothing to create.
             path.mkdir(parents=True, exist_ok=True)
-            workspace = Workspace.attach(path)
+        # The shared resolver: the org's own folder when it has one, else a managed workspace keyed on
+        # the slug under the default projects root.
+        workspace = workspace_for(entry)
         workspace.ensure()
         bus = EventBus(run_id=f"fleet_{entry.slug}", trace_path=workspace.trace_path)
         org = None
@@ -297,12 +299,25 @@ class Fleet:
         return live
 
     def _org_spend(self, orch: Any) -> float | None:
+        """The org's spend, from the cost ledger its own run kept — or None when unknown.
+
+        `cost_snapshot` reads the cost ledger the executing process recorded; the decision ledger the
+        orchestrator *also* holds has no cost in it at all, which is why the old call to
+        `orch.ledger.snapshot()` never returned a figure. `None` covers both "no readable figure" and
+        "a call went unmeasured": in the second case the ledger's total is a floor, and a floor
+        presented as a total is the accounting lie this figure exists to avoid.
+        """
+        getter = getattr(orch, "cost_snapshot", None)
+        if getter is None:
+            return None
         try:
-            snapshot = orch.ledger.snapshot()
-            value = snapshot.get("cost_usd")
-            return float(value) if value is not None else None
+            snapshot = getter()
         except Exception:  # noqa: BLE001 - an unreadable ledger is "unknown", not zero
             return None
+        if not isinstance(snapshot, dict) or snapshot.get("cost_complete") is False:
+            return None
+        value = snapshot.get("total_usd")
+        return float(value) if value is not None else None
 
     @staticmethod
     def _headline(live: dict[str, Any]) -> str:

@@ -56,13 +56,23 @@ class OverlaySkillSource(SkillSource):
     include_global:
         Whether ``~/.agentorg/skills`` is also searched. On by default; a caller that wants strict
         per-project isolation can turn it off.
+    skill_roots:
+        The roots to search, verbatim and highest priority first. When given, :meth:`roots` returns
+        them and ``project``/``include_global`` are not consulted at all.
     """
 
     def __init__(self, base: Any, *, project: Path | str | None = None,
-                 include_global: bool = True) -> None:
+                 include_global: bool = True,
+                 skill_roots: list[Path | str] | None = None) -> None:
         self.base = base
         self.project = project
         self.include_global = include_global
+        #: An explicit root list, when the caller already knows it. This exists for the *child*: the
+        #: generated executor plugin runs in another process, and the roots it must search are
+        #: whatever the parent planned against. Re-deriving them there is how a global skill became
+        #: invisible to the process that ran the node — the parent planned and hired against a skill
+        #: the child had never heard of, and nothing said so.
+        self.skill_roots = [Path(p).expanduser() for p in skill_roots] if skill_roots else None
         self._cache: dict[str, tuple[str, SkillBundle]] = {}
         self._lock = threading.RLock()
         self._names: list[str] | None = None
@@ -72,7 +82,13 @@ class OverlaySkillSource(SkillSource):
     # ── enumeration ─────────────────────────────────────────────────────────
 
     def roots(self) -> list[Path]:
-        """The user skill roots, highest priority first."""
+        """The user skill roots, highest priority first.
+
+        An explicit ``skill_roots`` wins outright so a handed-over list is used exactly as given —
+        the point of passing it is that the two processes agree, which re-deriving cannot promise.
+        """
+        if self.skill_roots is not None:
+            return list(self.skill_roots)
         return [r / "skills" for r in usercfg.roots(project=self.project,
                                                     include_global=self.include_global)]
 
@@ -160,6 +176,16 @@ class OverlaySkillSource(SkillSource):
         with self._lock:
             self._cache[name] = (digest, bundle)
         return bundle
+
+    def bundle(self, name: str) -> SkillBundle:
+        """Load one skill — the Owner's when present, otherwise the library's.
+
+        Defined rather than left to :meth:`__getattr__`: the passthrough would reach the *base*
+        source, and a project skill sharing a library skill's name would be silently ignored — the
+        one thing the overlay exists to prevent. `load` already resolves overlay-first, so this
+        stays a one-line alias rather than a second resolution order to keep in step.
+        """
+        return self.load(name)
 
     def load_many(self, names: list[str]) -> dict[str, SkillBundle]:
         return {name: self.load(name) for name in names}

@@ -12,7 +12,9 @@ directory and the suite stays offline.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
+import subprocess
 import sys
 
 import pytest
@@ -25,6 +27,7 @@ from engine.authoring import AuthoringError, SkillTemplate, scaffold, slugify, w
 from engine.config import load
 from engine.library import resolve
 from engine.people import HireError, HireRequest, People
+from engine.planner import Planner
 from engine.skills import FilesystemSkillSource
 from engine.skills.overlay import OverlaySkillSource
 
@@ -161,6 +164,176 @@ def test_a_project_skill_beats_a_global_one_of_the_same_name(home, project, libr
                 root=project / ".agentorg")
     source = OverlaySkillSource(FilesystemSkillSource(library), project=project)
     assert list(source.load("shared-name").contract.criteria) == ["PROJECT"]
+
+
+# ── the authored skill reaches a plan and a run ──────────────────────────────
+
+
+def _manifest_naming(skill: str) -> dict:
+    """A minimal valid graph whose first node names `skill`."""
+    return {
+        "name": "authored-node",
+        "version": "1.0.0",
+        "description": "a node that names an authored skill",
+        "start": "work",
+        "nodes": [{"id": "work", "skill": skill, "max_iterations": 1},
+                  {"id": "fix", "skill": "backend-developer", "max_iterations": 1}],
+        "edges": [{"from": "work", "to": "fix", "when": "work.status == done",
+                   "payload": "handoff-v1"}],
+        "loops": [{"id": "l", "nodes": ["fix", "work"], "exit_when": "work.verdict == pass",
+                   "max_iterations": 2, "escalate_to": "fix"}],
+        "end": ["fix"],
+    }
+
+
+def test_the_planner_plans_a_node_the_goal_names_when_the_owner_authored_it(home, project, library):
+    """A genuinely new skill must be able to reach a plan, or authoring is inert.
+
+    The composition tables can only name library skills, so without a path from the goal's own words
+    to the overlay a skill could be created, hired against, loaded — and never planned.
+    """
+    write_skill(SkillTemplate(name="db-migrator"), criteria=["reversible"], checklist=["down"],
+                root=project / ".agentorg")
+    source = OverlaySkillSource(FilesystemSkillSource(library), project=project,
+                                include_global=False)
+    plan = Planner(source).plan("Run the db-migrator over the payments schema", slug="migrate")
+    assert "db-migrator" in plan.skills_used, plan.skills_used
+    assert any(node.get("skill") == "db-migrator" for node in plan.nodes)
+    assert plan.validation.valid, plan.validation.errors
+
+
+def test_a_goal_that_merely_mentions_the_subject_does_not_drag_the_skill_in(home, project,
+                                                                         library):
+    """The match is the skill's *name*, not any word in common — or every plan would collect skills."""
+    write_skill(SkillTemplate(name="db-migrator"), criteria=["reversible"], checklist=["down"],
+                root=project / ".agentorg")
+    source = OverlaySkillSource(FilesystemSkillSource(library), project=project,
+                                include_global=False)
+    plan = Planner(source).plan("Build a booking API with a migrations folder", slug="booking")
+    assert "db-migrator" not in plan.skills_used, plan.skills_used
+
+
+def test_the_validator_resolves_an_authored_skill_and_still_refuses_an_unknown_one(home, project,
+                                                                                 library):
+    """Widening the validator's catalogue must not become "any name at all goes"."""
+    write_skill(SkillTemplate(name="db-migrator"), criteria=["reversible"], checklist=["down"],
+                root=project / ".agentorg")
+    planner = Planner(OverlaySkillSource(FilesystemSkillSource(library), project=project,
+                                         include_global=False))
+    assert planner.validate(_manifest_naming("db-migrator")).valid
+
+    verdict = planner.validate(_manifest_naming("no-such-skill"))
+    assert not verdict.valid
+    assert any("does not resolve" in error for error in verdict.errors), verdict.errors
+    # The refusal must carry the library's own words. Reading only `message` from an error the
+    # library reports as `{"error": …}` printed the reason as the string "None".
+    assert all(error and error != "None" for error in verdict.errors), verdict.errors
+
+
+#: Run in a *fresh* process, because the generated plugin builds its overlay at import time — the
+#: only moment the child's view of the skill roots exists, and therefore the only place this defect
+#: was visible. The plugin path arrives as argv[1], so what is exercised is the run's own generated
+#: file rather than a reconstruction of it.
+_CHILD_PROBE = '''
+import importlib.util
+import json
+import sys
+
+spec = importlib.util.spec_from_file_location("generated_executor", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules["generated_executor"] = module
+spec.loader.exec_module(module)
+
+skills = module._context.skills
+print("ROOTS " + json.dumps([str(p) for p in skills.roots()]))
+for name in ("project-marker", "global-marker"):
+    print(f"RESOLVES {name} {skills.has(name)}")
+    if skills.has(name):
+        print(f"CRITERIA {name} {list(skills.load(name).contract.criteria)}")
+'''
+
+
+def test_the_process_that_runs_a_node_sees_every_root_the_planner_planned_with(home, project,
+                                                                              config, library,
+                                                                              tmp_path):
+    """The child's overlay must be the parent's overlay, or a planned skill silently does not exist.
+
+    The overlay used to be rebuilt inside the generated plugin from the project root alone, so a
+    *global* skill planned and hired successfully and was then absent from the process that ran the
+    node — an invisible failure, since the run proceeds with a prompt that quietly lost the skill.
+    """
+    from engine import runcontext
+    from engine.host import RunnerHost
+    from engine.orchestrator import _skill_source
+    from engine.runcontext import RunContext
+
+    write_skill(SkillTemplate(name="project-marker"), criteria=["PROJECT"], checklist=["k"],
+                root=project / ".agentorg")
+    write_skill(SkillTemplate(name="global-marker"), criteria=["GLOBAL"], checklist=["k"],
+                root=home, global_=True)
+
+    # The parent side: the roots the orchestrator records (orchestrator.py `_write_run_context`).
+    source = _skill_source(library, project=project)
+    parent_roots = [str(path) for path in source.roots()]
+    assert any(path.startswith(str(home)) for path in parent_roots), parent_roots
+
+    workspace = project / "projects" / "proof"
+    workspace.mkdir(parents=True)
+    manifest = workspace / "proof.yaml"
+    manifest.write_text("name: proof\n", encoding="utf-8")
+    runcontext.write(workspace, RunContext(org={}, bindings={}, skill_roots=parent_roots))
+
+    plugin = RunnerHost(config=config, library=library, workspace=workspace).plugin_paths(
+        manifest_path=manifest, run_id="proof", workflow="proof", project="proof")["executor"]
+
+    probe = workspace / "probe.py"
+    probe.write_text(_CHILD_PROBE, encoding="utf-8")
+    # The runner runs from the library root, and the library root is pinned the same way here so the
+    # probe resolves the same checkout the fixture did.
+    result = subprocess.run(
+        [sys.executable, str(probe), str(plugin)], cwd=str(library.files.root),
+        capture_output=True, text=True, timeout=180,
+        env={**os.environ, "AGENTORG_SKILLS_ROOT": str(library.files.root)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(_output_line(result.stdout, "ROOTS ")) == parent_roots
+    assert "RESOLVES project-marker True" in result.stdout
+    assert "RESOLVES global-marker True" in result.stdout
+    assert "CRITERIA global-marker ['GLOBAL']" in result.stdout
+
+
+def _output_line(stdout: str, prefix: str) -> str:
+    """The payload of the probe's single `<prefix>…` line."""
+    for line in stdout.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):]
+    raise AssertionError(f"the child printed no {prefix!r} line:\n{stdout}")
+
+
+def test_the_runner_refuses_a_manifest_naming_a_new_skill_and_says_so(home, project, config,
+                                                                     library):
+    """The one wall an authored skill still meets, pinned so it cannot pass unnoticed.
+
+    The engine's planner and validator now resolve a node's skill through the overlay — as the hire
+    and the executor already did — but the *runner* validates the manifest itself against the
+    library's names before executing anything, and there is no way to tell it about an authored one.
+    So a genuinely new name is planned and then refused at the run's first line. What must not happen
+    is that refusal arriving as a bare exit code: the runner's own line is the whole diagnosis.
+    """
+    from engine.host import RunnerHost
+    from engine.planner import emit_safe_yaml
+
+    write_skill(SkillTemplate(name="db-migrator"), criteria=["reversible"], checklist=["down"],
+                root=project / ".agentorg")
+    workspace = project / "projects" / "wall"
+    workspace.mkdir(parents=True)
+    manifest = workspace / "wall.yaml"
+    manifest.write_text(emit_safe_yaml(_manifest_naming("db-migrator")), encoding="utf-8")
+
+    outcome = RunnerHost(config=config, library=library, workspace=workspace).run(
+        manifest_path=manifest, run_id="wall", workflow="wall", project="wall")
+    assert outcome.broken, outcome.as_dict()
+    assert "db-migrator" in outcome.error, outcome.as_dict()
 
 
 # ── hiring ───────────────────────────────────────────────────────────────────

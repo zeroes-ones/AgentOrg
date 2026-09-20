@@ -33,11 +33,12 @@ Usage:
 from __future__ import annotations
 
 import math
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any
 
 __all__ = [
     "Band",
@@ -186,6 +187,20 @@ class Session:
             )
         if not self.session_id:
             self.session_id = new_session_id(self.index)
+        #: Guards every mutation below.
+        #:
+        #: One `Session` object is shared by *every* fan-out item bound to one agent on one node:
+        #: `_session_for` keys on `f"{agent.id}:{node_id}"` (`executor.py:1994`), so two items running
+        #: in parallel append to one transcript from two threads. `ctx.lock` guards the dict *lookup*,
+        #: never this object — so without this lock two `turns.append` calls interleave two items'
+        #: transcripts and the token accounting that drives compaction counts both at once. Reentrant
+        #: because the mutators call each other (`append_text` → `append`, `unpin` → `pin`'s lock).
+        self._lock = threading.RLock()
+        #: The thread that sealed this session, which is how "sealed twice by one caller" (a bug) is
+        #: told apart from "a sibling rotated the session while I was still working" (a race).
+        self._sealed_by: int | None = None
+        #: The session that continues this one after a rotation.
+        self._successor: "Session | None" = None
 
     # ── capacity ────────────────────────────────────────────────────────────
 
@@ -201,12 +216,14 @@ class Session:
     @property
     def history_tokens(self) -> int:
         """Tokens held by the conversation history."""
-        return sum(turn.tokens for turn in self.turns)
+        with self._lock:
+            return sum(turn.tokens for turn in self.turns)
 
     @property
     def pinned_tokens(self) -> int:
         """Tokens held by pinned constraints — the irreducible part of the history."""
-        return sum(max(1, len(text) // 4) for text in self.pinned)
+        with self._lock:
+            return sum(max(1, len(text) // 4) for text in self.pinned)
 
     @property
     def used_tokens(self) -> int:
@@ -221,7 +238,8 @@ class Session:
     @property
     def turns_count(self) -> int:
         """How many turns this session has taken."""
-        return len(self.turns)
+        with self._lock:
+            return len(self.turns)
 
     @property
     def attention_weight(self) -> float:
@@ -258,23 +276,84 @@ class Session:
 
     # ── mutation (turn boundaries only) ─────────────────────────────────────
 
-    def _assert_active(self) -> None:
-        if self.state is not SessionState.ACTIVE:
-            raise SessionError(
-                f"session {self.session_id} is {self.state.value}; only an ACTIVE session takes turns"
-            )
+    def adopt_successor(self, successor: "Session") -> None:
+        """Record the session that continues this one after a rotation.
 
-    def append(self, turn: Turn) -> None:
-        """Add a turn.
+        This is what makes a rotation safe for a *sibling*: every item bound to one agent shares one
+        session object, so when one item rotates it, another item's in-flight exchange has nowhere
+        obvious to go. Its turns are appended to this session after the seal, and a sealed transcript
+        is a transcript that has already been serialized into a handoff — so the turn is either lost or
+        the item fails with `SessionError`. Linking the successor turns that into what it actually is:
+        the agent's thread moving on to the next session while the sibling finishes its turn.
+
+        One line wires it, in `_rotate` where the fresh session is built (`executor.py:2139-2141`):
+        `session.adopt_successor(fresh)`. Reported rather than made here — `executor.py` is owned by
+        another agent.
+        """
+        with self._lock:
+            # Refuse to close a loop: a cycle would let two threads walking the chain in opposite
+            # directions deadlock on each other's lock, and a hung worker thread is a hung run. The
+            # walk reads the attribute directly rather than taking each session's lock, so this check
+            # cannot itself participate in a lock-ordering cycle.
+            node: "Session | None" = successor
+            hops = 0
+            while node is not None and hops < 64:
+                if node is self:
+                    raise SessionError(
+                        f"adopting {successor.session_id} as the successor of {self.session_id} would "
+                        "make a cycle; a rotation always moves forward"
+                    )
+                node = node._successor
+                hops += 1
+            self._successor = successor
+
+    @property
+    def successor(self) -> "Session | None":
+        """The session continuing this one, or None."""
+        with self._lock:
+            return self._successor
+
+    def _live_successor(self) -> "Session | None":
+        """The nearest successor that is still ACTIVE, following a chain of rotations.
+
+        A chain is walked (bounded) because a long-lived sibling can outlive more than one rotation.
+        A cycle would be a wiring bug; the bound means it degrades to "no successor" rather than
+        hanging a worker.
+        """
+        seen = 0
+        node = self._successor
+        while node is not None and seen < 8:
+            if node is self:
+                return None
+            with node._lock:
+                if node.state is SessionState.ACTIVE:
+                    return node
+                node = node._successor
+            seen += 1
+        return None
+
+    def append(self, turn: Turn) -> bool:
+        """Add a turn. Returns whether it went into this session's live transcript.
 
         Raises
         ------
         SessionError
-            When the session is no longer active. Appending to a sealing session would put text into
-            a transcript that has already been serialized.
+            When the session is no longer ACTIVE *and* nothing continues it. Appending to a sealing
+            session would put text into a transcript that has already been serialized — but when a
+            rotation has moved the agent on, the turn follows the rotation instead, because failing the
+            caller loses a completed exchange over the timing of a sibling's rotation.
         """
-        self._assert_active()
-        self.turns.append(turn)
+        with self._lock:
+            if self.state is not SessionState.ACTIVE:
+                successor = self._live_successor()
+                if successor is not None:
+                    return successor.append(turn)
+                raise SessionError(
+                    f"session {self.session_id} is {self.state.value}; only an ACTIVE session takes "
+                    "turns, and no rotation continued it"
+                )
+            self.turns.append(turn)
+            return True
 
     def append_text(self, role: str, text: str, *, tier: int = 2, serves: str = "",
                     pinned: bool = False) -> Turn:
@@ -292,11 +371,20 @@ class Session:
         """Record a constraint that must survive compaction verbatim.
 
         Idempotent: pinning the same rule twice would inflate the count and make the AR-04 check
-        meaningless, so a duplicate is ignored.
+        meaningless, so a duplicate is ignored. A pin arriving after a rotation is recorded on the
+        *successor*, because the successor is the transcript the next call will actually send — a pin
+        left on a closed session is a constraint silently dropped.
         """
         cleaned = (text or "").strip()
-        if cleaned and cleaned not in self.pinned:
-            self.pinned.append(cleaned)
+        if not cleaned:
+            return
+        with self._lock:
+            successor = self._live_successor()
+            if successor is not None:
+                successor.pin(cleaned)
+                return
+            if cleaned not in self.pinned:
+                self.pinned.append(cleaned)
 
     def unpin(self, text: str) -> bool:
         """Remove a pin. Returns whether it was present.
@@ -305,56 +393,87 @@ class Session:
         that produced it is superseded — so the caller is told if nothing changed.
         """
         cleaned = (text or "").strip()
-        if cleaned in self.pinned:
-            self.pinned.remove(cleaned)
-            return True
-        return False
+        with self._lock:
+            if cleaned in self.pinned:
+                self.pinned.remove(cleaned)
+                return True
+            return False
 
     def begin_phase(self, phase: str) -> bool:
         """Move to a new node phase, reporting whether it actually changed.
 
         A phase change is one of the three rotation triggers, so the caller needs to know whether it
-        happened rather than assuming.
+        happened rather than assuming. A sibling that sets the phase after a rotation sets it on the
+        successor, so a phase change cannot land on a session nobody will send again.
         """
-        if phase == self.phase:
-            return False
-        self.phase = phase
-        return True
+        with self._lock:
+            successor = self._live_successor()
+            if successor is not None:
+                return successor.begin_phase(phase)
+            if phase == self.phase:
+                return False
+            self.phase = phase
+            return True
 
     # ── lifecycle ───────────────────────────────────────────────────────────
 
-    def seal(self, *, reason: str) -> None:
-        """Stop taking turns, recording why.
+    def seal(self, *, reason: str) -> bool:
+        """Stop taking turns, recording why. Returns whether *this* call sealed it.
 
         Raises
         ------
         SessionError
-            When the session is not ACTIVE. Sealing an already-sealed session would overwrite the
-            reason on a transcript that is being serialized, which loses why the rotation happened.
-        """
-        if self.state is not SessionState.ACTIVE:
-            raise SessionError(
-                f"session {self.session_id} is {self.state.value} and cannot be sealed again; "
-                f"the rotation reason {self.rotation_reason!r} would be overwritten"
-            )
-        self.state = SessionState.SEALING
-        self.rotation_reason = reason
-        self.sealed_at = time.time()
+            When this session is SEALING **and this thread is the one that sealed it**. Sealing an
+            already-sealing session would overwrite the reason on a transcript that is being
+            serialized, which loses why the rotation happened — and a caller repeating its own seal is
+            a bug that must surface.
 
-    def mark_handoff(self) -> None:
-        """Record that the handoff payload has been written and is pending verification."""
-        if self.state is not SessionState.SEALING:
+            A second seal from a *different* thread is the sibling race, not a bug: two items bound to
+            one agent can each decide to rotate the same saturated session. The first rotation has
+            already happened and the sibling must not lose its work over it, so this is reported as
+            "already sealed" rather than raised, and the first rotation's reason stands.
+        """
+        with self._lock:
+            if self.state is SessionState.ACTIVE:
+                self.state = SessionState.SEALING
+                self.rotation_reason = reason
+                self.sealed_at = time.time()
+                self._sealed_by = threading.get_ident()
+                return True
+            if self.state is SessionState.SEALING and self._sealed_by == threading.get_ident():
+                raise SessionError(
+                    f"session {self.session_id} is {self.state.value} and cannot be sealed again; "
+                    f"the rotation reason {self.rotation_reason!r} would be overwritten"
+                )
+            # SEALING from another thread, or already through HANDOFF/CLOSED: the rotation completed
+            # or is completing, and its reason is the one that counts.
+            return False
+
+    def mark_handoff(self) -> bool:
+        """Record that the handoff payload has been written and is pending verification.
+
+        Returns whether the transition happened. A call after a sibling's rotation already carried the
+        session through SEALING does not raise: the payload it refers to exists, and failing the
+        caller here fails an item over the *ordering* of two rotations rather than over anything the
+        item did.
+        """
+        with self._lock:
+            if self.state is SessionState.SEALING:
+                self.state = SessionState.HANDOFF
+                return True
+            if self.state is SessionState.HANDOFF or self.state is SessionState.CLOSED:
+                return False
             raise SessionError(
                 f"session {self.session_id} is {self.state.value}; it must be SEALING before a "
                 "handoff is written"
             )
-        self.state = SessionState.HANDOFF
 
     def close(self) -> None:
         """Archive the session. Its transcript is never re-sent."""
-        if self.state is SessionState.CLOSED:
-            return
-        self.state = SessionState.CLOSED
+        with self._lock:
+            if self.state is SessionState.CLOSED:
+                return
+            self.state = SessionState.CLOSED
 
     @property
     def closed(self) -> bool:
@@ -366,34 +485,37 @@ class Session:
         """Serialise the session.
 
         `include_turns=False` gives the summary used in telemetry and the UI, where the full
-        transcript would be both large and sensitive.
+        transcript would be both large and sensitive. Serialisation is taken under the lock so the
+        snapshot cannot catch a half-appended turn or a pin list mid-iteration — the counts and the
+        transcript in one payload have to agree with each other.
         """
-        payload: dict[str, Any] = {
-            "session_id": self.session_id,
-            "session_index": self.index,
-            "agent_id": self.agent_id,
-            "node_id": self.node_id,
-            "phase": self.phase,
-            "attempt": self.attempt,
-            "state": self.state.value,
-            "window": self.window,
-            "usable_window": self.usable_window,
-            "output_reserve": self.output_reserve,
-            "sat_tokens": self.used_tokens,
-            "saturation": round(self.saturation, 4),
-            "band": self.band.value,
-            "turns": self.turns_count,
-            "attention_weight": round(self.attention_weight, 4),
-            "pinned_count": len(self.pinned),
-            "rotation_reason": self.rotation_reason,
-            "rotation_count": self.rotation_count,
-            "created_at": self.created_at,
-            "sealed_at": self.sealed_at,
-        }
-        if include_turns:
-            payload["turns"] = [turn.as_dict() for turn in self.turns]
-            payload["pinned"] = list(self.pinned)
-        return payload
+        with self._lock:
+            payload: dict[str, Any] = {
+                "session_id": self.session_id,
+                "session_index": self.index,
+                "agent_id": self.agent_id,
+                "node_id": self.node_id,
+                "phase": self.phase,
+                "attempt": self.attempt,
+                "state": self.state.value,
+                "window": self.window,
+                "usable_window": self.usable_window,
+                "output_reserve": self.output_reserve,
+                "sat_tokens": self.used_tokens,
+                "saturation": round(self.saturation, 4),
+                "band": self.band.value,
+                "turns": self.turns_count,
+                "attention_weight": round(self.attention_weight, 4),
+                "pinned_count": len(self.pinned),
+                "rotation_reason": self.rotation_reason,
+                "rotation_count": self.rotation_count,
+                "created_at": self.created_at,
+                "sealed_at": self.sealed_at,
+            }
+            if include_turns:
+                payload["turns"] = [turn.as_dict() for turn in self.turns]
+                payload["pinned"] = list(self.pinned)
+            return payload
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Session":

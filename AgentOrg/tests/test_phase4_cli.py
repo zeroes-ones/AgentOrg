@@ -94,19 +94,26 @@ def test_doctor_passes_in_this_environment():
     assert "doctor: all checks passed" in result.stdout
 
 
-def test_doctor_reports_seven_checks():
-    """The count is documented, so it is asserted."""
+def test_doctor_reports_every_check():
+    """The count is documented, so it is asserted.
+
+    Eight, not seven: the machine posture (`[system]`) became a check when it turned out `doctor`
+    never read the section its own remedy text pointed at — so a person on a full-access machine got
+    "all checks passed" and nothing about the switch that decides whether the engine can touch their
+    Mac at all. The number is asserted rather than derived so that *losing* a check is a failure
+    here, which is the only way a silent drop in coverage gets noticed.
+    """
     result = run("doctor")
     lines = [line for line in result.stdout.splitlines()
              if line.startswith(("OK ", "FAIL"))]
-    assert len(lines) == 7
+    assert len(lines) == 8
 
 
 def test_doctor_checks_the_thing_that_matters():
     payload = run_json("doctor")
     names = {check["check"] for check in payload["checks"]}
     for expected in ("configuration", "skills library", "skill bundles", "providers",
-                     "machine", "model catalog", "secret hygiene"):
+                     "machine", "model catalog", "secret hygiene", "system access"):
         assert expected in names
 
 
@@ -943,6 +950,13 @@ def test_decide_approve_continues_the_run(run_project):
     It only cleared the gate, leaving the run at `ready` with nothing driving it, so an operator who
     approved a gate saw the gate go and the work never resume. The CLI had no path that did the
     second half, which is the difference between resolving a gate and resuming behind it.
+
+    This fixture's graph *ends* at its gate, so continuing means the run finishes rather than parking
+    again. That is the stronger property, and it is what the older form of this assertion got wrong:
+    it asserted `awaiting_gate`, which only held because the gate was re-detected forever — a released
+    gate whose node record still carried `verdict: awaiting_owner` looked pending to `_detect_gate`,
+    so an approval appeared to "continue" by re-parking on the node it had just released. A run with
+    nothing after the gate must reach `done`, and a run with work after it must run that work.
     """
     root, project = run_project
     _run_cli("run", "--manifest", str(project / "clirun.yaml"), "--slug", "clirun",
@@ -952,10 +966,11 @@ def test_decide_approve_continues_the_run(run_project):
     assert result.returncode == EXIT_OK, result.stderr[:400]
     assert "approved release" in result.stdout
     assert "Continuing the run past the gate" in result.stdout
-    # The run resumed and re-reached the gate (the stub always parks there) rather than staying ready.
+    # The run resumed past the gate and finished, instead of re-parking on it.
     status = _run_cli("status", "--slug", "clirun", "--root", str(root), "--json")
     payload = json.loads(status.stdout)
-    assert payload["phase"] in ("awaiting_gate", "awaiting_human"), payload["phase"]
+    assert payload["phase"] == "done", payload["phase"]
+    assert not payload.get("gate"), "a released gate must not still be waiting"
 
 
 def test_decide_no_continue_clears_the_gate_without_spending(run_project):
@@ -969,3 +984,33 @@ def test_decide_no_continue_clears_the_gate_without_spending(run_project):
     assert "Continuing the run" not in result.stdout
     status = _run_cli("status", "--slug", "clirun", "--root", str(root), "--json")
     assert json.loads(status.stdout)["phase"] == "ready"
+
+
+def test_agents_reports_sprawl_so_a_leaky_delegate_is_visible(tmp_path):
+    """The anti-sprawl metric existed on the desk and was reachable from no command.
+
+    A roster could therefore grow a delegate that burns tokens without finishing work — exactly the
+    delegation leak the metric is defined to detect — and nothing a person could run would say so.
+    `agents` is where it belongs, because it is the only command already holding the real roster.
+    """
+    project = tmp_path / "Sprawling"
+    (project / ".agentorg").mkdir(parents=True)
+    (project / ".git").mkdir()
+    (project / ".agentorg" / "roster.json").write_text(json.dumps({
+        "name": "AgentOrg", "org_version": "1.0.0",
+        "agents": [{
+            "id": "ag_bloat", "name": "Bloat", "title": "Engineer", "kind": "ai", "role": "worker",
+            "level": 3, "provider": "Olla", "model": "deepseek-v4.1-flash",
+            "context_window": 1048576, "skills": ["backend-developer"],
+            "capabilities": ["read:*"], "origin": "owner", "team": "", "tags": [],
+        }],
+        "teams": [], "policy": {},
+    }))
+
+    result = _run_cli("agents", "--project", str(project), "--json")
+    assert result.returncode == EXIT_OK, result.stderr[:300]
+    payload = json.loads(result.stdout)
+    assert "sprawl" in payload, "the metric must travel with the roster it describes"
+    # The report is always present and named, so an empty one is distinguishable from no report.
+    assert set(payload["sprawl"]) >= {"agents", "suspects", "threshold", "window_runs"}
+    assert isinstance(payload["sprawl"]["suspects"], list)

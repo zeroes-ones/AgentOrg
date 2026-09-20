@@ -182,6 +182,46 @@ def test_a_retire_persists(tmp_path):
     assert spec.id not in org.agents
 
 
+def test_a_retirement_is_recorded_and_survives_a_reload(tmp_path):
+    """A retire leaves a tombstone: the roster entry goes, the decision stays.
+
+    `agent retire --reason` advertises a record, and without one a retirement is unrecoverable history
+    — nothing in the product says the agent existed. The record is part of the roster *document*
+    (`retired`), so it travels through `people.save` and the next `load` rather than living only in the
+    manager that performed it.
+    """
+    people, spec = _hired(tmp_path)
+    people.retire_agent(spec.id, reason="trial over", org=people.org)
+
+    record = people.org.retired[0]
+    assert record["id"] == spec.id
+    assert record["name"] == FRESH_NAME
+    assert record["reason"] == "trial over"
+    assert record["at"], "a tombstone needs a time, or 'when was this decided' stays unanswerable"
+
+    fresh = _people(tmp_path)
+    org = fresh.load(project=tmp_path)
+    assert [r["id"] for r in org.retired] == [spec.id]
+    assert org.retired[0]["reason"] == "trial over"
+
+
+def test_a_retired_name_can_be_hired_again(tmp_path):
+    """A tombstone is a record, not a ban: the hire checks live agents, so the name is reusable."""
+    people, spec = _hired(tmp_path)
+    people.retire_agent(spec.id, reason="trial over", org=people.org)
+    again = people.hire(HireRequest(name=FRESH_NAME, skill="code-reviewer", provider="ollama",
+                                    model="qwen2.5-coder:7b"), org=people.org)
+    assert again.id in people.org.agents
+    assert people.org.retired, "the tombstone must outlive the re-hire"
+
+
+def test_the_tombstone_is_not_reported_as_an_agent(tmp_path):
+    """`roster_view` and the agent list describe the *live* org; a retired agent is not in them."""
+    people, spec = _hired(tmp_path)
+    people.retire_agent(spec.id, org=people.org)
+    assert spec.id not in [a["id"] for a in people.org.roster_view()]
+
+
 def test_the_built_in_company_is_never_frozen_into_the_roster(tmp_path):
     """Writing the defaults would shadow a later change to the built-ins with a stale snapshot."""
     people, _ = _hired(tmp_path)
@@ -249,9 +289,15 @@ def test_the_console_can_retire(tmp_path):
     server = _server(tmp_path)
     spec = server._cmd_hire({"name": FRESH_NAME, "skill": "code-reviewer",
                              "provider": "ollama", "model": "qwen2.5-coder:7b"})["agent"]
-    result = server._cmd_agent_retire({"agent_id": spec["id"]})
+    result = server._cmd_agent_retire({"agent_id": spec["id"], "reason": "trial over"})
     assert result["retired"]["id"] == spec["id"]
     assert server._cmd_agents({})["hired"] == 0
+    # The reason the console sent is recorded, not discarded: the roster document keeps the tombstone.
+    import json
+
+    roster = pathlib.Path(server._cmd_agents({})["roster_path"])
+    document = json.loads(roster.read_text())
+    assert document["retired"][0]["reason"] == "trial over"
 
 
 def test_the_console_cannot_retire_the_owner(tmp_path):

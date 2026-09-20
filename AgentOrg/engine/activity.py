@@ -10,6 +10,10 @@ says, in order and in plain words, what the org is doing, why it stopped, and wh
 That gap is not cosmetic. A person who sets a goal and comes back later saw a run that said
 `pm = blocked / guardrail-blocked` with every other node `pending` and no explanation anywhere in the
 product — so the honest summary of the experience was "nothing is happening and I do not know why".
+The reason *was* recorded, in the checkpoint's own `log`: an edge guardrail refuses the payload before
+a summary is ever attached to the node record, so the timeline — which read the trace and the engine's
+diagnostics and not that log — carried the token and none of the sentence. Reading the checkpoint's
+`log` beside those sources, and saying what the token means, is what closes it.
 
 DESIGN
 ------
@@ -24,6 +28,11 @@ DESIGN
 - **One headline, one next action.** The two things a person wants first are "what is it doing now"
   and "what should I do" — so they are computed explicitly rather than left for the reader to infer
   from the timeline.
+- **A stop is explained, in the engine's own words.** A node that did not finish gets its reason from
+  its record's `summary`, or — when there is none, which is exactly the guardrail case — from the entry
+  its own `log` carries, glossed by whatever the verdict token means. The reading of that log lives in
+  `flow`, which builds the board's `blocked_by` from the same entries: two readings of the same actions
+  would be two things to keep true, and one of them would drift.
 
 Usage:
     from engine.activity import build_activity
@@ -37,9 +46,16 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+# The reading of the checkpoint's `log` — which actions count as a cause, which statuses and verdicts
+# mean a node stopped, what a verdict token means, and which command resolves a stop — lives in `flow`,
+# where the board's `blocked_by` is built from the same entries. Importing it is deliberate: the board
+# and this timeline describe one run, and a second reading of the same log actions would be a second
+# answer to "why did it stop". `flow` imports nothing from this module, so this is a leaf.
+from .flow import clip, is_stuck, recovery_command, stop_report, why_stopped
 
 __all__ = ["ActivityEntry", "build_activity", "ACTIVITY_VERSION"]
 
@@ -271,8 +287,45 @@ def _node_entries(nodes: dict[str, Any]) -> list[ActivityEntry]:
         tone = {"done": "good", "blocked": "bad", "failed": "bad",
                 "needs_review": "warn", "pending": "info"}.get(status, "info")
         title = f"{name}: {status}" + (f" ({verdict})" if verdict else "")
-        entries.append(ActivityEntry("", "node", title, summary[:160], tone=tone, node_id=name))
+        entries.append(ActivityEntry("", "node", title, clip(summary, 160), tone=tone, node_id=name))
     return entries
+
+
+def _stop_entries(stops: list[dict[str, Any]]) -> list[ActivityEntry]:
+    """Why a stopped node stopped, from the checkpoint's own `log`.
+
+    This is the source the timeline was missing, not a new one: the reason for a guardrail block is
+    written *here* and nowhere else — the edge refuses the payload before a summary is attached to the
+    node record, and the engine's diagnostics do not carry it. So a story built from the trace and the
+    diagnostics could show that a run ended and never why, which is the complaint this module exists
+    for.
+
+    Only entries for a node that is *still* stopped are promoted (`flow.stop_report` decides that), so
+    this is a handful of lines rather than the run's whole log.
+    """
+    return [
+        ActivityEntry(
+            str(stop.get("at") or ""), "node",
+            f"{stop['node']}: {stop.get('word', '')}".strip().rstrip(":"),
+            clip(str(stop.get("detail") or stop.get("why") or ""), 200),
+            tone=str(stop.get("tone") or "warn"), node_id=str(stop.get("node") or ""))
+        for stop in stops
+    ]
+
+
+def _control_fired(stops: list[dict[str, Any]], run: dict[str, Any]) -> bool:
+    """Whether a safety control stopped this run, so a goal may not release it.
+
+    The engine's own rule, not a second one: `orchestrator._UNRELEASABLE_STOP_REASONS` names exactly
+    `guardrail`, `contract` and `error` and refuses to let a goal release a run whose stop reason
+    mentions one — autonomy decides that work is done, never that a control which fired was wrong. The
+    log's cause actions are the per-node form of the same three.
+    """
+    controls = ("guardrail", "contract", "error")
+    if any(str(stop.get("action") or "") in controls for stop in stops):
+        return True
+    reason = str(run.get("stop_reason") or "").lower()
+    return any(word in reason for word in controls)
 
 
 def _subagent_entries(workspace: Any, run_id: str) -> list[dict[str, Any]]:
@@ -305,8 +358,30 @@ def _proposal_entries(state_dir: Path | None) -> list[dict[str, Any]]:
 
 # ── the headline and the next action ─────────────────────────────────────────
 
+def _stuck_nodes(nodes: dict[str, Any], log: Any = None) -> dict[str, str]:
+    """The nodes that stopped short, in the order the checkpoint lists them, each with its reason.
+
+    The rule for "stopped short" is `flow.is_stuck`, the *same* predicate the board counts and headlines
+    with — one reading of a status and a verdict, so the report and the board cannot disagree about
+    which node is the stopped one. It is why a *finished* node is never stuck here whatever verdict it
+    still carries: the runner keeps a released gate's `awaiting_owner`, and reporting an approved gate as
+    stuck is the false positive `orchestrator._detect_gate` was fixed for.
+
+    The reason comes from `flow.why_stopped`, which reads the node's `summary` and then the entry its own
+    `log` carries — the guardrail case, where there is no summary because the payload was refused before
+    one could be attached.
+    """
+    stuck: dict[str, str] = {}
+    for name, record in nodes.items():
+        if not isinstance(record, dict):
+            continue
+        if is_stuck(str(record.get("status") or "pending"), str(record.get("verdict") or "")):
+            stuck[str(name)] = why_stopped(str(name), record, log)
+    return stuck
+
+
 def _headline(run: dict[str, Any], goal: dict[str, Any], nodes: dict[str, Any],
-              workspace_name: str) -> str:
+              workspace_name: str, stuck: dict[str, str] | None = None) -> str:
     """One line: what is the org doing *right now*."""
     phase = str(run.get("phase") or "idle")
     running = bool(run.get("running"))
@@ -314,9 +389,16 @@ def _headline(run: dict[str, Any], goal: dict[str, Any], nodes: dict[str, Any],
     gate = run.get("gate") if isinstance(run.get("gate"), dict) else None
 
     if gate is not None:
-        return f"Waiting on you: {str(gate.get('reason') or gate.get('gate_id') or 'a gate')[:110]}"
+        return f"Waiting on you: {clip(str(gate.get('reason') or gate.get('gate_id') or 'a gate'), 110)}"
     if stop and phase not in ("done",):
-        return f"Stopped — {stop[:150]}"
+        return f"Stopped — {clip(stop, 150)}"
+    # A stopped node outranks "running", because a run with a node that cannot advance will not finish,
+    # and that node is the one thing a person can act on. It sits *after* the run's own `stop_reason`
+    # because that sentence is the engine's summary of the whole run, and where it exists it already
+    # names the cause.
+    if stuck:
+        node = next(iter(stuck))
+        return f"{node} is stuck — {clip(stuck[node] or 'no reason recorded', 160)}"
     if running:
         done = sum(1 for r in nodes.values()
                    if isinstance(r, dict) and r.get("status") in ("done", "skipped"))
@@ -335,16 +417,23 @@ def _headline(run: dict[str, Any], goal: dict[str, Any], nodes: dict[str, Any],
 
 
 def _next_action(run: dict[str, Any], goal: dict[str, Any],
-                 staffing: list[dict[str, Any]]) -> dict[str, Any]:
+                 staffing: list[dict[str, Any]], stuck: dict[str, str] | None = None,
+                 state_dir: Path | None = None) -> dict[str, Any]:
     """The one thing the Owner should do next, if anything.
 
-    Ordered by urgency: a gate or a block is work only they can unblock; a staffing gap is a hire; an
-    armed-but-idle goal is a resume. An empty result means there is genuinely nothing to do.
+    Ordered by urgency: a gate is a decision only they can take; an unstaffed node is a hire; a stopped
+    run is a reason to look; a node that cannot advance is a *retry*, because the work was produced and
+    only a new attempt can satisfy the edge that refused it; then an armed-but-idle goal is a resume.
+    An empty result means there is genuinely nothing to do.
+
+    The retry's command is derived from the state by `flow.recovery_command`, which is the one place
+    that knows which verbs the engine will actually accept — so this can never point a person at a
+    command that comes back `no run found`.
     """
     gate = run.get("gate") if isinstance(run.get("gate"), dict) else None
     if gate is not None:
         return {"kind": "decide", "label": f"Decide gate {gate.get('gate_id')!r}",
-                "detail": str(gate.get("reason") or "")[:200],
+                "detail": clip(str(gate.get("reason") or ""), 200),
                 "command": f"engine.cli decide --slug {run.get('slug', '')} --approve --note \"...\""}
     if staffing:
         return {"kind": "hire", "label": f"Hire for {len(staffing)} unstaffed capabilit(ies)",
@@ -353,15 +442,22 @@ def _next_action(run: dict[str, Any], goal: dict[str, Any],
     stop = str(run.get("stop_reason") or "")
     if stop:
         return {"kind": "investigate", "label": "Investigate why the run stopped",
-                "detail": stop[:200],
+                "detail": clip(stop, 200),
                 "command": f"engine.cli status --slug {run.get('slug', '')}"}
+    if stuck:
+        node = next(iter(stuck))
+        recovery = recovery_command(str(run.get("slug") or ""), run, state_dir, node=node)
+        if recovery["command"]:
+            return {"kind": "retry",
+                    "label": f"Re-run the graph so {node} gets another attempt",
+                    "detail": stuck[node] or recovery["why"], "command": recovery["command"]}
     if goal.get("objective") and not goal.get("live") and goal.get("open"):
         return {"kind": "resume", "label": "Resume the goal to continue",
                 "detail": str(goal.get("pause_reason") or "paused"),
                 "command": "engine.cli goal resume"}
     if goal.get("objective") and not run.get("run_id"):
         return {"kind": "start", "label": "Start a run for this goal",
-                "detail": str(goal.get("objective"))[:200],
+                "detail": clip(str(goal.get("objective")), 200),
                 "command": "engine.cli run --goal \"...\""}
     return {"kind": "none", "label": "Nothing needs you", "detail": "", "command": ""}
 
@@ -456,7 +552,7 @@ def build_activity(workspace: Any, *, run_status: dict[str, Any] | None = None,
         timeline.append(ActivityEntry(
             str(child.get("updated_at") or child.get("created_at") or ""), "subagent",
             f"subagent {status}: {str(child.get('task') or child.get('child_id') or '')[:80]}",
-            str(child.get("preview") or "")[:160], tone=tone,
+            clip(str(child.get("preview") or ""), 160), tone=tone,
             agent_id=str(child.get("agent_id") or "")))
 
     # A proposal is work waiting on a person, so it belongs in the story.
@@ -464,8 +560,16 @@ def build_activity(workspace: Any, *, run_status: dict[str, Any] | None = None,
         timeline.append(ActivityEntry(
             str(proposal.get("at") or ""), "proposal",
             f"proposal: {str(proposal.get('title') or proposal.get('id') or '')[:80]}",
-            str(proposal.get("summary") or proposal.get("finding") or "")[:160], tone="warn",
+            clip(str(proposal.get("summary") or proposal.get("finding") or ""), 160), tone="warn",
             ref=str(proposal.get("file") or "")))
+
+    # Why a node stopped, from the checkpoint's own `log` — the source the timeline was missing. It sits
+    # before the per-node state so the story reads "then this was refused" and closes with what the run
+    # looks like now, and it carries no timestamp when the runner wrote none (the runner's entries have
+    # none), which pins it with the current-state entries at the end — where it belongs, since a stop
+    # that is still in force is current state rather than history.
+    stops = stop_report(nodes, run.get("log"))
+    timeline += _stop_entries(stops)
 
     # The authoritative per-node state closes the timeline, so it is never stale.
     timeline += _node_entries(nodes)
@@ -515,15 +619,25 @@ def build_activity(workspace: Any, *, run_status: dict[str, Any] | None = None,
     }
 
     staffing = staffing if staffing is not None else list(run.get("staffing_gaps") or [])
-    headline = _headline(run, goal, nodes, workspace_name)
-    next_action = _next_action(run, goal, staffing)
+    stuck = _stuck_nodes(nodes, run.get("log"))
+    headline = _headline(run, goal, nodes, workspace_name, stuck)
+    next_action = _next_action(run, goal, staffing, stuck=stuck, state_dir=state_dir)
 
     # Where it is going: the phase and, when a goal is armed, the fact that it will continue.
+    #
+    # `continues` is not `goal.live` on its own. A guardrail block or a contract violation is a safety
+    # control *firing*, and the engine refuses to let a goal release one
+    # (`orchestrator._UNRELEASABLE_STOP_REASONS`) — so a report that said "continues" over a refused node
+    # was telling a person to wait for something the engine had already decided will not happen, which is
+    # the same "nothing is happening and I do not know why" this module exists to end.
+    control_fired = _control_fired(stops, run)
     going = {
         "phase": str(run.get("phase") or "idle"),
         "live": bool(goal.get("live")),
-        "continues": bool(goal.get("live")),
-        "phase_note": str(goal.get("pause_reason") or "") if not goal.get("live") else "",
+        "continues": bool(goal.get("live")) and not control_fired,
+        "phase_note": ("a guardrail or contract control stopped this run, and a goal may not release "
+                       "one" if control_fired
+                       else str(goal.get("pause_reason") or "") if not goal.get("live") else ""),
     }
 
     return {

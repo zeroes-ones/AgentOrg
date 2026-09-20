@@ -366,7 +366,24 @@ def check_autonomy_floor() -> str:
     permissive = PolicyResolver(allow_autonomous_escalation=True)
     permissive.set("org", "", RouteClass.ESCALATE, "auto")
     assert permissive.resolve(RouteClass.ESCALATE).level.value == "auto"
-    return "floor refused R-ESCALATE/R-CONFLICT below confirm; routine class loosened; opt-in honoured"
+
+    # The goal's posture is the *other* door onto the same floor, and an unattended goal may now
+    # release a terminal gate. So the property this check exists for is asserted on the posture too:
+    # choosing `supervised` must park every gate, and the autonomous posture must still refuse to pass
+    # one that is not mechanically decidable.
+    from ..goal import GoalPolicy, Posture
+
+    assert GoalPolicy().posture is Posture.UNATTENDED, "the autonomous posture is the default"
+    supervised = GoalPolicy(posture=Posture.SUPERVISED).effective()
+    assert supervised.auto_approve is False and supervised.auto_hire is False, (
+        "a supervised goal must narrow every automatic decision to nothing")
+    assert not supervised.unattended, "a supervised goal must not answer its own gates"
+    # An unattended goal narrows nothing — but the release path, not this policy, is what constrains a
+    # terminal gate; see `Orchestrator._release_terminal_gate` and the phase-28 tests for its refusals.
+    assert GoalPolicy().effective().unattended, "an unattended goal may answer the gates it can"
+
+    return ("floor refused R-ESCALATE/R-CONFLICT below confirm; routine class loosened; opt-in "
+            "honoured; a supervised goal narrows every automatic decision")
 
 
 def check_router_asks_when_unsure() -> str:

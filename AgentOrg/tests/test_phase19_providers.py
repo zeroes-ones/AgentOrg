@@ -162,6 +162,62 @@ def test_write_provider_removing_an_absent_entry_is_not_an_error(tmp_path):
     assert "ollama" in json.loads(path.read_text())["providers"]
 
 
+def _reviewer_creds(tmp_path, reviewer: dict) -> pathlib.Path:
+    """Two providers with `defaults.reviewer` naming the one that is about to go."""
+    path = tmp_path / "credentials.json"
+    path.write_text(json.dumps({
+        "version": "1.0.0",
+        "providers": {
+            "only-one": {"kind": "ollama", "base_url": "http://localhost:11434"},
+            "keeper": {"kind": "ollama", "base_url": "http://localhost:11434"},
+        },
+        "models": {"known": {"m": {"context_window": 32768}}},
+        "defaults": {"provider": "only-one", "model": "m", "reviewer": reviewer},
+    }, indent=2))
+    os.chmod(path, 0o600)
+    return path
+
+
+def test_removing_a_provider_prunes_the_reviewer_reference_too(tmp_path):
+    """`defaults.reviewer.provider` is a third place a provider is named, and it dangled.
+
+    The writer pruned `per_provider_limits[pid]` and `defaults.provider`, so a removal left the
+    reviewer pointing at an endpoint that no longer existed. The reviewer sub-object is otherwise
+    untouched — its `model` still means something without its provider — which is the minimal fix:
+    removing the reference, not the setting.
+    """
+    path = _reviewer_creds(tmp_path, {"provider": "only-one", "model": "m"})
+    write_provider(path, {}, provider_id="only-one", remove=True)
+    document = json.loads(path.read_text())
+    assert "provider" not in document["defaults"]
+    assert "provider" not in document["defaults"]["reviewer"]
+    assert document["defaults"]["reviewer"]["model"] == "m"
+
+
+def test_an_emptied_reviewer_sub_object_is_dropped(tmp_path):
+    """A reviewer sub-object left with nothing in it is a key with no content; `set_defaults` drops
+    one, so the removal-writer does too rather than leaving an empty object to interpret."""
+    path = _reviewer_creds(tmp_path, {"provider": "only-one"})
+    write_provider(path, {}, provider_id="only-one", remove=True)
+    assert "reviewer" not in json.loads(path.read_text())["defaults"]
+
+
+def test_a_reviewer_left_without_a_provider_still_loads(tmp_path):
+    """**What the loader does with the pruned sub-object**, verified rather than assumed.
+
+    A reviewer left with a model and no provider is tolerated: `_build_defaults` copies the model into
+    `reviewer_model` and leaves `reviewer_provider` empty, and review resolution reads empty as "the
+    builders' provider". So what the removal writes resolves to the default pair instead of refusing
+    to load — which is why pruning the reference is enough and the model is left alone.
+    """
+    path = _reviewer_creds(tmp_path, {"provider": "only-one", "model": "m"})
+    write_provider(path, {}, provider_id="only-one", remove=True)
+    config = load(path, warn=False)
+    assert config.default.reviewer_provider == "", "empty means 'use the builders' provider'"
+    assert config.default.reviewer_model == "m"
+    assert sorted(config.providers) == ["keeper"]
+
+
 def test_write_provider_sets_mode_0600(tmp_path):
     """A key on disk in a world-readable file is a leaked key."""
     path = _creds(tmp_path, mode=0o644)

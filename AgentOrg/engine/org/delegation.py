@@ -91,6 +91,22 @@ class DelegationError(RuntimeError):
         super().__init__(prefix + message)
 
 
+def _default_elevated_markers() -> tuple[str, ...]:
+    """The capability prefixes that force an Owner gate, from the one place that owns the default.
+
+    Imported lazily because `config` imports this package's neighbours: the delegation module must not
+    pull the whole config loader in at import time just to read a five-element tuple. Falls back to
+    the literal only if the import genuinely fails, so a partially-importable tree still gates machine
+    access rather than silently auto-approving it.
+    """
+    try:
+        from ..config import DelegationConfig
+
+        return DelegationConfig().elevated_markers()
+    except Exception:  # noqa: BLE001 - a gate must not disappear because an import broke
+        return ("write:", "deploy:", "exec:", "admin:", "system:")
+
+
 class ApprovalTier(str, Enum):
     """Who approves a hire, and why.
 
@@ -536,20 +552,80 @@ class HiringDesk:
             state=RequisitionState.OWNER_GATE, needs_owner=True,
         )
 
+    def _elevated_capabilities(self, capabilities: list[str],
+                               markers: tuple[str, ...]) -> list[str]:
+        """Which of these capabilities genuinely reach beyond the project.
+
+        `write:` is in the marker list because an unscoped write is a grant the whole filesystem
+        would have to be trusted with, and the tool layer's containment is what makes the distinction
+        real rather than cosmetic: `ToolRegistry._resolve` refuses an absolute path, any `..` segment,
+        a `~` path, and anything that resolves outside the workspace, so every write a scoped grant
+        permits provably lands inside the project.
+
+        Treating *every* `write:` as elevated made a workspace-scoped helper indistinguishable from
+        one requesting `deploy:prod` — both scored T3 — which then contradicted
+        `goal.auto_hire_max_tier`, whose whole documented job is to cap how risky an auto-created
+        helper may be. Since that cap is configurable only up to T2, a T3 classification meant the
+        engine's own standard helper could never be admitted at any setting, so the cap could not be
+        enforced at all without disabling auto-staffing outright. The two are different risks and the
+        tier now says so.
+        """
+        elevated: list[str] = []
+        for capability in capabilities:
+            text = str(capability or "")
+            if not text.startswith(markers):
+                continue
+            kind, _, scope = text.partition(":")
+            if kind in ("read", "write") and self._scope_is_contained(scope):
+                continue
+            elevated.append(text)
+        return elevated
+
+    @staticmethod
+    def _scope_is_contained(scope: str) -> bool:
+        """Whether a path scope is bounded to a project subtree rather than everything.
+
+        Contained means the grant names a clean relative subtree (`src`, `src/**`, `src/`). Three
+        shapes are deliberately *not* contained, because calling them contained would understate the
+        grant: a wildcard or empty scope (`write:*`) is authority over any path the tool layer can
+        reach; an absolute path or a `~` path is not a project scope at all; and a `..` segment is a
+        traversal. The tool layer refuses the last two outright, so such a grant is inert rather than
+        dangerous — but the tier is a statement about what was *asked for*, and asking for a traversal
+        deserves the Owner's attention rather than a quiet T0.
+        """
+        text = str(scope or "").strip()
+        stem = text.rstrip("*").rstrip("/")
+        if not stem or stem == ".":
+            return False
+        if stem.startswith(("/", "~")):
+            return False
+        if ".." in stem.split("/"):
+            return False
+        return True
+
     def classify_tier(self, request: Requisition) -> tuple[ApprovalTier, str]:
         """Decide which approval tier a requisition lands in, and why.
 
         The reasoning is returned so the Owner sees *why* something reached them, and so an
         auto-approval is equally explainable.
         """
-        markers = tuple(self.approval_tiers.get(
-            "elevated_capability_markers", ["write:", "deploy:", "exec:", "admin:"]))
+        # `system:` belongs in this default, and leaving it out was a real hole: a requisition asking
+        # for `system:automation` — running AppleScript on the person's machine — classified **T1**,
+        # auto-approved with a notification, because the markers only knew about file and deploy
+        # capabilities. An agent could be handed machine access by the delegation desk without anyone
+        # deciding it, which is the opposite of what the rest of this design does.
+        #
+        # Read from `DelegationConfig.elevated_markers()` rather than repeated here, because the two
+        # had already drifted: the config carried a `system:`-aware default that nothing consumed, so
+        # editing it changed nothing and this literal was the real answer. One definition, one place.
+        markers = tuple(self.approval_tiers.get("elevated_capability_markers")
+                        or _default_elevated_markers())
         t0_max = int(self.approval_tiers.get("t0_max_tokens", 40_000))
         t1_max = int(self.approval_tiers.get("t1_max_tokens", 80_000))
         t2_max = int(self.approval_tiers.get("t2_max_tokens", 200_000))
         owner_above_usd = float(self.approval_tiers.get("require_owner_above_usd", 0.0))
 
-        elevated = [c for c in request.capabilities if c.startswith(markers)]
+        elevated = self._elevated_capabilities(request.capabilities, markers)
         if elevated:
             return ApprovalTier.T3, (
                 f"requests elevated capabilities {elevated}; these need an explicit "

@@ -27,8 +27,10 @@ DESIGN
 - **The boundary is code, not config.** An improver that can edit its own eval gate can make anything
   pass, so a system whose safety is enforced by code it can rewrite does not have that property. The
   refused list is hard-coded; a config knob would imply a supported alternative and there is none.
-- **Validation happens in a scratch copy.** Checking a fix must not be able to damage the working tree,
-  which is the same reasoning as testing a provider before saving it.
+- **Validation reads the tree; it does not patch it.** The suite runs against the working tree as it
+  stands and the result is compared to the frozen baseline. No patch is ever applied, so a run cannot
+  be said to have *caused* anything — an improvement means a scenario the baseline recorded failing now
+  passes, and anything else, including a scenario that already passed, has demonstrated nothing.
 - **A refusal names the path.** An improver that quietly discards work teaches nobody anything.
 - **Rejections are recorded**, so the same proposal is not re-litigated every cycle.
 - **Promotion is a file, not an action.** A proposal is written where a person can read and diff it.
@@ -78,6 +80,10 @@ SAFETY_SURFACES: tuple[str, ...] = (
     "engine/host.py",             # supervision of the runner
     "engine/config.py",           # budget, policy and redaction live here
     "engine/improver.py",         # this module: it may not rewrite its own rules
+    # The applier — the *only* module that edits a tree on a proposal's behalf, and therefore the one
+    # a proposal must never be able to aim at. Without this line the boundary is a formality: the
+    # loop could draft a patch to the code that decides whether a patch may land.
+    "engine/proposals.py",
     "credentials.json",           # secrets
     "macos/Sources/AgentOrgKit/ConsoleAppDelegate.swift",   # what keeps the engine alive
     "macos/Sources/AgentOrg/App.swift",                     # the scene and lifecycle
@@ -307,14 +313,30 @@ class Proposal:
             lines.append(f"- {self.validation.detail}")
         if self.patch:
             lines += ["", "## Patch", "", "```diff", self.patch.rstrip(), "```"]
-        lines += [
-            "",
-            "---",
-            "",
-            "**Nothing has been applied.** This loop never edits the tree. Read the patch, then apply "
-            "it yourself if you agree — or delete this file.",
-        ]
+        lines += ["", "---", ""]
+        lines.append(self._closing())
         return "\n".join(lines) + "\n"
+
+    def _closing(self) -> str:
+        """What the last line says about the state — and it must not contradict it.
+
+        The default is the boundary working: *nothing has been applied*. But a proposal that a person
+        has since accepted or applied keeps its file, and a fixed sentence would then tell its reader
+        the tree is untouched while the change is in it. The words follow the state, because a
+        proposal's one job is to be honest about what has happened to it.
+        """
+        if self.state == "applied":
+            return ("**This change has been applied to the tree**, verified by the project's own test "
+                    "suite before and after. Undo it with `proposals undo`.")
+        if self.state == "accepted":
+            return ("**Accepted — nothing has been applied.** Applying it is a separate step "
+                    "(`proposals apply`), and it is refused unless the suite demonstrates an "
+                    "improvement and no regression.")
+        if self.state == "rejected":
+            return ("**Rejected**, and the reason is recorded so the same finding is not re-drafted "
+                    "every cycle. Nothing has been applied.")
+        return ("**Nothing has been applied.** This loop never edits the tree. Read the patch, then "
+                "apply it yourself if you agree — or delete this file.")
 
 
 # ── the loop ─────────────────────────────────────────────────────────────────
@@ -603,12 +625,13 @@ class Improver:
     # ── Q3: validate ────────────────────────────────────────────────────────
 
     def validate(self, proposal: Proposal) -> Validation:
-        """Run the suite and compare against the frozen baseline. Never modifies the tree.
+        """Run the suite as it stands and compare against the frozen baseline. Never modifies the tree.
 
-        A *delta* against the baseline, because that is what the suite itself does and for the reason
-        its own docstring gives: a run that gains on one scenario and loses on three is a regression
-        even at the same total. The proposal must show **no regression** *and* name what improved — a
-        change that is merely not-worse is not an improvement.
+        The suite runs against the *unmodified* tree — this module applies no patch, so the run cannot
+        be said to have caused anything. What it can show is a delta against the baseline, and the only
+        honest claim available is a scenario the baseline recorded **failing** that now passes. The
+        proposal must show **no regression** *and* such a flip — a change that is merely not-worse is
+        not an improvement, and neither is a scenario the baseline already passed.
         """
         validation = Validation()
         if proposal.state == "refused":
@@ -640,13 +663,14 @@ class Improver:
             return validation
 
         validation.ran = True
+        baseline = self._baseline()
         regressions = self._regressions(result)
         validation.regressions = regressions
-        validation.improved = self._improvements(result, proposal.finding)
+        validation.improved = self._improvements(result, proposal.finding, baseline)
         validation.detail = (
             f"{len(validation.improved)} improvement(s), {len(regressions)} regression(s)"
             if (validation.improved or regressions)
-            else "the suite is unchanged by this proposal, so there is nothing to promote")
+            else self._no_improvement_detail(proposal.finding, baseline))
         proposal.validation = validation
         return validation
 
@@ -656,6 +680,19 @@ class Improver:
         except Exception:  # noqa: BLE001 - no suite means nothing to claim
             return None
         return run_suite
+
+    @staticmethod
+    def _baseline() -> dict[str, Any] | None:
+        """The frozen baseline, or `None` when it cannot be read.
+
+        `None` is a distinct outcome from an empty baseline: it means no comparison is possible at all,
+        and the callers must not launder that into "nothing improved" (nor into "nothing regressed").
+        """
+        try:
+            from .evals.runner import BASELINE_PATH
+            return json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - an unreadable baseline is a missing comparison, not a pass
+            return None
 
     @staticmethod
     def _regressions(result: Any) -> list[str]:
@@ -671,19 +708,53 @@ class Improver:
             return []
 
     @staticmethod
-    def _improvements(result: Any, finding: Finding) -> list[str]:
-        """Scenarios that now pass and name the finding's subject.
+    def _improvements(result: Any, finding: Finding,
+                      baseline: dict[str, Any] | None) -> list[str]:
+        """Scenarios the baseline recorded **failing** that now pass, bounded to the finding's subject.
 
-        Bounded deliberately to the scenario the finding points at, plus any scenario that flipped from
-        failing to passing — because "some other scenario got better" is not evidence that *this*
-        change fixed *this* problem.
+        A flip *against the frozen baseline*, not merely a passing scenario. `baseline.json` records all
+        17 scenarios passing, so "it passes now" is true of every proposal, including one with an empty
+        diff; counting that as an improvement stamps the unchanged tree as a fix. The baseline is what
+        makes "improved" mean that something changed.
+
+        Bounded deliberately to the scenario the finding points at, because "some other scenario got
+        better" is not evidence that *this* change fixed *this* problem.
         """
-        names: list[str] = []
+        scenario = finding.scenario
+        if not scenario or not baseline:
+            return []
+        was = (baseline.get("results") or {}).get(scenario)
+        if not was or was.get("passed"):
+            return []
         for outcome in getattr(result, "outcomes", []) or []:
-            if getattr(outcome, "passed", False) and finding.scenario \
-                    and outcome.name == finding.scenario:
-                names.append(outcome.name)
-        return names
+            if outcome.name == scenario and getattr(outcome, "passed", False):
+                return [scenario]
+        return []
+
+    @staticmethod
+    def _no_improvement_detail(finding: Finding, baseline: dict[str, Any] | None) -> str:
+        """Why nothing can have improved, named rather than merely asserted.
+
+        The old detail read "the suite is unchanged", which sounds neutral. The honest reading is
+        stronger: a run of the *unchanged* tree cannot evidence a fix at all, and when the baseline
+        already records the named scenario as passing there is no flip left to observe. Saying which of
+        those happened is what stops "nothing to promote" from reading as a formality.
+        """
+        trailing = "the suite is unchanged by this proposal, so there is nothing to promote"
+        scenario = finding.scenario
+        if not scenario:
+            return f"the finding names no scenario to improve, so a run cannot evidence a fix; {trailing}"
+        if baseline is None:
+            return (f"the baseline cannot be read, so no failing-to-passing flip for {scenario!r} can "
+                    f"be shown and none is claimed; {trailing}")
+        was = (baseline.get("results") or {}).get(scenario)
+        if was is None:
+            return (f"the baseline records no {scenario!r}, so a run of the unchanged tree cannot "
+                    f"evidence a fix; {trailing}")
+        if was.get("passed"):
+            return (f"the baseline already records {scenario!r} as passing, so a run of the unchanged "
+                    f"tree cannot evidence a fix — this proposal has demonstrated nothing; {trailing}")
+        return f"{scenario!r} was failing at baseline and does not pass now, so nothing flipped; {trailing}"
 
     # ── Q4: promote (write it out; never apply) ─────────────────────────────
 

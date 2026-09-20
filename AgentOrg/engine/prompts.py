@@ -173,6 +173,11 @@ class TaskContext:
     is_reviewer: bool = False
     # Whether the node may delegate.
     may_delegate: bool = True
+    # The contract refusal a bounded rework pass is answering, as the runner reported it:
+    # `{reason, rule, attempt, max_attempts, open_question_limit, open_questions}`. Empty on a
+    # first attempt. Carried because a retry that repeats the identical prompt fails identically —
+    # the node has to be told which rule refused it and what to change.
+    contract_rework: dict[str, Any] = field(default_factory=dict)
 
 
 class PromptBuilder:
@@ -309,7 +314,80 @@ class PromptBuilder:
         parts.append(self._intake_block(task))
         if task.findings:
             parts.append(self._rework_block(task))
+        if task.contract_rework:
+            parts.append(self._contract_rework_block(task))
         return "\n\n".join(parts)
+
+    def _contract_rework_block(self, task: TaskContext) -> str:
+        """The contract-repair template: the refusal this node must answer, and what to change.
+
+        Distinct from `_rework_block`, which answers *review findings* — a reviewer's opinion about
+        the work. This answers a contract refusing the node's own report: nothing was wrong with the
+        work, and the node cannot advance until what it reported satisfies the rule. The two are
+        separated because the fixes are different in kind, and merging them would tell a node to
+        "root-cause the findings" when there are no findings, only a rule.
+
+        Two contracts refuse a node and both arrive here: the **handoff** rules (R1–R8, whose
+        messages name a rule id) and the **completion** contract (whose messages name the trailer
+        fields instead). The block is written to be accurate for either — the reproduced run was
+        refused by the completion contract, so a block that assumed the handoff path would have told
+        the node to fix a payload that was never the problem.
+
+        The prompt is the whole point of the retry. A rework window that re-sent the identical prompt
+        would fail identically and burn the whole budget doing it, so the refusal's own words travel
+        here verbatim — the rule id or the offending fields, what they measure, and for R6 the
+        questions that broke the ceiling.
+        """
+        rework = task.contract_rework
+        rule = str(rework.get("rule") or "").strip()
+        limit = rework.get("open_question_limit")
+        reason = str(rework.get("reason") or "")[:400]
+        lines = [
+            f"## CONTRACT REPAIR — attempt {rework.get('attempt')} of "
+            f"{rework.get('max_attempts')}",
+            # "the run's own contract" rather than "the handoff contract": two different contracts
+            # refuse a node, and the real reproduced run was refused by the *completion* contract
+            # (missing evidence and criteria coverage), not by a handoff rule. Naming the wrong one
+            # sends the node to fix a payload that was never the problem.
+            "**Your previous attempt was refused by the run's own contract, not by a reviewer.** The "
+            "work itself may be fine; what you *reported* could not satisfy the contract. Fixing it "
+            "is a small edit to your report, not a re-do.",
+            "",
+            f"**The refusal, verbatim:** {reason}",
+            "",
+            "Do not resubmit the same report. Address the specific failure above and report the "
+            "same work with the report corrected.",
+            "",
+        ]
+        # Completion-contract clauses name the fields themselves (`completion.evidence`,
+        # `completion.criteria`), so the block can be specific rather than generic — and has to be,
+        # because the fix is a trailer edit the node will not find by re-reading its prose.
+        if "completion." in reason or "criteria" in reason:
+            lines += [
+                "**What this is about.** Your reply's fenced trailer — not your prose. It must "
+                "carry `evidence`: one concrete item per claim (a path, a hash, or command output), "
+                "and an entry in `criteria_satisfied` for **every** criterion listed under "
+                "`## COMPLETION CRITERIA` above, each with its `criterion` copied verbatim. One "
+                "entry is not coverage. Emit the work exactly as before and correct only the trailer.",
+                "",
+            ]
+        if rule == "R6" and limit:
+            lines += [
+                f"**What R6 measures.** No more than {limit} unresolved questions may cross a "
+                "boundary. The contract counts every question still open in the run, not only the "
+                "ones you raised — so the pile has to come down, not just be re-worded.",
+                "",
+                "Resolve what you can from the work you have already done, and promote each "
+                "remaining one to a **stated assumption** in your summary or a **decision** with its "
+                "rationale, rather than leaving it open. An assumption you have committed to is not "
+                "an open question.",
+                "",
+                f"**The questions that were open ({len(rework.get('open_questions') or [])}):**",
+            ]
+            for question in (rework.get("open_questions") or [])[:12]:
+                lines.append(f"- {question}")
+            lines.append("")
+        return "\n".join(lines)
 
     def _intake_block(self, task: TaskContext) -> str:
         """The library's handoff-in template: answer three questions before working."""

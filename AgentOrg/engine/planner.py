@@ -27,8 +27,11 @@ DESIGN
   loop with an `exit_when` and `max_iterations`, and a reachable terminal human gate. Those
   are the properties the design's termination section promises, so they are asserted rather
   than hoped for.
-- **Handoffs are typed.** Each edge connects a producer whose declared outputs satisfy the
-  consumer's declared inputs, or the planner says so and drops the edge.
+- **The chain follows the library's own graph where one exists.** Each edge connects a producer
+  whose declared outputs satisfy the consumer's declared inputs; where it does not, the mismatch is
+  allowed but reported on `Plan.type_notes`, because artifact declarations describe a skill's typical
+  use rather than a type system. The *order* of the chain is the library's `chain:` graph when the
+  selected skills form a DAG, and the hand-written order with a recorded reason when they do not.
 
 Usage:
     planner = Planner(source)
@@ -285,6 +288,17 @@ class Plan:
     skills_used: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
     dropped: tuple[str, ...] = ()
+    #: Handoffs the planner allowed even though the producer's declared outputs and the consumer's
+    #: declared inputs do not intersect. A mismatch is not fatal (artifact declarations describe a
+    #: skill's typical use, not a type system), but it is information the Owner needs — the receiving
+    #: node has to state what it actually received. Surfaced here because these were computed and
+    #: then discarded, so a plan looked clean while seven mismatches went unmentioned.
+    type_notes: tuple[str, ...] = ()
+    #: Why the build chain is in the order it is. Always populated for a multi-node chain: either the
+    #: library's `chain:` graph ordered it (and the note names that order), or the order could not be
+    #: taken from the graph and the note gives the reason (a cycle, no declared dependency, or a graph
+    #: that could not be read).
+    order_notes: tuple[str, ...] = ()
     #: Which composition shape the goal selected — `software`, `strategy`, `research`, `gtm`.
     #: Surfaced because "why this org?" is the first question an Owner asks of a plan, and the
     #: answer must not be something they have to infer from the node list.
@@ -354,6 +368,16 @@ class Plan:
             for gate in self.gates:
                 lines.append(f"  {gate.get('id')}  kind={gate.get('kind')}  "
                              f"{gate.get('description', '')}")
+        if self.order_notes:
+            lines.append("")
+            lines.append("Chain order:")
+            for entry in self.order_notes:
+                lines.append(f"  - {entry}")
+        if self.type_notes:
+            lines.append("")
+            lines.append("Handoffs allowed despite a type mismatch (the receiver must say what it got):")
+            for entry in self.type_notes:
+                lines.append(f"  - {entry}")
         if self.dropped:
             lines.append("")
             lines.append("Omitted (with reason):")
@@ -396,6 +420,8 @@ class Plan:
             "skills_used": list(self.skills_used),
             "notes": list(self.notes),
             "dropped": list(self.dropped),
+            "type_notes": list(self.type_notes),
+            "order_notes": list(self.order_notes),
             "shape": self.shape,
             "staffing": [dict(gap) for gap in self.staffing],
             "graph_review": dict(self.graph_review or {}),
@@ -463,11 +489,11 @@ class Planner:
                                    include_parallel=True, include_all_verifiers=True)),
             ("lean", self._compose(project, goal, selected, domain, max_iterations, max_steps,
                                    include_parallel=False, include_all_verifiers=False)),
-            ("minimal", self._minimal(project, goal, max_iterations)),
+            ("minimal", (self._minimal(project, goal, max_iterations), {})),
         ]
 
         dropped: list[str] = []
-        for label, manifest in candidates:
+        for label, (manifest, carried) in candidates:
             validation = self.validate(manifest)
             if validation.valid:
                 notes = [] if label == "full" else [
@@ -486,6 +512,8 @@ class Planner:
                     ),
                     notes=tuple(notes),
                     dropped=tuple(dropped),
+                    type_notes=tuple(carried.get("type_notes") or ()),
+                    order_notes=tuple(carried.get("order_notes") or ()),
                     shape=domain,
                     staffing=self._staffing_gaps(manifest),
                     graph_review=self._graph_review(manifest),
@@ -550,6 +578,19 @@ class Planner:
             if re.search(pattern, lowered) and self._load(skill) is not None:
                 selected.append((_node_id_for(skill), skill, _phase_for(skill)))
                 already.add(skill)
+        # A skill the Owner authored joins the chain when the goal names it outright. Every table
+        # above is written against the library, so it can only ever name a library skill — which
+        # meant a genuinely new skill could be created, hired against and loaded, and still never
+        # appear in a plan. Only *authored* names are added: the library's own composition stays the
+        # reviewed shape it was, and an authored skill that overrides a library name is already
+        # picked up by the tables because its contract is loaded through the overlay.
+        for skill in self._named_authored(lowered):
+            if skill in already:
+                continue
+            if self._load(skill) is None:
+                continue
+            selected.append((_node_id_for(skill), skill, _phase_for(skill)))
+            already.add(skill)
         # Verifiers go last so the chain's final node is the producing node, which is what the
         # rework loop hands back to.
         for node_id, skill, phase in shape["verify"]:
@@ -559,6 +600,16 @@ class Planner:
                 selected.append((node_id, skill, phase))
                 already.add(skill)
         return selected
+
+    def _named_authored(self, lowered_goal: str) -> list[str]:
+        """Authored skill names the goal names outright, in a stable order.
+
+        The match is deliberately literal — the slug (`db-migrator`) or the same words spaced
+        (`db migrator`) — because a looser rule (any word in common) would drag unrelated skills into
+        every plan. Naming a capability is an instruction; mentioning a subject is not.
+        """
+        return [name for name in self._authored_names()
+                if name in lowered_goal or name.replace("-", " ") in lowered_goal]
 
     def _staffing_gaps(self, manifest: dict[str, Any]) -> tuple[dict[str, Any], ...]:
         """Skills the plan needs that the roster does not staff, with the hire that closes each.
@@ -606,6 +657,10 @@ class Planner:
         It never changes the manifest — the graph is dense and mutual, so it informs a person rather
         than dictating an order. Empty when no graph can be built, so the plan still renders.
 
+        This is the *diagnostic* use of the graph. `_order_chain` is the composing one, and it is
+        deliberately narrower: it reorders the chain only where the corpus declares a real dependency
+        and no cycle, and records its reason either way.
+
         The consensus threshold scales with the plan: demanding a fixed 2 of 3 nodes would flood a
         small plan with noise from the graph's density, while a large plan needs a higher bar to be
         meaningful.
@@ -640,14 +695,36 @@ class Planner:
         if isinstance(result, dict):
             return PlanValidation(
                 valid=bool(result.get("valid")),
-                errors=tuple(
-                    str(e.get("message") if isinstance(e, dict) else e)
-                    for e in (result.get("errors") or [])
-                ),
+                errors=tuple(_error_text(e) for e in (result.get("errors") or [])),
                 name=str(result.get("name") or ""),
                 manifest_sha=str(result.get("manifest_sha") or ""),
             )
         return PlanValidation(valid=False, errors=(f"validator returned {type(result).__name__}",))
+
+    def _skill_names(self) -> list[str]:
+        """Every skill name the source resolves: the library plus the Owner's own.
+
+        Read from the source rather than the library, so the validator's catalogue and the loader's
+        catalogue are one list rather than two that can drift apart.
+        """
+        try:
+            return list(self.source.names())
+        except Exception:  # noqa: BLE001 - a source we cannot enumerate is not a plan failure
+            return []
+
+    def _authored_names(self) -> list[str]:
+        """The names that came from one of the Owner's own roots, per the source's own provenance.
+
+        Asked of the overlay rather than derived here by comparing roots, because comparing roots
+        would be a second copy of the precedence rule — and the overlay is the thing that knows.
+        A source with no notion of user roots (a bare library source) answers "none", which keeps
+        the composition below exactly as it was for a library-only org.
+        """
+        self._skill_names()  # the overlay records provenance while it enumerates
+        names = getattr(self.source, "user_names", None)
+        if not names:
+            return []
+        return sorted(str(name) for name in names)
 
     # ── validation plumbing ─────────────────────────────────────────────────
 
@@ -679,7 +756,15 @@ class Planner:
             module = importlib.util.module_from_spec(spec)
             sys.modules["_agentorg_validate_workflows"] = module
             spec.loader.exec_module(module)
-            skills = module._find_skill_names() if hasattr(module, "_find_skill_names") else set()
+            # The catalogue the validator resolves against is the *org's*, not the checkout's: the
+            # pinned library plus the Owner's own skills — the same overlay the hire is validated
+            # against and the executor loads through. Widening it is not a weakening: a name the
+            # overlay cannot resolve is still refused, by name. Leaving it library-only meant a node
+            # naming an authored skill was rejected by a validator that had never been told the skill
+            # existed, so a skill could be created, hired against, planned — and never run.
+            skills = dict(module._find_skill_names()) if hasattr(module, "_find_skill_names") else {}
+            for name in self._skill_names():
+                skills.setdefault(name, f"<authored>/{name}")
             instance = module.WorkflowValidator(skills)
 
             def run(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -757,9 +842,55 @@ class Planner:
         except (SkillError, Exception):  # noqa: BLE001 - a bad skill is skipped, not fatal
             return None
 
+    def _order_chain(self, primary: list[tuple[str, str, str]]) -> tuple[list[tuple[str, str, str]],
+                                                                        tuple[str, ...]]:
+        """Order the build chain by the library's own `chain:` graph, with a recorded fallback.
+
+        Returns ``(ordered_primary, notes)``. The order is the graph's when the selected skills form
+        a DAG, and the hand-written order otherwise — with the reason recorded rather than the
+        difference silently swallowed. Two things make the fallback necessary and not merely tidy:
+
+        - **A cycle is a real property of this corpus.** `api-designer` and `backend-developer`
+          declare each other, so `software` (the default shape) has no graph order at all. A planner
+          that refused here would refuse most goals; one that picked a winner silently would report an
+          order the corpus contradicts.
+        - **An unreadable graph yields alphabetisation, not a dependency order.** When no skill
+          resolves, every node has no edges and Kahn emits them sorted by name — which would reorder
+          the chain for no reason. Requiring at least one *in-set* edge is what separates "the graph
+          ordered this" from "the graph knew nothing".
+        """
+        if len(primary) < 2:
+            return primary, ()
+        names = [skill for _id, skill, _phase in primary]
+        try:
+            from .skills.graph import SkillGraph
+
+            graph = SkillGraph(self.source)
+            ordered, cyclic = graph.topological_order(names, include_framework=True)
+        except Exception as exc:  # noqa: BLE001 - a graph we cannot read is not a plan failure
+            return primary, (f"kept the declared chain order: the library's chain graph could not "
+                             f"be read ({type(exc).__name__})",)
+        if cyclic:
+            return primary, (
+                "kept the declared chain order: the library's chain graph declares a cycle among "
+                f"{sorted(cyclic)}, so there is no dependency order to impose",)
+        in_set = set(names)
+        related = any(
+            up in in_set and up != skill
+            for skill in names
+            for up in graph.upstream(skill, include_framework=True)
+        )
+        if not related or sorted(ordered) != sorted(names):
+            return primary, ("kept the declared chain order: the library's chain graph declares no "
+                             "dependency between these skills, so it has no order to offer",)
+        by_skill = {entry[1]: entry for entry in primary}
+        return [by_skill[skill] for skill in ordered], (
+            "ordered the chain by the library's own `chain:` graph: " + " -> ".join(ordered),)
+
     def _compose(self, slug: str, goal: str, selected: list[tuple[str, str, str]], domain: str,
                  max_iterations: int, max_steps: int | None, *,
-                 include_parallel: bool, include_all_verifiers: bool) -> dict[str, Any]:
+                 include_parallel: bool, include_all_verifiers: bool,
+                 ) -> tuple[dict[str, Any], dict[str, tuple[str, ...]]]:
         """Build a manifest from the selected skills.
 
         The graph is: sequential phases, then a parallel verification fan-out, then a bounded
@@ -768,8 +899,10 @@ class Planner:
         only the *people* differ, because the invariants (terminate, gate, bounded loop) are
         properties of the graph rather than of the work.
 
-        `domain` selects the verifier set and the description; the software domain keeps the exact
-        behavior it always had, so existing plans are unchanged.
+        `domain` selects the verifier set and the description. Returns ``(manifest, carried)``, where
+        `carried` holds the type mismatches and the chain-order note so `plan()` can put them on the
+        `Plan` — a return value rather than an instance attribute, because the attribute form lost
+        them.
         """
         shape = _DOMAIN_SHAPES.get(domain) or _DOMAIN_SHAPES["software"]
         verifier_skills = {skill for _id, skill, _phase in shape["verify"]}
@@ -794,6 +927,11 @@ class Planner:
                 review.append(entry)
             else:
                 primary.append(entry)
+
+        # Order the build chain by the library's own declared dependencies before any node is built,
+        # so the edges below follow the graph rather than the order the tables happened to be written
+        # in. A cyclic or unreadable graph keeps the declared order and says why.
+        primary, order_notes = self._order_chain(primary)
 
         for node_id, skill, phase in primary:
             bundle = self._load(skill)
@@ -958,10 +1096,12 @@ class Planner:
         if max_steps is not None:
             manifest["budget"] = {"max_steps": int(max_steps)}
 
-        # Both dropped phases and allowed type mismatches are information the Owner needs,
-        # so they travel with the plan rather than being logged and forgotten.
-        self._last_dropped = [*dropped, *type_notes]
-        return manifest
+        # Both dropped phases and allowed type mismatches are information the Owner needs, so they
+        # are returned to `plan()` rather than stashed in an instance attribute nobody reads. The
+        # attribute form was the defect: `_last_dropped` collected seven real mismatches on an
+        # ordinary plan while `Plan.dropped` stayed empty, because the two were different lists.
+        return manifest, {"type_notes": tuple(type_notes), "order_notes": order_notes}
+
     def _minimal(self, slug: str, goal: str, max_iterations: int) -> dict[str, Any]:
         """The smallest runnable graph: one worker, one reviewer, one bounded loop, one gate.
 
@@ -1159,6 +1299,21 @@ def _gate_description(domain: str) -> str:
     return ("Owner decision: the deliverable is accepted once the verification loop converges, or "
             "the escalation report is reviewed when automation exhausted its budget. Nothing "
             "downstream (a build, a launch, a spend) proceeds without this.")
+
+
+def _error_text(entry: Any) -> str:
+    """One validator error as text.
+
+    The library reports ``{"error": "…"}`` while the engine's own stubs report ``{"message": "…"}``,
+    and reading only ``message`` turned every library refusal into the string ``None`` — a plan
+    reported as invalid with no reason, which is worse than the refusal it was hiding.
+    """
+    if isinstance(entry, dict):
+        for key in ("message", "error", "detail"):
+            text = entry.get(key)
+            if text:
+                return str(text)
+    return str(entry)
 
 
 def _phase_for(skill: str) -> str:

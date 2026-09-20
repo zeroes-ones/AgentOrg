@@ -237,6 +237,207 @@ def test_auto_pass_records_who_decided(orch):
     assert run.gate is None
 
 
+# ── the posture, and the terminal release ────────────────────────────────────
+
+
+def test_an_unattended_goal_is_the_default_posture():
+    """The one word that answers "do I have to be here for this to finish?"."""
+    from engine.goal import Posture
+
+    assert GoalPolicy().posture is Posture.UNATTENDED
+    assert GoalPolicy().unattended is True
+
+
+def test_the_legacy_human_gate_flag_maps_onto_the_posture():
+    """An old goal.json, or an old CLI flag, must mean what it meant: a human is involved."""
+    from engine.goal import Posture
+
+    assert GoalPolicy(human_gate=True).posture is Posture.SUPERVISED
+    assert GoalPolicy(posture=Posture.SUPERVISED).human_gate is True
+    # And a document that carries the flag but no posture resolves the same way.
+    assert GoalPolicy.from_dict({"human_gate": True}).posture is Posture.SUPERVISED
+    assert GoalPolicy.from_dict({"posture": "supervised"}).human_gate is True
+
+
+def test_the_posture_and_the_legacy_flag_round_trip_through_a_goal_document():
+    from engine.goal import Posture
+
+    for posture in (Posture.UNATTENDED, Posture.SUPERVISED):
+        goal = Goal.new("round trip", policy=GoalPolicy(posture=posture))
+        loaded = Goal.from_dict(goal.as_dict())
+        assert loaded.policy.posture is posture
+        assert loaded.policy.human_gate == (posture is Posture.SUPERVISED)
+
+
+def test_an_unknown_posture_is_refused_rather_than_guessed():
+    """A typo must not silently become "supervised" or, worse, "unattended"."""
+    with pytest.raises(Exception, match="posture"):
+        GoalPolicy(posture="cowboy")
+    with pytest.raises(Exception, match="posture"):
+        GoalPolicy.from_dict({"posture": "cowboy"})
+
+
+def test_goal_config_declares_the_documented_max_rounds_and_posture():
+    """`max_rounds` was documented and read but never declarable; `default_posture` is new."""
+    cfg = GoalConfig()
+    assert cfg.max_rounds >= 1
+    assert cfg.default_posture == "unattended"
+    with pytest.raises(Exception):
+        GoalConfig(default_posture="cowboy")
+    with pytest.raises(Exception):
+        GoalConfig(max_rounds=0)
+
+
+def _terminal_gate(orch, requires=None, present=None):
+    """A terminal gate whose evidence lives in the run's node records, as the planner emits it."""
+    return GateRequest(gate_id="human-gate", kind="human", reason="release",
+                       requires=list(requires if requires is not None else ["reviewer.summary"]),
+                       present=list(present or []))
+
+
+def _run_with_evidence(orch, *, nodes, stop_reason=""):
+    run = _stub_run(orch)
+    run.outcome = {"nodes": nodes, "artifacts": []}
+    run.stop_reason = stop_reason
+    return run
+
+
+def test_a_supervised_goal_still_parks_at_the_terminal_gate(orch):
+    """The safety floor, asserted rather than documented: choosing `supervised` parks every gate."""
+    run = _run_with_evidence(orch, nodes={"reviewer": {"status": "done", "summary": "all good"}})
+    run.gate = _terminal_gate(orch)
+    policy = GoalPolicy(posture="supervised").effective()
+    assert orch._auto_pass(run, policy) is False
+    assert run.gate is not None, "a supervised gate must still be waiting for the Owner"
+
+
+def test_an_unattended_goal_releases_the_terminal_gate_when_the_evidence_is_present(orch):
+    """The whole point: a goal can finish with nobody watching — with evidence, and on the record."""
+    run = _run_with_evidence(orch, nodes={"reviewer": {"status": "done", "summary": "reviewed, clean"}})
+    run.gate = _terminal_gate(orch)
+    assert orch._auto_pass(run, GoalPolicy().effective()) is True
+    assert run.gate is None, "the gate was released, so the run is ready to advance"
+    assert run.decisions[-1]["by"] == "goal"
+    # The release is a recorded decision, so "who released this, and why" is answerable afterwards.
+    recorded = orch.ledger.current("human-gate")
+    assert recorded is not None and recorded.choice == "released" and recorded.by == "goal"
+
+
+def test_a_release_with_no_evidence_parks_instead(orch):
+    """An approval of nothing is not an approval: a gate that cannot show its evidence waits."""
+    run = _run_with_evidence(orch, nodes={"reviewer": {"status": "pending", "summary": ""}})
+    run.gate = _terminal_gate(orch)
+    assert orch._auto_pass(run, GoalPolicy().effective()) is False
+    assert run.gate is not None
+    assert orch.ledger.current("human-gate") is None, "nothing may be recorded for a refused release"
+
+
+def test_a_gate_that_declares_nothing_is_not_trivially_releasable(orch):
+    """`requires: []` is not evidence that the work is done, so it is treated as incomplete."""
+    run = _run_with_evidence(orch, nodes={"reviewer": {"status": "done", "summary": "done"}})
+    run.gate = _terminal_gate(orch, requires=[])
+    assert orch._auto_pass(run, GoalPolicy().effective()) is False
+    assert run.gate is not None
+
+
+def test_a_guardrail_block_is_never_released_by_a_goal(orch):
+    """Autonomy may decide work is done; it may not decide a safety control that fired was wrong."""
+    run = _run_with_evidence(
+        orch, nodes={"reviewer": {"status": "done", "summary": "reviewed"}},
+        stop_reason="pm: a hand-off payload was blocked by the edge guardrail")
+    run.gate = _terminal_gate(orch)
+    assert orch._auto_pass(run, GoalPolicy().effective()) is False
+    assert run.gate is not None
+    assert orch.ledger.current("human-gate") is None
+
+
+def test_a_contract_violation_is_never_released_by_a_goal(orch):
+    run = _run_with_evidence(
+        orch, nodes={"reviewer": {"status": "done", "summary": "reviewed"}},
+        stop_reason="developer: a node's completion contract was violated")
+    run.gate = _terminal_gate(orch)
+    assert orch._auto_pass(run, GoalPolicy().effective()) is False
+    assert run.gate is not None
+
+
+def test_a_blocked_node_parks_the_release(orch):
+    """A blocked node is a stated, concrete failure — releasing over it would record a false "done"."""
+    run = _run_with_evidence(orch, nodes={
+        "reviewer": {"status": "done", "summary": "reviewed"},
+        "developer": {"status": "blocked", "summary": "cannot proceed"}})
+    run.gate = _terminal_gate(orch)
+    assert orch._auto_pass(run, GoalPolicy().effective()) is False
+    assert run.gate is not None
+
+
+def test_an_artifact_requirement_is_resolved_against_the_artifact_index(orch):
+    """The other evidence shape: a gate requiring an artifact name, as the library's own gate does."""
+    run = _stub_run(orch)
+    run.outcome = {"nodes": {}, "artifacts": ["review-report"]}
+    run.gate = _terminal_gate(orch, requires=["review-report"])
+    assert orch._auto_pass(run, GoalPolicy().effective()) is True
+    assert run.gate is None
+
+
+def test_an_unrecordable_release_parks_rather_than_releasing_unrecorded(orch):
+    """If the ledger refuses the record, the release must not happen silently."""
+    from engine.org.ledger import LedgerError
+
+    run = _run_with_evidence(orch, nodes={"reviewer": {"status": "done", "summary": "reviewed"}})
+    run.gate = _terminal_gate(orch)
+
+    def _refuse(*_args, **_kwargs):
+        raise LedgerError("this gate already holds a decision")
+
+    orch.ledger.record = _refuse
+    assert orch._auto_pass(run, GoalPolicy().effective()) is False
+    assert run.gate is not None, "an unreleasable gate must stay parked for the Owner"
+
+
+def test_gate_evidence_separates_missing_from_present(orch):
+    """The report the refusal is based on, checked directly so the reason is never a guess."""
+    run = _run_with_evidence(orch, nodes={
+        "one": {"status": "done", "summary": "wrote something"},
+        "two": {"status": "pending", "summary": ""}})
+    report = orch._gate_evidence(run, _terminal_gate(orch, requires=["one.summary", "two.summary"]))
+    assert report["present"] == ["one.summary"]
+    assert report["missing"] == ["two.summary"]
+    assert report["complete"] is False
+
+
+def test_a_released_gate_is_not_detected_as_still_waiting(orch):
+    """A decided gate must stop being a gate.
+
+    The runner keeps a gate node's verdict (`awaiting_owner`) even after a release marks its status
+    `done`. A detector keyed on the verdict alone therefore re-parked a released run on the very gate
+    that had just been approved, so an unattended goal looped until `max_rounds` and never finished —
+    while the ledger correctly recorded a release that the engine then ignored.
+    """
+    state = {"nodes": {"release": {"status": "done", "verdict": "awaiting_owner"}}}
+    assert orch._detect_gate(state) is None, "a released gate is not waiting on anyone"
+
+    # The undecided gate is still detected, so the fix narrows the check rather than removing it.
+    pending = {"nodes": {"release": {"status": "needs_review", "verdict": "awaiting_owner"}}}
+    detected = orch._detect_gate(pending)
+    assert detected is not None and detected.gate_id == "release"
+
+
+def test_a_continuation_keeps_the_executor_the_run_started_with():
+    """A resume must not silently switch executors.
+
+    `resume_run` did not accept `extra_args`, so every continuation round after the first dropped the
+    caller's `--executor` and spawned the generated plugin instead. A run under a stub executor
+    therefore proved one thing in round one and something else in every later round.
+    """
+    import inspect
+
+    from engine.host import RunnerHost
+
+    signature = inspect.signature(RunnerHost.resume_run)
+    assert "extra_args" in signature.parameters, (
+        "resume_run must thread extra_args through, or a continuation loses its executor override")
+
+
 # ── the flow board ───────────────────────────────────────────────────────────
 
 
@@ -510,3 +711,235 @@ def test_an_attached_workspace_finds_its_run_by_slug(tmp_path):
     assert orch.load("some-workflow") is not None, "the workflow slug must resolve"
     assert orch.load("myapp") is not None, "the folder slug must resolve"
     assert orch.load(None) is not None
+
+# ── the whole point, end to end: a goal that finishes with nobody watching ────
+
+
+#: A graph with one producing node and a terminal human gate — the smallest shape that can either
+#: finish alone or park. `execute_node` satisfies the producer's declared checklist (the runner
+#: refuses `criteria_met` that names criteria the skill never declared) and parks the gate.
+_AUTOPROBE_MANIFEST = {
+    "name": "autoprobe",
+    "version": "1.0.0",
+    "description": "Unattended probe",
+    "payloads": {"handoff-v1": ["status", "summary"]},
+    "start": "dev",
+    "nodes": [{"id": "dev", "skill": "backend-developer", "outputs": ["change"]}],
+    "gates": [{"id": "release", "type": "gate", "kind": "human", "requires": ["change"],
+               "description": "Owner release approval"}],
+    "edges": [{"from": "dev", "to": "release", "when": "dev.status == done",
+               "payload": "handoff-v1"}],
+    "end": ["release"],
+}
+
+_AUTOPROBE_STUB = '''CRITERIA = ["c1", "c2", "c3"]
+
+
+def execute_node(node_id, state, ctx):
+    if node_id == "release":
+        return {"status": "needs_review", "verdict": "awaiting_owner",
+                "summary": "human gate reached", "evidence": ["gate:release"]}
+    return {"status": "done", "verdict": "ok", "summary": "implemented",
+            "evidence": ["src/app.py#abc"], "criteria_met": list(CRITERIA),
+            "artifacts": [{"name": "change", "path": "src/app.py", "sha": "abc123",
+                           "type": "change"}]}
+'''
+
+
+def _drive_to_completion(tmp_path, posture):
+    """Run the probe graph under a goal of the given posture, with the stub executor.
+
+    This is the verification that matters: it exercises `_run_with_goal` → `_auto_pass` →
+    `_release_terminal_gate` → `decide` → `_release_node_for_resume` → the next continuation round,
+    which is the whole chain the unit tests above only reach one call at a time.
+    """
+    from engine.bus import EventBus
+    from engine.goal import Posture
+    from engine.orchestrator import Orchestrator
+    from engine.planner import emit_safe_yaml
+    from engine.state import Workspace
+
+    ws = Workspace.for_project("autoprobe", root=tmp_path / "projects")
+    ws.ensure()
+    (ws.path / "autoprobe.yaml").write_text(emit_safe_yaml(_AUTOPROBE_MANIFEST))
+    (ws.path / "stub.py").write_text(_AUTOPROBE_STUB)
+    config = load(EXAMPLE)
+    config.goal.max_rounds = 3
+    bus = EventBus(run_id="autoprobe", history_size=4000)
+    orch = Orchestrator(config=config, library=_library(), workspace=ws, bus=bus)
+    orch.goal_set("ship the probe", armed=True, by="test",
+                  policy=GoalPolicy(posture=posture))
+    run = orch.adopt(ws.path / "autoprobe.yaml", slug="autoprobe")
+    orch.approve(run)
+    orch.execute(run, executor=ws.path / "stub.py")
+    return orch, run, ws
+
+
+def test_an_unattended_goal_finishes_the_run_with_no_human(tmp_path):
+    """The feature, stated as the user experiences it: point it at a plan and walk away."""
+    from engine.goal import Posture
+    from engine.orchestrator import RunPhase
+
+    orch, run, _ws = _drive_to_completion(tmp_path, Posture.UNATTENDED)
+    assert run.phase is RunPhase.DONE, f"expected a finished run, got {run.phase.value}"
+    assert run.gate is None, "the terminal gate was released, so nothing is waiting"
+
+    # And it is on the record as the goal's decision, not as the Owner's.
+    decisions = [d for d in run.decisions if d.get("by") == "goal"]
+    assert decisions, "an unattended run must record who released the gate"
+    recorded = orch.ledger.current("release")
+    assert recorded is not None, "the release must be in the ledger, not only in the trace"
+    assert (recorded.choice, recorded.by) == ("released", "goal")
+
+
+def test_a_supervised_goal_parks_the_identical_plan(tmp_path):
+    """The floor, verified on the same graph the autonomous case finishes.
+
+    Same manifest, same executor, same goal objective — only the posture differs. If this ever passes
+    while the test above fails, or vice versa, the posture is not what is deciding.
+    """
+    from engine.goal import Posture
+    from engine.orchestrator import RunPhase
+
+    orch, run, _ws = _drive_to_completion(tmp_path, Posture.SUPERVISED)
+    assert run.phase is RunPhase.AWAITING_GATE, "a supervised goal must park at the terminal gate"
+    assert run.gate is not None and run.gate.gate_id == "release"
+    assert not [d for d in run.decisions if d.get("by") == "goal"], (
+        "a supervised goal must make no decision on the Owner's behalf")
+    assert orch.ledger.current("release") is None, "nothing may be released without being asked"
+
+
+def test_the_unattended_run_stops_at_its_round_cap_rather_than_looping_forever(tmp_path):
+    """The bound that makes "no ceiling by default" survivable: `goal.max_rounds` is real.
+
+    It was documented and read by the orchestrator while no config field declared it, so only the
+    hardcoded fallback applied and no caller could tighten it. Declaring it is what makes this
+    assertion possible at all.
+    """
+    from engine.goal import Posture
+
+    orch, run, _ws = _drive_to_completion(tmp_path, Posture.UNATTENDED)
+    goal = orch.goal()
+    assert goal is not None
+    assert goal.spend.rounds <= 3, (
+        f"the run exceeded its configured round cap: {goal.spend.rounds} rounds")
+
+
+# ── the tier cap: a knob that must actually bound something ──────────────────
+
+
+def test_a_project_contained_write_is_not_an_elevated_capability():
+    """The misclassification that made the tier cap unenforceable.
+
+    `write:` is an elevated marker because an *unscoped* write is a grant the whole filesystem would
+    have to be trusted with. But every `write:` scored T3, so a workspace-scoped helper looked
+    identical to one requesting `deploy:prod` — and since `goal.auto_hire_max_tier` is configurable
+    only up to T2, the engine's own auto-created helper could not be admitted at *any* setting. The
+    cap was therefore unimplementable without turning auto-staffing off, which is how it came to be
+    documented but never enforced.
+    """
+    from engine.org.delegation import ApprovalTier, HiringDesk, Requisition
+
+    desk = HiringDesk.__new__(HiringDesk)
+    desk.approval_tiers = {}
+
+    def tier(capabilities):
+        request = Requisition(requester_id="g", kind="helper", skill="s",
+                              capabilities=list(capabilities), needed=["s"],
+                              why_existing_insufficient="x", expected_outcome="y")
+        return desk.classify_tier(request)[0]
+
+    # A subtree grant is contained — the tool layer refuses absolute, `~` and `..` paths, and
+    # anything resolving outside the workspace, so this cannot reach beyond the project.
+    assert tier(["read:*", "write:src/**"]) is not ApprovalTier.T3
+    assert tier(["read:src/**"]) is not ApprovalTier.T3
+
+    # What is genuinely unbounded or privileged still reaches the Owner.
+    for dangerous in (["write:*"], ["write:/etc"], ["write:../etc"], ["write:~"],
+                      ["deploy:prod/**"], ["admin:*"], ["exec:bash"]):
+        assert tier(dangerous) is ApprovalTier.T3, f"{dangerous} must stay gated"
+
+
+def test_the_tier_rank_orders_the_tiers_it_caps():
+    """The cap compares ordinals, so a tier added below it is admitted and one above is not."""
+    from engine.org.delegation import ApprovalTier
+    from engine.orchestrator import Orchestrator
+
+    assert Orchestrator._tier_rank(ApprovalTier.T0) == 0
+    assert Orchestrator._tier_rank(ApprovalTier.T3) == 3
+    # A shape this build does not recognise is treated as the most gated, not the least.
+    assert Orchestrator._tier_rank("mystery") == 3
+
+
+def test_the_default_cap_admits_the_engines_own_helper(tmp_path):
+    """The default must let the engine do the job the feature exists for.
+
+    Stated as a test because the tempting "fix" — gate the cap literally — would park every auto-hire
+    at the default setting, replacing a dead knob with a broken feature.
+    """
+    from engine.orchestrator import _AUTO_HELPER_CAPABILITIES
+
+    orch = _staff_orch(tmp_path)
+    tier, _why = orch._helper_tier(skill="backend-developer", provider="ollama",
+                                   model="qwen2.5-coder:7b", window=32768)
+    cap = int(orch.config.goal.auto_hire_max_tier)
+    assert orch._tier_rank(tier) <= cap, (
+        f"the engine's own helper is {tier.value} (capabilities {list(_AUTO_HELPER_CAPABILITIES)}), "
+        f"above the default cap T{cap}: auto-staffing could never run")
+
+    # And the real call still creates the helper.
+    run = _awaiting_run(orch)
+    result = orch._auto_staff(_plan("no-such-skill-anywhere"), enabled=None, run=run)
+    assert [c["skill"] for c in result["created"]] == ["no-such-skill-anywhere"]
+
+
+def test_a_cap_below_the_helpers_tier_reports_the_gap_instead_of_hiring(tmp_path):
+    """The cap must be able to fire, or it is still a dead knob.
+
+    Configured so even a scoped read counts as elevated, which is the only way the engine's helper can
+    outrank the cap — that the cap *can* refuse is the property being pinned.
+    """
+    from engine.bus import EventBus
+
+    ws = Workspace.for_project("capfire", root=tmp_path / "projects")
+    ws.ensure()
+    config = load(EXAMPLE)
+    config.goal.auto_hire_max_tier = 0
+    config.delegation.approval_tiers = {"elevated_capability_markers": ["read:", "write:"]}
+    bus = EventBus(run_id="r1", history_size=500)
+    orch = Orchestrator(config=config, library=_library(), workspace=ws, bus=bus)
+
+    tier, _why = orch._helper_tier(skill="backend-developer", provider="ollama",
+                                   model="qwen2.5-coder:7b", window=32768)
+    assert orch._tier_rank(tier) > 0, "this config is meant to make the helper outrank the cap"
+
+    run = _awaiting_run(orch)
+    before = len(orch.org.agents)
+    result = orch._auto_staff(_plan("no-such-skill-anywhere"), enabled=None, run=run)
+
+    assert result["created"] == [], "a helper above the cap must not be created"
+    assert len(orch.org.agents) == before
+    assert [g["skill"] for g in result["gaps"]] == ["no-such-skill-anywhere"], (
+        "the gap must be reported, so it reaches the Owner as work to staff rather than vanishing")
+
+    # And the refusal names the tier and the cap, so "why was this not staffed" has an answer.
+    gate = [e for e in bus.history() if e.type.value == "human.gate"]
+    assert gate, "a capped auto-hire must surface as something the Owner can see"
+    payload = gate[-1].payload
+    assert payload["waiting_on"] == "owner"
+    assert payload["cap"] == "T0" and payload["tier"] in ("T1", "T2", "T3")
+
+
+def test_the_classified_tier_and_the_created_helper_describe_the_same_agent(tmp_path):
+    """The cap bounds the real hire, so both must read one capability definition.
+
+    A cap computed from one capability set and a helper created with another would bound a fiction —
+    which is exactly the drift a duplicated literal invites.
+    """
+    from engine.orchestrator import _AUTO_HELPER_CAPABILITIES
+
+    orch = _staff_orch(tmp_path)
+    run = _awaiting_run(orch)
+    orch._auto_staff(_plan("no-such-skill-anywhere"), enabled=None, run=run)
+    helper = next(a for a in orch.org.agents.values() if a.skills == ["no-such-skill-anywhere"])
+    assert list(helper.capabilities) == list(_AUTO_HELPER_CAPABILITIES)

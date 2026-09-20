@@ -15,11 +15,21 @@ Sub-modules
 session     Session, SessionState, the turn-boundary state machine
 projection  the pre-flight estimate and the irreducible/reducible split
 compaction  the 70/85/95 ladder with AR-04 verbatim preservation
+cachealign  cache-first eviction: one contiguous run, chosen with the store's warm-prefix signal
 rotation    the three triggers, the three guards, and session_handoff.json
 assembly    new-session prompt ordering by attention zone
 """
 
 from .assembly import AssembledPrompt, AttentionZone, assemble_session_prompt
+from .cachealign import (
+    CacheVerdict,
+    EvictionPlan,
+    common_prefix_chars,
+    consult_store,
+    log_text,
+    plan_eviction,
+    prefix_hash_of,
+)
 from .compaction import CompactionAction, CompactionResult, compact, classify_band
 from .projection import Component, Projection, estimate_components, project
 from .rotation import (
@@ -44,10 +54,12 @@ __all__ = [
     "AssembledPrompt",
     "AttentionZone",
     "Band",
+    "CacheVerdict",
     "Component",
     "CompactionAction",
     "CompactionResult",
     "ContextBudgetError",
+    "EvictionPlan",
     "Projection",
     "RotationDecision",
     "RotationGuardError",
@@ -60,9 +72,14 @@ __all__ = [
     "assemble_session_prompt",
     "build_handoff",
     "classify_band",
+    "common_prefix_chars",
     "compact",
+    "consult_store",
     "decide_rotation",
     "estimate_components",
+    "log_text",
     "new_session_id",
+    "plan_eviction",
+    "prefix_hash_of",
     "project",
 ]

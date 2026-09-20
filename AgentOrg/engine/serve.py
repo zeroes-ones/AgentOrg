@@ -15,17 +15,27 @@ DESIGN
 ------
 - **stdout is the protocol, stderr is for humans.** A stray `print` on stdout corrupts the stream the
   app parses, so every diagnostic here goes to stderr. That rule is why the app can read stdout raw.
-- **`stdin` owns the control channel, and the run happens off it.** A run takes minutes; if the loop
-  blocked while executing, the app's `/pause` would queue behind the very work it is trying to pause.
-  So commands execute on a worker thread and the read loop stays responsive.
+- **`stdin` owns the control channel, commands run on a worker, and a run gets a thread of its own.**
+  A run takes minutes; if anything on the command path blocked while executing, the app's `/pause`
+  would queue behind the very work it is trying to pause. Taking the run off the *read* loop was not
+  enough: the worker is what answers `status` and `pause`/`abort`, so a run executing inline on it froze
+  the panels and made Pause a no-op until the run had already ended. So the worker dispatches, and
+  `start` executes its graph on a separate thread.
 - **Every command is acknowledged, always.** The app's `send` awaits a `command.ack` correlated by
   `cmd_id` and times out otherwise. An unacknowledged command is indistinguishable from a lost one, so
-  the ack is sent for failures too — with the reason.
+  the ack is sent for failures too — with the reason. That holds when the engine is stopping, when it
+  is behind, and when the output has died: a command that will not run is *refused*, by name, rather
+  than left in a queue nobody will empty.
 - **The event stream is the run's own bus.** Rather than inventing a second protocol, the run's
   `EventBus` is tapped and forwarded, so the UI sees exactly the events the engine already emits and
   the two cannot drift.
-- **EOF is a clean shutdown.** The app closes stdin when it stops; that must end the server rather than
-  leaving an orphan holding the project.
+- **EOF is a clean shutdown, and so is a stop signal.** The app closes stdin when it stops, and signals
+  SIGTERM moments later; both must end this process through the same path — drain the commands already
+  accepted, refuse what will not run — rather than killing it where it stands. A drain is therefore
+  *bounded* (see `_DRAIN_TIMEOUT_S`) and its expiry is spoken, not silent.
+- **The transport never raises into the work.** `emit` is on the ack path, so a write that fails marks
+  the output dead and stops the server deliberately: an engine that cannot write cannot answer, and one
+  that keeps reading commands anyway is worse than one that stops and says why.
 
 Usage:
     python3 -m engine.cli serve
@@ -34,9 +44,11 @@ Usage:
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -53,6 +65,69 @@ class ServerError(RuntimeError):
     """A server problem worth naming rather than surfacing as a traceback on stdout."""
 
 
+#: Returned by a handler that has taken over its own acknowledgement for a command, so the command
+#: worker must not send one. Only `start` does this: it hands the graph to a run thread (see
+#: `_start_run`) and the ack is that run's outcome, sent when the graph settles.
+_ACK_DEFERRED = object()
+
+
+class _StopRequested(Exception):
+    """Raised by the SIGTERM handler to break a read that is parked on stdin.
+
+    A stop *flag* cannot do it. PEP 475 retries an interrupted syscall once a signal handler returns
+    without raising, so a loop blocked in `for line in self.stdin` would sit there with the flag set —
+    an engine that ignores SIGTERM while believing it is stopping, which is worse than the default
+    action it replaced. This is the same mechanism Ctrl-C has always used here; it is caught at the
+    read loop so the ordinary drain and shutdown still run.
+    """
+
+#: How long a graceful stop waits for a command the worker has **already started**.
+#:
+#: This is the budget for a worker command to reach its ack, and it is chosen against a measured
+#: failure rather than a feeling: with 10s here plus `_shutdown`'s 2s join, a handler that ran longer
+#: than ~12s was killed mid-command and its ack never went out — the work done and the answer lost,
+#: which is the worst shape of bug in this module because the app cannot tell it from a lost command.
+#: The commands that run on the worker are bounded work (a status snapshot, a roster edit, a goal
+#: arm), and the slowest of them measured cold is a few seconds; 60s is an order of magnitude of
+#: headroom, and it stays bounded so a wedged handler cannot hold the engine open forever — at which
+#: point `_shutdown` *says* which commands it is refusing instead of exiting on top of them.
+_DRAIN_TIMEOUT_S = 60.0
+
+#: The same wait once a stop **signal** has arrived. The app signals SIGTERM and then SIGKILLs this
+#: process after its own 5s grace (`AgentProcessService.terminationGrace`), so a drain longer than
+#: that is a drain that gets killed halfway — the exit must fit inside the grace to be orderly at all.
+#: 4s leaves the kill a second of margin.
+_SIGNAL_DRAIN_S = 4.0
+
+#: How long `_stop_now` lets the main thread exit through its own orderly path before force-exiting.
+#: Force-exiting is the last resort it always was, but "last" now means "after the process had its
+#: chance", not "immediately, possibly mid-write".
+_STOP_NOW_GRACE_S = 3.0
+
+#: How long `_shutdown` waits for the worker to notice the stop sentinel. The drain has already
+#: waited for the work, so this is a formality — the worker is idle-blocked and wakes in ≤0.2s.
+_SHUTDOWN_JOIN_S = 2.0
+
+#: How long `_shutdown` gives a still-live run's runner to exit after SIGTERM before it is SIGKILLed.
+#:
+#: Not `host.shutdown_runners`' 2s default: on a stop *signal* the drain has already been capped at
+#: `_SIGNAL_DRAIN_S` (4s) of the app's 5s SIGKILL grace (`AgentProcessService.terminationGrace`), so
+#: the runner's own grace has to fit in what is left — 0.5s leaves the host's 1s post-kill `wait()` a
+#: margin inside that second, while still staging SIGTERM before SIGKILL rather than killing at once.
+_RUNNER_SHUTDOWN_GRACE_S = 0.5
+
+#: The most commands that may wait for the worker before the engine refuses new ones.
+#:
+#: The queue was unbounded, so an app sending faster than the worker drains grew it without limit —
+#: an engine that looks healthy and answers later and later, holding memory for commands whose answers
+#: nobody is waiting for any more. The bound is deliberately loose: the app awaits each command's ack
+#: (`send` is an `async` round trip), so a well-behaved client has a handful outstanding at most, and
+#: the queue only legitimately holds a burst the worker has not reached yet. Exceeding 512 therefore
+#: means a client that is not waiting for its answers, and the honest response is a refusal naming the
+#: backlog rather than a promise to catch up.
+_COMMAND_QUEUE_MAX = 512
+
+
 def _log(message: str) -> None:
     """Diagnostics go to stderr. stdout belongs to the protocol and a stray line corrupts it.
 
@@ -65,6 +140,29 @@ def _log(message: str) -> None:
         print(message, file=sys.stderr, flush=True)
     except (BrokenPipeError, ValueError, OSError):
         pass
+
+
+def _directory_bytes(path: Any) -> int:
+    """Total bytes under a directory, for the "what would I lose" preview.
+
+    Every `stat` is guarded: this walks a folder the person may be actively running in, so a file can
+    vanish between the walk listing it and the size being read. An unreadable file contributes nothing
+    rather than aborting the count, because a preview that raised would leave the confirmation with no
+    number at all — and "I could not measure it" is a better answer than "remove anyway".
+    """
+    from pathlib import Path
+
+    total = 0
+    try:
+        for entry in Path(path).rglob("*"):
+            try:
+                if entry.is_file():
+                    total += entry.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return total
 
 
 @dataclass
@@ -102,14 +200,62 @@ class Server:
         self.stdin = self.stdin if self.stdin is not None else sys.stdin
         self.stdout = self.stdout if self.stdout is not None else sys.stdout
         self._seq = 0
+        #: Guards the *transport*: `emit`'s seq/write pair. It is an RLock because `emit` can be
+        #: re-entered (`ack` calls it) — and, critically, it is held across a **blocking** write, so
+        #: nothing on the shutdown path may take it. The in-flight counter has its own lock for exactly
+        #: that reason (see `_flight_lock`).
         self._lock = threading.RLock()
-        self._commands: "queue.Queue[Command | None]" = queue.Queue()
+        self._commands: "queue.Queue[Command | None]" = queue.Queue(maxsize=_COMMAND_QUEUE_MAX)
         self._worker: threading.Thread | None = None
         self._stop = threading.Event()
+        #: The worker's own lock: taken only to move `_in_flight`, never held across I/O. A counter
+        #: shared with `emit` was the defect — `_drain` read it in another thread and could be blocked
+        #: behind a write to a pipe the app had stopped reading, which delayed exactly the decision it
+        #: was making.
+        self._flight_lock = threading.Lock()
+        #: Woken when a command is queued, so the worker picks it up without polling for it.
+        self._work_ready = threading.Event()
+        #: Set when a write to stdout fails. The app's read end is gone: answers now have nowhere to
+        #: go, so the engine stops itself deliberately instead of raising through an ack.
+        self._output_dead = threading.Event()
+        #: Why the engine is stopping, in the client's words. Set by `shutdown`, a stop signal, a dead
+        #: output, or a drain that gave up; used to word the refusals for commands that will not run.
+        self._stop_reason = ""
+        #: The command the worker is executing right now, so `_shutdown` can answer it if the engine
+        #: exits on top of it rather than leaving the app waiting on a reply that will never come.
+        self._current_cmd: Command | None = None
+        #: A ceiling on the current drain, set by a stop signal that has a shorter grace than the drain
+        #: (see `_SIGNAL_DRAIN_S`). Read on every pass, so a signal arriving mid-drain still counts.
+        self._drain_cap: float | None = None
+        #: The signal handlers this server displaced, so they can be put back when it stops. A caller
+        #: that keeps running after `serve_forever` must not inherit our handlers.
+        self._previous_signals: dict[int, Any] = {}
+        #: True while `serve_forever` is in its read phase — from the readiness handshake to the end of
+        #: the loop. A stop signal raises only while it is set, so the raise lands in the loop rather
+        #: than in the shutdown that follows it (see `_on_stop_signal`). Only the main thread writes it.
+        self._reading = False
+        #: Fallback ids for commands the app sent without one. `itertools.count` rather than the clock:
+        #: a millisecond timestamp collided for two untagged commands in the same millisecond, and two
+        #: commands sharing a `cmd_id` are indistinguishable to the client that correlates on it.
+        self._cmd_ids = itertools.count(1)
+        #: Why the portfolio could not be read, when it could not. Empty means no failure — either the
+        #: register was read or there genuinely is none. Kept because "I could not read your register"
+        #: and "you have no register" must not lead to the same action (see `_cmd_portfolio_add`).
+        self._portfolio_error = ""
         self._forwarded: set[int] = set()
-        #: Commands currently being executed by the worker. `_drain` waits on this together with the
-        #: queue, because an in-flight command has already left the queue and would otherwise be
-        #: mistaken for nothing to wait for.
+        #: The thread executing a graph, when one is live. Read by `_cmd_start` to refuse a second run
+        #: and by nothing else — the orchestrator's own `running` flag is set *after* `execute` starts,
+        #: so it cannot answer "is a graph executing right now" in the window between the two.
+        self._run_thread: threading.Thread | None = None
+        #: Commands the worker has taken off the queue and not finished. `_drain` waits on this
+        #: together with the queue, because an in-flight command has already left the queue and would
+        #: otherwise be mistaken for nothing to wait for.
+        #:
+        #: It counts only what the *worker* is running — a graph handed to its own thread is not
+        #: counted here. It used to be, so that a stop during a run waited for the run exactly as the
+        #: worker's own commands do; but a run takes minutes and `_drain` is bounded, so that wait could
+        #: only ever time out (delaying the exit by its full length while the run was killed anyway).
+        #: The run's ack belongs to the run, and `_shutdown` says so plainly when one is still live.
         self._in_flight: int = 0
         #: The shared discovery catalog. Built lazily on first use and dropped by `_reload_config`,
         #: so its TTL cache survives across polls instead of being thrown away each time.
@@ -118,10 +264,20 @@ class Server:
     # ── the transport ───────────────────────────────────────────────────────
 
     def emit(self, event: Event | dict[str, Any]) -> None:
-        """Write one event as a single line.
+        """Write one event as a single line. **Never raises.**
 
         Serialised under a lock because two threads emit: the worker handling a command and the run's
         own bus forwarding events. Interleaved writes would produce a line the app cannot parse.
+
+        The write itself is guarded for the same reason `_log` guards stderr, and the reason matters
+        more here: `emit` is on the **ack path**. When the app's read end closes — it is gone, or it
+        stopped reading — `stdout.write` raises `BrokenPipeError`, and an `emit` that propagated it
+        killed the worker from inside an acknowledgement: the first ack raised, the `except` in `_work`
+        tried to ack the *failure* (raising again), and the thread died with the engine still reading
+        commands and exit code 0. Measured before this guard: three queued commands, zero acks, worker
+        dead, queue still holding all three, and the app waiting 600s per command against an engine
+        that looked healthy. So a write failure is not raised to the caller: it marks the output dead
+        and stops the server deliberately, which is a stop the engine can describe.
         """
         with self._lock:
             self._seq += 1
@@ -139,8 +295,50 @@ class Server:
             except (TypeError, ValueError) as exc:
                 _log(f"cannot serialise an event: {exc}")
                 return
-            self.stdout.write(line + "\n")
-            self.stdout.flush()
+            try:
+                self.stdout.write(line + "\n")
+                self.stdout.flush()
+            except (BrokenPipeError, ValueError, OSError) as exc:
+                # Nothing on this path may raise: the caller may be an ack, a run's event forward, or
+                # a refusal being written during shutdown.
+                self._output_failed(exc)
+
+    def _output_failed(self, exc: BaseException) -> None:
+        """The app's read end is gone: record it once, and stop the server on purpose.
+
+        Stopping rather than continuing is the honest reading of a failed write. stdout *is* the
+        protocol — every event, including every acknowledgement, goes through it — so an engine that
+        cannot write cannot answer anything, and a command it still "accepts" is a command whose
+        answer will never arrive. Continuing would leave the app waiting on replies from an engine
+        that looks alive; this way the read loop unwinds, `_drain` refuses what will not run, and the
+        process exits with a log line naming the reason.
+
+        Idempotent: the writes that follow (the refusals themselves) fail too, and each must be a
+        no-op rather than another stop.
+        """
+        if self._output_dead.is_set():
+            return
+        self._output_dead.set()
+        self._stop.set()
+        self._stop_reason = "the app stopped reading the engine's output"
+        _log(f"serve: cannot write an event ({exc}); stopping after the current command")
+        try:
+            self._commands.put_nowait(None)
+        except queue.Full:
+            pass
+        self._work_ready.set()
+        if self.stdout is sys.stdout:
+            # Point the interpreter's own stdout somewhere harmless. CPython flushes `sys.stdout` as it
+            # exits, and *that* flush fails too against the same dead pipe — measured: a deliberate stop
+            # left "Exception ignored while flushing sys.stdout: BrokenPipeError" on stderr and exit code
+            # **120** instead of 0. Both are what a crash looks like: the app shows engine stderr in its
+            # diagnostics and reports a non-zero exit as a failure, so a stop the engine chose would
+            # read as a crash it did not. Only when this really is the process's own stdout — an injected
+            # stream (a test, a caller) is not the interpreter's and is left exactly as it was.
+            try:
+                sys.stdout = open(os.devnull, "w")  # noqa: SIM115 - the process is about to exit
+            except OSError:  # pragma: no cover - devnull unavailable is not worth failing a stop over
+                pass
 
     def ack(self, cmd_id: str, *, ok: bool, detail: dict[str, Any] | None = None,
             error: str | None = None) -> None:
@@ -151,44 +349,154 @@ class Server:
     # ── the loop ────────────────────────────────────────────────────────────
 
     def serve_forever(self) -> int:
-        """Read commands until EOF, executing each off the read loop. Returns an exit code."""
+        """Read commands until EOF, executing each off the read loop. Returns an exit code.
+
+        Every way this ends — EOF, a stop signal, a `shutdown` command, an output that died — goes
+        through the same `_drain` and `_shutdown`, so what the app has already sent is either run and
+        acknowledged, or refused with a reason. None of them is a silent exit.
+        """
         _log(f"agentorg serve: project={self.workspace.path} pid={_pid()}")
-        # The readiness handshake, first on the wire. The console cannot otherwise tell a live engine
-        # from a spawned-but-doomed one: a bootstrap failure is a process that exists for a moment and
-        # exits, and the app used to call that "running". This frame is emitted *after* the workspace,
-        # config and providers are all resolved, so receiving it means the engine really is usable —
-        # and anything that stops it before here is reported by the app as a failure, not a success.
-        self.emit(Event(seq=0, type=EventType.ENGINE_READY,
-                        payload={"pid": _pid(), "project": str(self.workspace.path),
-                                 "slug": self.slug,
-                                 "providers": sorted(getattr(self.config, "providers", {}) or {})}))
-        self.emit(Event(seq=0, type=EventType.AGENT_LOG,
-                        payload={"text": "engine ready", "stream": "stderr"}))
-        self._worker = threading.Thread(target=self._work, name="agentorg-serve", daemon=True)
-        self._worker.start()
-        self._watch_parent()
+        # Signals first, so a stop that arrives during bootstrap is not the default action. See
+        # `_install_signal_handlers`: without this the app's Stop killed the process in milliseconds and
+        # the drain below never ran at all.
+        self._install_signal_handlers()
+        # Everything from here to the end of the read loop runs with `_reading` set, so a stop signal
+        # that arrives anywhere in this window breaks the read (see `_on_stop_signal`). It has to cover
+        # the handshake too, not just the loop: a signal during bootstrap would otherwise set a flag
+        # nothing looks at, and this process would sit in a read the flag cannot interrupt.
+        self._reading = True
         try:
+            # The readiness handshake, first on the wire. The console cannot otherwise tell a live engine
+            # from a spawned-but-doomed one: a bootstrap failure is a process that exists for a moment and
+            # exits, and the app used to call that "running". This frame is emitted *after* the workspace,
+            # config and providers are all resolved, so receiving it means the engine really is usable —
+            # and anything that stops it before here is reported by the app as a failure, not a success.
+            self.emit(Event(seq=0, type=EventType.ENGINE_READY,
+                            payload={"pid": _pid(), "project": str(self.workspace.path),
+                                     "slug": self.slug,
+                                     "providers": sorted(getattr(self.config, "providers", {}) or {})}))
+            self.emit(Event(seq=0, type=EventType.AGENT_LOG,
+                            payload={"text": "engine ready", "stream": "stderr"}))
+            self._worker = threading.Thread(target=self._work, name="agentorg-serve", daemon=True)
+            self._worker.start()
+            self._watch_parent()
             for line in self.stdin:
-                if self._stop.is_set():
-                    break
                 line = line.strip()
                 if not line:
                     continue
                 command = self._parse(line)
                 if command is None:
                     continue
-                self._commands.put(command)
-        except (KeyboardInterrupt, BrokenPipeError):
+                if self._stop.is_set():
+                    # Read *after* the engine was told to stop: the worker will not take it — its loop
+                    # has already ended — so it is refused here, with the same reason the queue gets.
+                    # Breaking without this answered a command the app had already sent with silence.
+                    self._refuse(command, self._stop_reason or "the engine is stopping")
+                    break
+                try:
+                    self._commands.put_nowait(command)
+                except queue.Full:
+                    # Refused rather than queued: a queue that grows without limit is an engine that
+                    # answers later and later while looking healthy, and the app would wait on an
+                    # answer it cannot date. Saying "I am behind, and by this much" is an answer.
+                    self._refuse(command,
+                                 f"the engine is behind: {self._commands.maxsize} commands are "
+                                 "already queued and have not run")
+                    continue
+                self._work_ready.set()
+        except (KeyboardInterrupt, BrokenPipeError, _StopRequested):
             pass
         except OSError as exc:
             _log(f"serve: stdin failed: {exc}")
         finally:
-            # Drain the queue before stopping. EOF arrives as soon as the writer closes stdin, which
-            # can be well before the worker has executed what was already read — stopping first would
-            # drop those commands' acks and leave the app waiting on a reply that never comes.
-            self._drain()
-            self._shutdown()
+            self._reading = False
+            try:
+                # Drain the queue before stopping. EOF arrives as soon as the writer closes stdin, which
+                # can be well before the worker has executed what was already read — stopping first would
+                # drop those commands' acks and leave the app waiting on a reply that never comes.
+                self._drain()
+                self._shutdown()
+            except _StopRequested:
+                # A further stop signal arrived *while* the engine was stopping. There is nothing left to
+                # break: the shutdown in progress is already the orderly path, and its refusals are what
+                # the app is owed. Swallowed so a second SIGTERM cannot turn a clean stop into a
+                # traceback.
+                _log("serve: a further stop signal arrived while the engine was already stopping")
+            finally:
+                self._restore_signal_handlers()
         return 0
+
+    def _install_signal_handlers(self) -> None:
+        """Handle SIGTERM and SIGINT, so both unwind through `_drain`/`_shutdown`.
+
+        **SIGTERM was the app's Stop path, and it never reached the drain.** The app closes the command
+        pipe and then signals (`AgentProcessService.terminate`, which says in its own comment that the
+        engine "finishes the command in flight, writes its checkpoint, and exits"); Python's default
+        SIGTERM action kills the process in milliseconds, so the drain that *would* have run on the EOF
+        was cut off, and no acknowledgement ever went out. That comment described behaviour this file
+        did not have. A handler that sets the stop flag — and, when the read is parked, breaks it — is
+        what makes it true.
+
+        **SIGINT keeps raising `KeyboardInterrupt`**, because a flag alone cannot unwind a read loop
+        parked on a terminal: PEP 475 retries an interrupted syscall once the handler returns, so the
+        loop would sit there with the stop flag set until the next line arrived. The exception is
+        already the loop's own exit path (it is caught at the `try` above), so Ctrl-C behaves exactly
+        as it did, with the stop flag now set as well.
+
+        Installing is skipped outside the main thread — `signal.signal` refuses there, and more to the
+        point, a test or a library driving this server in a thread must not have its own signals
+        rewritten.
+        """
+        if threading.current_thread() is not threading.main_thread():
+            return
+        for signum, handler in ((signal.SIGTERM, self._on_stop_signal),
+                                (signal.SIGINT, self._on_interrupt_signal)):
+            try:
+                self._previous_signals[signum] = signal.signal(signum, handler)
+            except (ValueError, OSError, AttributeError) as exc:  # pragma: no cover - platform limit
+                _log(f"serve: could not handle signal {signum}: {exc}")
+
+    def _restore_signal_handlers(self) -> None:
+        """Put back what we replaced, so a caller that keeps running after `serve_forever` — the CLI,
+        or a test that drives the loop and then asserts on its own signals — is not left with ours."""
+        if threading.current_thread() is not threading.main_thread():
+            return
+        for signum, previous in self._previous_signals.items():
+            try:
+                signal.signal(signum, previous)
+            except (ValueError, OSError, TypeError):  # pragma: no cover - platform limit
+                pass
+        self._previous_signals.clear()
+
+    def _on_stop_signal(self, signum: int, frame: Any) -> None:
+        """SIGTERM: stop deliberately, in time to exit before the app's SIGKILL.
+
+        The signal names the reason and caps the drain, because this process is on a clock: the app
+        sends SIGKILL 5s after signalling, so waiting the full drain here would only be cut off
+        mid-ack — the exit has to fit inside the grace to be orderly at all.
+
+        It raises, rather than only setting the flag, so a read parked on stdin actually ends. The
+        app's own path closes the pipe *before* signalling, so normally EOF has already unwound the
+        loop and the raise never happens; a `kill` on a terminal-launched engine has no EOF to rely on,
+        and there the raise is the difference between stopping and appearing to ignore the signal. Only
+        while `_reading` is set: an exception raised out of the shutdown that a *previous* signal
+        started would abandon the refusals the app is owed, and `serve_forever` has already put the
+        stop flag where that shutdown will see it.
+        """
+        self._stop_reason = self._stop_reason or f"the app asked the engine to stop (signal {signum})"
+        self._stop.set()
+        self._drain_cap = _SIGNAL_DRAIN_S
+        self._work_ready.set()
+        if self._reading:
+            raise _StopRequested
+
+    def _on_interrupt_signal(self, signum: int, frame: Any) -> None:
+        """SIGINT: mark the stop, then raise, which is how the loop has always unwound on Ctrl-C."""
+        self._stop_reason = self._stop_reason or "the engine was interrupted"
+        self._stop.set()
+        self._drain_cap = _SIGNAL_DRAIN_S
+        self._work_ready.set()
+        raise KeyboardInterrupt
 
     def _watch_parent(self) -> None:
         """Exit if the app that started us goes away, whatever the pipe says.
@@ -243,21 +551,53 @@ class Server:
         threading.Thread(target=_poll_ppid, name="agentorg-parent-watch", daemon=True).start()
 
     def _stop_now(self) -> None:
-        """Stop immediately: unblock the read loop, then exit without waiting to be collected.
+        """Stop now, but give the main thread its own orderly exit before forcing one.
 
         An engine whose app is gone has no client, no acknowledgements to send, and a project it should
-        release, so it exits rather than lingering. `os._exit` rather than a clean return because the
-        read loop is parked on stdin, which may never see EOF — the very condition that brought us here.
+        release, so it exits rather than lingering — and `os._exit` is still how, because the read loop
+        is parked on stdin, which may never see EOF: the very condition that brought us here.
+
+        What changed is that `os._exit` is the **last resort** rather than the first move. Called
+        straight away from the watchdog thread it killed the process mid-write, with no drain and no
+        `_shutdown`, for no stated gain — the app is gone either way, but a half-written frame and a
+        half-finished command are artifacts a debugging session has to explain. So: set the stop, wake
+        whatever is blocked on the queue, close the read end (which is what unblocks the loop where the
+        platform honours it), and let the main thread run its own drain and shutdown. Only if it is
+        still going after `_STOP_NOW_GRACE_S` is the process taken down beneath it.
         """
         self._stop.set()
-        self._commands.put(None)
+        self._stop_reason = self._stop_reason or "the app that started the engine is gone"
+        try:
+            self._commands.put_nowait(None)
+        except queue.Full:
+            pass
+        self._work_ready.set()
         try:
             os.close(0)
         except OSError:
             pass
+        main = threading.main_thread()
+        if main is not threading.current_thread():
+            main.join(_STOP_NOW_GRACE_S)
+        # `os._exit` skips `atexit`, so the runner reap the host registers there never runs on this
+        # path — and a runner that outlives the engine keeps executing and keeps spending against the
+        # same checkpoint while the app shows the run as stopped. Local import to match this module's
+        # convention (the protocol is the only module-level import it carries). The default grace is
+        # used here: the app that started us is gone, so there is no SIGKILL grace to fit inside.
+        #
+        # Swallowed without logging, deliberately: stderr is the dead app's pipe and a write to it
+        # raises `BrokenPipeError`, so a diagnostic here would stop `os._exit` from ever running —
+        # turning a failed reap into a process that lingers, which is the exact failure this whole
+        # path exists to prevent.
+        try:
+            from .host import shutdown_runners
+
+            shutdown_runners()
+        except Exception:  # noqa: BLE001 - a failed reap must not hold the force-exit
+            pass
         os._exit(0)
 
-    def _drain(self, timeout_s: float = 10.0) -> None:
+    def _drain(self, timeout_s: float = _DRAIN_TIMEOUT_S) -> None:
         """Wait until the worker has *finished* what it was given, bounded so a wedged command cannot
         hang exit.
 
@@ -267,14 +607,101 @@ class Server:
         ack never went out, and the app sat waiting for a reply to a command that had actually
         succeeded. That is the worst shape of bug here: the work is done and the answer is lost.
 
-        So the worker reports what it is doing, and this waits on that. A counter rather than a flag,
-        because the worker is single-threaded today but the invariant should not depend on that.
+        So the worker reports what it is doing, and this waits on that — under its own lock, and with
+        the pop and the count taken together (`_take_command`), because a read that lands between the
+        pop and the increment reads "queue empty, nothing in flight" while a command has already left
+        the queue and has not started. That window is one GIL slice wide, which is why it passed for so
+        long and then failed under load — the three flaky tests in this area were not a slow handler,
+        they were this: `_drain` returned at once, `_shutdown`'s 2s join expired, and the ack landed
+        after the process had already returned.
+
+        Two bounds, deliberately. The wait is `timeout_s` (60s, see `_DRAIN_TIMEOUT_S`) for a worker
+        command, capped by `_drain_cap` when a stop signal has arrived with a shorter grace than that.
+        Once the stop flag is set — a `shutdown` command, a signal, a dead output — the *queue* is not
+        waited for at all: the worker ends after the command it is on, so nothing else in the queue can
+        run, and the honest thing is to refuse those commands now rather than hold the exit open for
+        work that will never happen.
         """
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            if self._commands.empty() and self._in_flight == 0:
+        entered = time.time()
+        while True:
+            cap = self._drain_cap
+            bound = timeout_s if cap is None else min(timeout_s, cap)
+            with self._flight_lock:
+                in_flight = self._in_flight
+            if in_flight == 0 and (self._stop.is_set() or self._commands.empty()):
+                return
+            if time.time() >= entered + bound:
+                self._stop_reason = (f"the engine gave up waiting after {bound:.0f}s with a command "
+                                     "still running")
+                _log(f"serve: {self._stop_reason}")
                 return
             time.sleep(0.02)
+
+    def _take_command(self) -> tuple[Any, bool]:
+        """Pop one command and take its in-flight token **together**. Returns `(command, taken)`.
+
+        One lock hold for both, because they are one fact: "this command has left the queue" and "this
+        command is running" must never be observable apart. Split across two statements — as they were —
+        `_drain` in another thread could see the queue empty and the counter zero in between, conclude
+        there was nothing to wait for, and let `_shutdown` kill the worker mid-command.
+
+        `False` means the queue was empty: not the `None` sentinel, which is a command-shaped value
+        meaning "stop" and does take a token (released immediately by the caller).
+        """
+        with self._flight_lock:
+            try:
+                command: Any = self._commands.get_nowait()
+            except queue.Empty:
+                return None, False
+            self._in_flight += 1
+            return command, True
+
+    def _release_flight(self) -> None:
+        """Give back one in-flight token. In `finally` blocks, so a crashing command cannot leave the
+        counter stuck and turn every later bounded wait into a full-length stall."""
+        with self._flight_lock:
+            self._in_flight -= 1
+
+    def _refuse(self, command: Command, reason: str, *, ran: bool = False) -> None:
+        """Answer a command that will **not** be run, with the reason. Never raises, never silent.
+
+        Every command is acknowledged — that is the contract at the top of this file — and it does not
+        get weaker when the engine is stopping or behind. An unacknowledged command is
+        indistinguishable from a lost one, so the app waits its full 600s budget on a reply that is
+        never coming; a refusal with a reason at least says which engine state it hit.
+        """
+        error = (f"{reason}; this command was still running, so its result will not arrive"
+                 if ran else f"{reason}; this command was queued but never ran")
+        self.ack(command.cmd_id, ok=False, error=error)
+
+    def _refuse_pending(self, reason: str) -> list[str]:
+        """Answer everything left over: the queue, and the command the worker is still inside.
+
+        Called once at shutdown, after the drain has either finished the work or given up on it. The
+        worker's own ack is the one that *should* answer the in-flight command, so this only speaks for
+        it when the worker is still inside it — `_current_cmd` is cleared in the worker's `finally`, so
+        a command that completed, even one that failed, has already been answered and is not touched
+        here. (A command that completes in the microseconds between that check and this ack would be
+        answered twice; the second ack names a command the app has already resolved, which it ignores,
+        and the alternative — never answering — is the failure this whole method exists to prevent.)
+        """
+        refused: list[str] = []
+        while True:
+            try:
+                command = self._commands.get_nowait()
+            except queue.Empty:
+                break
+            if command is None:
+                continue
+            refused.append(command.cmd_id)
+            self._refuse(command, reason)
+        current = self._current_cmd
+        if current is not None:
+            refused.append(current.cmd_id)
+            self._refuse(current, reason, ran=True)
+        if refused:
+            _log(f"serve: refused {len(refused)} command(s) that would not run: {', '.join(refused)}")
+        return refused
 
     def _parse(self, line: str) -> Command | None:
         """Parse one command line, reporting a malformed one without dying.
@@ -291,51 +718,121 @@ class Server:
             _log("serve: ignoring a command with no type")
             return None
         return Command(
-            cmd_id=str(data.get("cmd_id") or f"cmd_{int(time.time() * 1000)}"),
+            # The fallback id is per-process unique. A millisecond timestamp was not: two untagged
+            # commands in the same millisecond produced one `cmd_id`, and the app correlates its
+            # answers on that id — two commands answering to one name is a reply the app attributes to
+            # the wrong command. (The app always sends its own id; this is the path a hand-written
+            # line or a third-party client takes.)
+            cmd_id=str(data.get("cmd_id") or f"cmd_{_pid()}_{next(self._cmd_ids)}"),
             type=str(data["type"]),
             payload=data.get("payload") if isinstance(data.get("payload"), dict) else {},
         )
 
     def _work(self) -> None:
-        """Execute queued commands, one at a time, off the read loop."""
+        """Dispatch queued commands, one at a time, off the read loop.
+
+        **Dispatch, not execute.** A command whose work outlives the call — `start` — hands its graph to
+        a thread of its own, because this worker is what answers the app's 2s `status` poll and, far more
+        importantly, its `pause`/`abort`. Executing a run inline here queued all of those behind the very
+        run they were meant to act on: the panels froze and Pause did nothing until the run had ended.
+
+        The loop takes each command and its in-flight token in one hold of `_flight_lock`, and waits for
+        the next one on an event rather than a blocking `get` — a blocking `get` cannot also take the
+        token, and a token taken *before* the pop would be held while idle, which would make `_drain`
+        wait for a worker that is doing nothing.
+        """
         while not self._stop.is_set():
-            try:
-                command = self._commands.get(timeout=0.2)
-            except queue.Empty:
+            command, taken = self._take_command()
+            if not taken:
+                self._work_ready.wait(0.2)
+                self._work_ready.clear()
                 continue
             if command is None:
+                self._release_flight()
                 return
-            # Marked before the work, so `_drain` cannot conclude "nothing running" while this is
-            # inside `handle()`. Decremented in `finally` so a crashing command cannot leave the
-            # counter stuck and turn a bounded wait into a 10-second stall on every exit.
-            with self._lock:
-                self._in_flight += 1
+            self._current_cmd = command
             try:
                 detail = self.handle(command)
-                self.ack(command.cmd_id, ok=True, detail=detail or {})
+                if detail is not _ACK_DEFERRED:
+                    self.ack(command.cmd_id, ok=True, detail=detail or {})
             except Exception as exc:  # noqa: BLE001 - one bad command must not kill the server
                 _log(f"serve: command {command.type!r} failed: {exc}")
                 self.ack(command.cmd_id, ok=False, error=str(exc))
             finally:
-                with self._lock:
-                    self._in_flight -= 1
+                self._current_cmd = None
+                # Released for every command, `_ACK_DEFERRED` included: the token means "the worker is
+                # on this command", and after a handoff it is not — the run owns the rest of the work
+                # and answers on its own thread. Holding it here would leave the counter stuck at one
+                # for the whole run, which is exactly the wait `_drain` must not make.
+                self._release_flight()
 
     def _shutdown(self) -> None:
+        """Stop the worker, answer anything that will not run, and say what was left.
+
+        The refusals are the part that did not exist. A `shutdown` command — or any stop — ends the
+        worker after the command it is on, so everything else in the queue used to sit there: measured,
+        one ack for three commands, and an engine that exited 0 with the other two never answered. The
+        app has no deadline for that; it waits 600s per command. So the queue is drained here by
+        *answering* it, as a refusal naming the reason, and the in-flight command is named too when the
+        drain gave up on it.
+        """
         self._stop.set()
-        self._commands.put(None)
-        if self._worker is not None and self._worker.is_alive():
-            self._worker.join(timeout=2.0)
+        try:
+            self._commands.put_nowait(None)
+        except queue.Full:
+            pass
+        self._work_ready.set()
+        with self._flight_lock:
+            busy = self._in_flight
+        # Joined only when the worker is *between* commands. The join is what lets it notice the stop
+        # sentinel and return; a worker still inside a command cannot be helped by waiting longer — the
+        # drain already gave that command its full bound — and two more seconds here is two seconds
+        # taken off the app's 5s grace before it SIGKILLs us, for nothing.
+        if not busy and self._worker is not None and self._worker.is_alive():
+            self._worker.join(timeout=_SHUTDOWN_JOIN_S)
+        self._refuse_pending(self._stop_reason or "the engine is stopping")
+        # The run thread is *not* joined: it is a daemon and a graph takes minutes. A stop during a run
+        # therefore ends the run where it is — said out loud rather than silently, because a run that is
+        # running when the process ends leaves a checkpoint that still says "running" and no verdict on
+        # the wire. (Aborting it properly would mean `Orchestrator.abort` → `Host._terminate`, which
+        # signals the runner and then *waits out its grace period* — `grace_s` defaults to 5s — and that
+        # wait is on the shutdown path, inside the very grace the app allows before SIGKILL.)
+        #
+        # What is done instead is the half that cannot wait: the run's *runner subprocess* is signalled
+        # and reaped, because a runner that outlives the engine keeps executing and keeps spending
+        # against the same checkpoint while the app shows the run as stopped. That trade used to be
+        # deferred with "it is the host's trade to make, not here" — it now exists in the host as
+        # `shutdown_runners`, and it is bounded (SIGTERM, a short grace, SIGKILL, then `wait`), so it
+        # fits on this path rather than blocking it. The run thread itself is still left to die with
+        # the process; its checkpoint continues to say "running", which is what actually happened.
+        if self._run_is_live():
+            from .host import shutdown_runners
+
+            try:
+                shutdown_runners(grace_s=_RUNNER_SHUTDOWN_GRACE_S)
+            except Exception as exc:  # noqa: BLE001 - a failed reap must not break the shutdown
+                _log(f"serve: reaping the run's runner failed: {exc}")
+            _log("serve: a run was still in flight; its runner was signalled and the engine exited "
+                 "before the run settled")
+        if self._output_dead.is_set():
+            _log("serve: the output stream was dead, so these refusals were logged, not delivered")
         _log("agentorg serve: stopped")
 
     # ── commands ────────────────────────────────────────────────────────────
 
-    def handle(self, command: Command) -> dict[str, Any]:
-        """Dispatch one command. Returns the ack's detail, or raises to report a refusal."""
+    def handle(self, command: Command) -> Any:
+        """Dispatch one command. Returns the ack's detail, or raises to report a refusal.
+
+        `start` may instead return `_ACK_DEFERRED`, meaning "this command will acknowledge itself": its
+        work outlives the call and its ack is the run's outcome, so the worker must not send one and the
+        handler is handed the `cmd_id` to send it on.
+        """
         kind = command.type_value
-        handler: Callable[[dict[str, Any]], dict[str, Any]] | None = getattr(
-            self, f"_cmd_{kind}", None)
+        handler: Callable[..., Any] | None = getattr(self, f"_cmd_{kind}", None)
         if handler is None:
             raise ServerError(f"unknown command {kind!r}")
+        if kind == "start":
+            return handler(command.payload or {}, cmd_id=command.cmd_id)
         return handler(command.payload or {})
 
     # -- read-only ----------------------------------------------------------
@@ -348,18 +845,24 @@ class Server:
         "caching is broken" rather than "nothing has run yet".
         """
         if self.orchestrator is None:
-            return {"phase": "idle", "running": False, "org": self._roster(),
-                    "gate": None, "outcome": {}, "cost": self._cost(),
-                    "cache": self._cmd_cache({}), "swarm": self._cmd_swarm({}),
-                    "workspace": self._workspace_info(),
-                    "goal": self._cmd_goal_status({})["goal"],
-                    "mission": self._cmd_mission({})["mission"],
-                    "subagents": self._cmd_subagents({}),
-                    "proposals": self._cmd_proposals({}),
-                    "activity": self._cmd_activity({}),
-                    "flow": self._cmd_flow({}),
-                    "defaults": self._cmd_defaults({}),
-                    "portfolio": self._cmd_portfolio({})}
+            # Every key the running branch carries is present here too — including the journey, which
+            # is read *most* in this state: no run yet means the person is still setting up.
+            idle: dict[str, Any] = {"phase": "idle", "running": False, "org": self._roster(),
+                                    "gate": None, "outcome": {}, "cost": self._cost(),
+                                    "cache": self._cmd_cache({}), "swarm": self._cmd_swarm({}),
+                                    "workspace": self._workspace_info(),
+                                    "goal": self._cmd_goal_status({})["goal"],
+                                    "mission": self._cmd_mission({})["mission"],
+                                    "subagents": self._cmd_subagents({}),
+                                    "proposals": self._cmd_proposals({}),
+                                    "activity": self._cmd_activity({}),
+                                    "flow": self._cmd_flow({}),
+                                    "defaults": self._cmd_defaults({}),
+                                    "portfolio": self._cmd_portfolio({})}
+            journey = self._journey()
+            if journey is not None:
+                idle["journey"] = journey
+            return idle
         status = self.orchestrator.status()
         # The roster is what the Org panel renders, so it travels with every snapshot rather than
         # needing its own command the UI would have to remember to send.
@@ -399,7 +902,42 @@ class Server:
         # The portfolio travels too, so the console can show every org the principal runs — the
         # register, not the live picture (that is `portfolio_live`, sent when the panel is open).
         status.setdefault("portfolio", self._cmd_portfolio({}))
+        # The onboarding journey travels here so setup can show the *whole* path — every step, what it
+        # is for, and what it unlocks — from the poll the wizard already makes. The engine owns the
+        # decision (`onboarding.journey_payload`) and the app decodes it, which is the same rule the
+        # capability descriptions follow: the words a person reads and the thing that gates them cannot
+        # drift if there is one copy. Absent rather than fatal when the config cannot be read: setup is
+        # exactly the state in which the config is often wrong, and a wizard that dies while you are
+        # fixing it is the worst moment to lose it.
+        journey = self._journey()
+        if journey is not None:
+            status["journey"] = journey
         return status
+
+    def _journey(self) -> dict[str, Any] | None:
+        """The setup journey for this workspace, or `None` when it cannot be determined.
+
+        `None` rather than `{}` so the app can tell "the engine has not been asked yet" from "the
+        engine says there are no steps" — the first is a spinner, the second would be a claim.
+
+        `probe=False` deliberately. The journey is read on every `status` poll, and the default probe
+        reaches the network to check each provider — so a console open in the background would probe
+        every few seconds forever. The gate does not need a live probe to say which step you are on;
+        the model step's own `Test` button is where a reachability check belongs.
+        """
+        from .onboarding import inspect, journey_payload
+
+        try:
+            report = inspect(config_path=getattr(self.config, "path", None),
+                             workspace=self.workspace, probe=False)
+        except Exception as exc:  # noqa: BLE001 - setup must survive a half-written config
+            _log(f"serve: could not compute the setup journey: {exc}")
+            return None
+        try:
+            return journey_payload(report.gate)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"serve: could not render the setup journey: {exc}")
+            return None
 
     def _cmd_activity(self, payload: dict[str, Any]) -> dict[str, Any]:
         """The activity timeline: what the org is doing, why it stopped, and what is next.
@@ -623,11 +1161,18 @@ class Server:
             "max_retries": spec.max_retries,
             "concurrency": spec.concurrency,
         }
-        # Prefer the environment variable when one is named: that is the documented safe path, and a
-        # literal written back over it would silently move the secret into the file.
+        # Both are written when both were given. The variable stays the *preferred* source — it is the
+        # documented safe path and `resolve_key` reads it first — but dropping the literal made
+        # "paste a key and also name a variable" a configuration with no usable key at all, which the
+        # engine then reported as "has no API key" to someone who had just pasted one.
+        #
+        # That was reachable from the app's own form the moment the variable field held anything, and
+        # it is the worst kind of wrong: the person's input was silently discarded and the error blamed
+        # them. Keeping both cannot leak anything further — the file is 0600 and gitignored, and the
+        # literal was going to be written whenever the variable field was empty.
         if spec.api_key_env:
             entry["api_key_env"] = spec.api_key_env
-        elif spec.api_key:
+        if spec.api_key:
             entry["api_key"] = spec.api_key
         if spec.api_version:
             entry["api_version"] = spec.api_version
@@ -653,8 +1198,25 @@ class Server:
                 "providers": self._cmd_providers({})["providers"]}
 
     def _cmd_provider_remove(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Remove one provider from `credentials.json`."""
-        from .config import ConfigError, write_provider
+        """Remove one provider from `credentials.json`, refusing to remove the last one.
+
+        **The refusal is the point.** `load` refuses a document with no providers
+        (`config._build_providers`: "config defines no providers; at least one is required"), so
+        writing one would leave a file the *next launch* cannot read — and the running server hides
+        it, because `_reload_config` swallows the failure and keeps serving the stale object. The
+        breakage would then surface only on restart, which is the worst moment to discover it.
+        Refusing is the fix rather than silently keeping or inventing a replacement: choosing which
+        endpoint takes over is a routing decision the user did not make, the same reason
+        `config._remove_provider_references` drops a dangling default instead of guessing another
+        provider. So the reason names the way forward — add the replacement first, then remove this
+        one.
+
+        **And the blast radius is reported.** A roster agent bound to the endpoint keeps that binding
+        (the roster is re-written verbatim), so it stops being callable rather than being re-pointed.
+        The reply names those agents, so the console can say *which* agents a removal broke from the
+        engine's own answer instead of asserting it in prose of its own.
+        """
+        from .config import ConfigError, provider_ids, write_provider
 
         pid = str(payload.get("provider_id") or payload.get("id") or "").strip()
         if not pid:
@@ -662,13 +1224,50 @@ class Server:
         if not self.config.path:
             raise ServerError("this engine was started without a credentials file")
         try:
+            remaining = [other for other in provider_ids(self.config.path) if other != pid]
+        except ConfigError as exc:
+            raise ServerError(str(exc)) from exc
+        if not remaining:
+            raise ServerError(
+                f"{pid!r} is the only provider configured, so removing it would leave a credentials "
+                "file no launch can read — the loader requires at least one provider. Add its "
+                "replacement first, then remove this one."
+            )
+        try:
             write_provider(self.config.path, {}, provider_id=pid, remove=True)
         except ConfigError as exc:
             raise ServerError(str(exc)) from exc
         self._reload_config()
         self.emit(Event(seq=0, type=EventType.MODEL_CATALOG_REFRESHED,
                         payload={"provider_id": pid, "reason": "provider removed"}))
-        return {"removed": pid, "providers": self._cmd_providers({})["providers"]}
+        # Read *after* the reload, from the live roster: the built-in company is re-derived from the
+        # resolved default on every load, so an endpoint that was only the default re-points those
+        # agents and they are correctly not reported. What is left is the persisted binding — an agent
+        # the Owner hired keeps the provider it was hired onto, and nothing moves it.
+        bound = self._agents_bound_to(pid)
+        return {"removed": pid, "providers": self._cmd_providers({})["providers"],
+                "agents": bound, "agent_count": len(bound)}
+
+    def _agents_bound_to(self, provider_id: str) -> list[dict[str, str]]:
+        """The live-roster agents still naming a provider, by id and name.
+
+        `{id, name}` rather than the whole spec: this travels with a removal's reply so the console can
+        name the agents that just stopped being callable, and a full spec would drag a model, a budget
+        and a capability list along with it. Sorted by name so two removals of the same endpoint report
+        the same order.
+
+        A console with no workspace — the CLI's `providers` command resolves none by design, because
+        it edits `credentials.json` and nothing else — has no project of its own, so the list is empty.
+        Discovering from the process's working directory would read whatever roster happens to sit
+        above it, which is a claim about a project the caller never named; the app always has a
+        workspace, so this only ever reports nothing for a surface that read no roster.
+        """
+        if self.workspace is None:
+            return []
+        org = self._people().load(project=self._project_dir())
+        return [{"id": spec.id, "name": spec.name}
+                for spec in sorted(org.agents.values(), key=lambda a: a.name)
+                if spec.provider == provider_id]
 
     def _provider_spec_from_payload(self, payload: dict[str, Any]) -> Any:
         """Build a `ProviderConfig` from a console payload, validating what it must.
@@ -687,6 +1286,19 @@ class Server:
         base_url = str(payload.get("base_url") or "").strip()
         if not base_url:
             raise ServerError("a provider needs a base_url")
+        # The mistake the picker used to invite: `ollama` targets a *local server's* `/api/chat`, while
+        # Ollama's cloud speaks the OpenAI dialect at `/v1`. Choosing "Ollama" for `ollama.com` produced
+        # `…/chat/completions/api/chat`, and the resulting 404 is indistinguishable from a bad key —
+        # so the person re-pasted their key and changed the URL, neither of which was wrong.
+        #
+        # Refused with the correction rather than silently rewritten: the kinds are genuinely different
+        # protocols, and quietly switching one for the other would leave the stored config describing
+        # something the person did not choose.
+        if kind == "ollama" and "ollama.com" in base_url.lower():
+            raise ServerError(
+                "ollama.com is Ollama's cloud endpoint, which speaks the OpenAI dialect — choose "
+                "'OpenAI-compatible' as the kind and use `https://ollama.com/v1` as the base URL. "
+                "The 'Local Ollama' kind is for a server on this machine, whose route is `/api/chat`.")
 
         raw_headers = payload.get("extra_headers") or payload.get("headers") or {}
         if not isinstance(raw_headers, dict):
@@ -763,6 +1375,12 @@ class Server:
         invalidated resolves to a usable one, and the reason travels so the panel can say why. No key
         is ever returned.
         """
+        # The posture on the *document*, not the effective one: the engine has a default either way,
+        # and only the record tells "the person answered" from "the engine filled it in". Read from
+        # `onboarding.posture_recorded` rather than by looking at the config's own field, so this
+        # cannot become a second answer to the question the journey step is decided by.
+        from .onboarding import posture_recorded
+
         config = self.config
         provider, model, reason = config.default_pair()
         # The window the system will *actually* bind with — catalog first, declared table second —
@@ -787,6 +1405,13 @@ class Server:
                 "persist_auto_hires": config.goal.persist_auto_hires,
                 "auto_hire_max_tier": config.goal.auto_hire_max_tier,
                 "token_budget": config.goal.token_budget,
+                # The posture a new goal inherits, and whether the *file* records one. Two fields
+                # because they are two different facts: the engine has a default either way, and the
+                # journey must still tell "the person has not answered yet" from "the person chose
+                # Unattended". `onboard.posture_recorded` is the one rule, so a second reading here
+                # cannot disagree with the step the wizard is showing.
+                "posture": config.goal.default_posture,
+                "posture_recorded": posture_recorded(config),
             },
             "usable": config._usable_providers(),
             "providers": sorted(config.providers),
@@ -834,6 +1459,18 @@ class Server:
         Kept separate from the model default on purpose: changing which model the org runs on must not
         silently change whether a run needs a person. A boolean passed as `None` is left untouched, so
         a panel can send only the switch that changed.
+
+        **`posture` is accepted here now, and it had to be.** The app's first-run wizard asks this
+        question, and until this key existed the only thing the answer changed was a value the window
+        kept to itself — `goal.default_posture` stayed absent from the file, so the engine's own
+        journey reported the step as outstanding forever while the window had already marked it done
+        and retired. A first-run step a person has answered that the engine still calls unanswered is
+        the "still confusing about onboarding" report in its purest form: the checklist and the engine
+        disagree, and re-running setup shows the same question again with nothing saying why.
+
+        Validated here rather than left to `GoalConfig.__post_init__`, because an invalid posture
+        written to the file would make the *whole configuration* unloadable on the next read — a bad
+        value must be refused at the write, not discovered as a broken engine afterwards.
         """
         from .config import ConfigError, set_autonomy
 
@@ -848,6 +1485,12 @@ class Server:
                 goal[key] = bool(value)
         if payload.get("auto_hire_max_tier") is not None:
             goal["auto_hire_max_tier"] = int(payload["auto_hire_max_tier"])
+        posture = str(payload.get("posture") or "").strip().lower()
+        if posture:
+            if posture not in ("unattended", "supervised"):
+                raise ServerError(
+                    f"unknown posture {posture!r}; expected 'unattended' or 'supervised'")
+            goal["default_posture"] = posture
         if not goal:
             raise ServerError("autonomy_set needs at least one setting")
         try:
@@ -858,6 +1501,48 @@ class Server:
         self.emit(Event(seq=0, type=EventType.POLICY_CHANGED,
                         payload={"reason": "autonomy set", **goal}))
         return self._cmd_defaults({})
+
+    def _cmd_system_set(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Write the machine-access switches, so a panel can grant what it has just described.
+
+        The counterpart to `system`, which only *reads*: without this the console could render every
+        capability, its reach and its caution, and still have no way to say yes — the person was told
+        "the machine tools are off" with no switch to turn. Granting is a state change on their machine,
+        so it is a separate command rather than a side effect of reading the description.
+
+        Only the keys present in the payload are written, so a panel can send one switch without
+        restating the others — the same rule `autonomy_set` follows, for the same reason: a UI that
+        resends everything it knows will overwrite a change made elsewhere in between.
+        """
+        from .config import ConfigError, set_system
+
+        if not self.config.path:
+            raise ServerError("this engine was started without a credentials file, so there is nowhere "
+                              "to record this")
+        update: dict[str, Any] = {}
+        for key in ("enabled", "allow_full_access"):
+            if payload.get(key) is not None:
+                update[key] = bool(payload[key])
+        for key in ("allow_apps", "allow_automation", "allow_shortcuts"):
+            value = payload.get(key)
+            if value is not None:
+                if not isinstance(value, (list, tuple)):
+                    raise ServerError(f"system_set: {key} must be a list of names")
+                update[key] = [str(v) for v in value]
+        if payload.get("screenshot_dir") is not None:
+            update["screenshot_dir"] = str(payload["screenshot_dir"])
+        if not update:
+            raise ServerError("system_set needs at least one setting")
+        try:
+            set_system(self.config.path, system=update)
+        except ConfigError as exc:
+            raise ServerError(str(exc)) from exc
+        # Reloaded in place for the same reason a provider edit is: the next tool call and the next
+        # `system` read must see the grant that was just written, not the section it replaced.
+        self._reload_config()
+        self.emit(Event(seq=0, type=EventType.POLICY_CHANGED,
+                        payload={"reason": "system access set", **update}))
+        return self._cmd_system({})
 
     def _cmd_cache(self, payload: dict[str, Any]) -> dict[str, Any]:
         """The cache picture for this run: hit rate, tokens, and what it has saved.
@@ -918,15 +1603,34 @@ class Server:
 
     # -- the run lifecycle --------------------------------------------------
 
-    def _cmd_start(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _cmd_start(self, payload: dict[str, Any], *, cmd_id: str = "") -> Any:
         """Plan (and unless asked not to, execute) a goal.
 
         The `start` command the app sends covers both: it proposes a graph and, having done so,
         proceeds — the Owner's approve gate is where a run actually waits.
+
+        The graph then executes on a **thread of its own** (`_start_run`), and that thread sends this
+        command's ack when the graph settles. Both halves are deliberate:
+
+        - Its own thread, because the command worker is the app's only path to `status` and to
+          `pause`/`abort`. A run executing inline there is what froze every panel and made Pause a
+          no-op until the run had ended.
+        - Acked on settle, because the ack's detail **is** the run's outcome (`phase`, `outcome`,
+          `gated`), and a run that cannot execute is a failed `start` — `ok=false` with the reason,
+          exactly as before. The app awaits this ack with the engine's 600s command budget, inside a
+          `Task`, so nothing in the console is blocked by it.
         """
         goal = str(payload.get("goal") or "").strip()
         if not goal:
             raise ServerError("start needs a goal")
+        if self._run_is_live():
+            # Refused before `_orchestrator` and `prepare`, both of which would clobber the live run:
+            # building an orchestrator replaces the one holding its `_host`, and `prepare` re-points
+            # `_run` at a second graph and persists it over the first one's checkpoint. The run thread
+            # is what takes the run off the worker now, so the worker no longer serialises a second
+            # `start` behind the first by accident — this is that serialisation, said out loud.
+            raise ServerError(
+                "a run is already in flight; pause or abort it before starting another")
         slug = str(payload.get("slug") or self.slug)
         self.slug = slug
         orch = self._orchestrator(slug)
@@ -949,16 +1653,59 @@ class Server:
         if payload.get("dry_run"):
             return detail
 
-        # Execute on this worker thread: the read loop stays free so /pause and /abort are honoured
-        # while the run is in flight.
-        orch.approve(run)
-        self.emit(Event(seq=0, type=EventType.MANIFEST_APPROVED,
-                        payload={"run_id": run.run_id, "slug": run.slug}))
-        outcome = orch.execute(run)
-        detail["phase"] = run.phase.value
-        detail["outcome"] = (outcome.summary or {}).get("outcome") or outcome.state.value
-        detail["gated"] = bool(getattr(outcome, "gated", False))
-        return detail
+        self._start_run(cmd_id, orch, run, detail)
+        return _ACK_DEFERRED
+
+    def _run_is_live(self) -> bool:
+        """Whether a graph is executing right now.
+
+        Read from the run *thread* rather than from the orchestrator's `running` flag: that flag is set
+        inside `execute`, which is already on the run thread, so a `start` landing in the window before
+        it would slip past a flag-based check and put two graphs on one workspace.
+        """
+        thread = self._run_thread
+        return thread is not None and thread.is_alive()
+
+    def _start_run(self, cmd_id: str, orch: Any, run: Any, detail: dict[str, Any]) -> None:
+        """Execute an approved graph on its own thread, acking `start` when it settles.
+
+        The thread is a daemon, like the command worker, so a shut-down engine cannot be held open by a
+        run that is still going. The worker's in-flight token ends here — it is released as soon as this
+        returns `_ACK_DEFERRED` — because the run is no longer the worker's work to account for, and
+        `_drain`'s wait is bounded (a run is not).
+        """
+        thread = threading.Thread(
+            target=self._run_graph, args=(cmd_id, orch, run, detail),
+            name=f"agentorg-run-{run.run_id}", daemon=True)
+        try:
+            self._run_thread = thread
+            thread.start()
+        except RuntimeError:
+            # No thread to hand the work to, and `_ACK_DEFERRED` was never returned, so the worker
+            # answers this command itself — as a failure, with the reason.
+            self._run_thread = None
+            raise
+
+    def _run_graph(self, cmd_id: str, orch: Any, run: Any, detail: dict[str, Any]) -> None:
+        """Approve, execute, and acknowledge — off the command worker."""
+        try:
+            orch.approve(run)
+            self.emit(Event(seq=0, type=EventType.MANIFEST_APPROVED,
+                            payload={"run_id": run.run_id, "slug": run.slug}))
+            outcome = orch.execute(run)
+            detail["phase"] = run.phase.value
+            detail["outcome"] = (outcome.summary or {}).get("outcome") or outcome.state.value
+            detail["gated"] = bool(getattr(outcome, "gated", False))
+            self.ack(cmd_id, ok=True, detail=detail)
+        except Exception as exc:  # noqa: BLE001 - a run that cannot execute is an answer, not a crash
+            _log(f"serve: run {run.run_id} failed: {exc}")
+            self.ack(cmd_id, ok=False, error=str(exc))
+        finally:
+            # Only the liveness marker: the in-flight counter is the worker's, and this thread never
+            # held a token in it. Cleared last, so `_run_is_live` is false only once the run's ack has
+            # been written — a `start` arriving in between would otherwise be refused for a run that had
+            # already finished.
+            self._run_thread = None
 
     def _cmd_approve(self, payload: dict[str, Any]) -> dict[str, Any]:
         orch, run = self._current_run()
@@ -985,9 +1732,21 @@ class Server:
         return {"run_id": run.run_id, "instruction": text}
 
     def _cmd_resume(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Continue a paused run from its checkpoint.
+
+        Refused while a graph is executing, exactly as `start` is, and for a sharper reason:
+        `Orchestrator.resume` sets the run's phase to READY, clears its gate and persists it — while the
+        run thread that is still executing the graph writes its own phases to the same run and the same
+        checkpoint. The two disagreeing is not a cosmetic problem: the file on disk says "ready" for a
+        run that is mid-node, and a resume after a crash would start a second execution of a graph that
+        never stopped.
+        """
         orch = self.orchestrator
         if orch is None:
             raise ServerError("no run is loaded to resume")
+        if self._run_is_live():
+            raise ServerError(
+                "a run is already in flight; pause or abort it before resuming")
         run = orch.resume()
         return {"run_id": run.run_id, "phase": run.phase.value}
 
@@ -1131,6 +1890,186 @@ class Server:
         """The skills an agent can be hired for, so the console offers real ones rather than a guess."""
         return {"skills": self._skill_names()}
 
+    def _cmd_system(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """What an agent may do on this machine, described for the person granting it.
+
+        A *description* command, not a second source of truth: the console renders what this returns,
+        so the two cannot disagree about what a switch does. The alternative — the prose living in
+        Swift as well — drifts the first time a capability changes, and the failure mode is a console
+        confidently describing a grant it does not enforce.
+
+        Reports three things and keeps them separate:
+
+        - `capabilities` — every declared grant with what it reaches, what changes, and its caution.
+        - `enabled` / `full_access` — the two switches, so the console can show *why* the list is
+          inert when the section is off.
+        - `unavailable` — grants with no tool behind them yet, so a console can survive the tree being
+          mid-build rather than offering a switch that does nothing.
+
+        Read-only, and safe on a config that will not load: a console asking what a capability means
+        should get an answer even when the engine is unhappy about something else.
+
+        The assembly is `syscap.console_payload`, not a literal here, because the CLI's `system list`
+        answers the same question and the whole point of `syscap` is that the two surfaces cannot
+        render one grant two ways. This method is now only the choice of *whose* grants to report;
+        the console asks about the capability set in the abstract, so it passes none.
+        """
+        from .syscap import console_payload, summary
+
+        payload = console_payload(getattr(self.config, "system", None))
+        # The acting holder, so the console can answer "and what may *you* do?" beside "what may an
+        # agent do?" — the two readings the panel shows as separate figures. Without it the app could
+        # only count the roster, which is how one machine came to report 6 of 12 in the app and 12 of
+        # 12 in the terminal for the same config: the terminal adds this holder itself
+        # (`systemcli.Holder`), and this reply did not carry one at all.
+        #
+        # The person's holder, not a named agent: a console asking about the capability set in the
+        # abstract is acting as the person, which is what `_holder_for("")` returns.
+        holder = self._holder_for("")
+        payload["holder"] = holder.as_dict()
+        # ...and the holder's own counts, *replacing* the description's abstract one. `console_payload`
+        # reports the capability set with no holder, so its `summary` reads "0 of 12 … granted" — which
+        # is false on a machine whose holder holds everything, and was printed as a headline for a
+        # while. `systemcli.cmd_list` replaces it the same way, for the reason its own comment gives:
+        # two counts in one document is how a reader picks the wrong one.
+        counts = summary(holder.capabilities)
+        payload["summary"] = counts["text"]
+        payload["granted"] = counts["granted"]
+        payload["granted_count"] = counts["granted_count"]
+        payload["total"] = counts["total"]
+        return payload
+
+    def _cmd_system_consent(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Approve or withdraw one state-changing tool, for one holder, in this run's ledger.
+
+        The console's counterpart to the CLI's `system consent grant|revoke`. Both reach the same
+        function (`sysctl_tools.grant_consent` / `revoke_consent`), which is what makes an approval
+        given in the app visible to the CLI and to an agent mid-run — one ledger, one decision.
+
+        `by` is the principal, never an agent. `grant_consent` refuses a `by` naming an agent
+        (`ag_*`) precisely so an approval cannot be self-issued, and that guard is left to the module
+        rather than re-implemented here: a second copy of the rule is a second place for it to be
+        wrong. The refusal is reported as a `ServerError` carrying the module's own message.
+        """
+        from .sysctl_tools import ConsentError, grant_consent, revoke_consent
+
+        tool = str(payload.get("tool") or "").strip()
+        if not tool:
+            raise ServerError("system_consent needs a tool")
+        holder = str(payload.get("agent_id") or payload.get("holder") or "").strip()
+        if not holder:
+            raise ServerError("system_consent needs an agent_id: an approval is per agent, and a grant "
+                              "with no holder would read as a grant to everyone")
+        approved = bool(payload.get("approved", True))
+        note = str(payload.get("note") or "")
+        fn = grant_consent if approved else revoke_consent
+        try:
+            fn(self._state_dir(), tool=tool, agent_id=holder, by=self._principal_id(), note=note)
+        except ConsentError as exc:
+            raise ServerError(str(exc)) from exc
+        return {"tool": tool, "agent_id": holder, "approved": approved,
+                "system": self._cmd_system({})}
+
+    def _cmd_system_invoke(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Run one capability through the *same* gate the agents go through, and return its result.
+
+        A read-only panel tells a person what they could allow but not what it does, which leaves the
+        hardest question — "is this grant safe to hand over?" — unanswered at exactly the moment it is
+        asked. This is the console's answer, and it is deliberately not a second implementation:
+        `ToolRegistry.call` is the one gate, so an invocation from the panel obeys `system.enabled`,
+        the holder's grant, the allowlists, the consent ledger and the bounds *identically* to the
+        same call from an agent mid-run. A panel with its own shortcut would be a way to reach the
+        machine that the ledger does not record.
+
+        A refusal is returned as a normal result with `refused: true` rather than raised: the reason is
+        the useful part, and the console shows it verbatim. Raising would reach the UI as a generic
+        failure and lose the sentence that says which grant to add.
+        """
+        tool = str(payload.get("tool") or "").strip()
+        if not tool:
+            raise ServerError("system_invoke needs a tool")
+        raw_args = payload.get("args")
+        args = dict(raw_args) if isinstance(raw_args, dict) else {}
+        holder = str(payload.get("agent_id") or "").strip()
+        try:
+            registry = self._system_registry(holder)
+        except Exception as exc:  # noqa: BLE001 - an unusable holder is a refusal, not a crash
+            raise ServerError(str(exc)) from exc
+        if tool not in registry.names():
+            # Named rather than silent: a tool that is not offered is usually `system.enabled` being
+            # off or the catalogue not knowing the name, and both need different fixes.
+            raise ServerError(
+                f"{tool!r} is not offered to this holder, so it cannot be invoked. Either the machine "
+                f"tools are off (`system.enabled`), or {tool!r} is not a tool this build knows.")
+        result = registry.call(tool, args)
+        text = getattr(result, "text", str(result))
+        return {"tool": tool, "args": args, "text": text,
+                "refused": "refused:" in text,
+                "ok": not getattr(result, "is_error", False) and "refused:" not in text}
+
+    def _system_registry(self, holder: str) -> Any:
+        """A tool registry bound to one holder, for an invocation from the console.
+
+        Built per call rather than cached: a cached registry would keep a grant list from before the
+        last `system_set`, so a person who had just granted a capability would be refused by the
+        registry still holding the previous answer.
+
+        The holder is turned into the same minimal shape the executor passes — an object with `id` and
+        `capabilities` — rather than a second code path. `ToolRegistry` reads `agent.capabilities` to
+        decide what to advertise and `agent.id` to key the consent ledger, so giving it the real
+        roster entry for a named holder and a wildcard holder for the person keeps the panel on
+        exactly the path an agent takes.
+        """
+        from .tools import ToolRegistry
+
+        agent = self._holder_for(holder)
+        return ToolRegistry(workspace_root=self._project_dir(), agent=agent,
+                            system=self._system_section())
+
+    def _holder_for(self, holder: str) -> Any:
+        """The agent a console invocation acts as: the named one, or the person themselves.
+
+        The person's holder carries `system:*` because a command the person types *is* the grant —
+        the same rule `systemcli`'s Owner holder follows, so the app and the terminal cannot disagree
+        about what the person may do. A named holder gets exactly its own capabilities, so choosing an
+        agent in the panel is a way to *test that agent's* scope rather than to borrow the person's.
+
+        `Holder` is imported from `systemcli` rather than building an `AgentSpec` here: that type exists
+        precisely for this (a *view* of who is acting, carrying the two attributes `ToolRegistry` reads
+        and an explanation of where the grants came from), and constructing a real `AgentSpec` would
+        need a skill list it does not have — an agent with no skills is unassignable by design, so the
+        person would have been refused for a reason that has nothing to do with permissions.
+        """
+        from .systemcli import Holder
+
+        if holder:
+            people = self._people()
+            org = people.load(project=self._project_dir())
+            for candidate in (getattr(org, "agents", None) or {}).values():
+                if holder in (getattr(candidate, "id", ""), getattr(candidate, "name", "")):
+                    return candidate
+            raise ServerError(
+                f"no agent named {holder!r} in this project's roster. Run `engine.cli agents` to "
+                "see who exists, or omit agent_id to act as yourself.")
+        return Holder(id="ag_owner", name="Owner", capabilities=("system:*",),
+                      why="the console's own holder — a command you type is the grant")
+
+    def _system_section(self) -> Any:
+        """The live `[system]` section, so the registry enforces the current switches."""
+        return getattr(self.config, "system", None)
+
+    def _state_dir(self) -> Any:
+        """Where this workspace keeps its ledger and run state."""
+        return getattr(self.workspace, "state_dir", None) or (self.workspace.path / ".agent_state")
+
+    def _principal_id(self) -> str:
+        """Who is operating this console. A person, so the ledger records an attributable approval."""
+        for attr in ("principal", "principal_id", "owner"):
+            value = getattr(self, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return "pr_owner"
+
     def _people(self) -> Any:
         """A roster manager over this workspace's project root.
 
@@ -1187,6 +2126,10 @@ class Server:
             purpose=str(payload.get("purpose") or ""),
             max_concurrency=int(payload.get("max_concurrency") or 1),
             as_reviewer=bool(payload.get("as_reviewer")),
+            # What the agent may reach. An absent or empty list means "use the skill's default", which
+            # is the engine's own least-privilege rule — so a console that never sends this field
+            # cannot accidentally widen an agent, and one that does is stating the whole set.
+            capabilities=[str(c) for c in (payload.get("capabilities") or []) if str(c).strip()],
         )
 
     def _skill_names(self) -> list[str]:
@@ -1237,7 +2180,7 @@ class Server:
         an unchanged objective with a changed policy replaces the policy and keeps the history, rather
         than forcing a clear-and-restart.
         """
-        from .goal import GoalPolicy
+        from .goal import GoalPolicy, Posture
 
         objective = str(payload.get("objective") or payload.get("goal") or "").strip()
         if not objective:
@@ -1245,6 +2188,19 @@ class Server:
         orch = self._goal_orchestrator()
         armed = not bool(payload.get("no_arm"))
         base = orch._default_goal_policy()
+        # `posture` is the one word the console sends now; `human_gate` is still accepted so an older
+        # build of the app keeps working. A posture in the payload wins over the legacy flag.
+        posture = payload.get("posture")
+        if posture:
+            try:
+                resolved = Posture(str(posture).strip().lower())
+            except ValueError as exc:
+                raise ServerError(
+                    f"unknown posture {posture!r}; expected one of "
+                    f"{', '.join(p.value for p in Posture)}") from exc
+        else:
+            resolved = (Posture.SUPERVISED if payload.get("human_gate")
+                        else base.posture)
         policy = GoalPolicy(
             auto_approve=(base.auto_approve if payload.get("auto_approve") is None
                           else bool(payload.get("auto_approve"))),
@@ -1252,7 +2208,7 @@ class Server:
                        else bool(payload.get("auto_hire"))),
             persist_hires=(base.persist_hires if payload.get("persist_hires") is None
                            else bool(payload.get("persist_hires"))),
-            human_gate=bool(payload.get("human_gate", False)),
+            posture=resolved,
         )
         orch.goal_set(objective, armed=armed, by="app", policy=policy)
         return self._goal_detail(orch)
@@ -1277,6 +2233,12 @@ class Server:
                 data["file"] = str(path.with_suffix(".md"))
                 proposals.append(data)
         proposals.sort(key=lambda p: str(p.get("at") or ""), reverse=True)
+        # Each entry carries its lifecycle — whether `apply` would proceed, and the reason when it
+        # would not — computed by the same module the CLI's `apply` uses. The panel offers a button on
+        # `can_apply`, and a Swift copy of that rule would be offered whenever this one refuses.
+        from .proposals import ProposalStore, annotate
+
+        annotate(proposals, ProposalStore(workspace=self.workspace))
 
         refused: list[dict[str, Any]] = []
         rejected_path = directory / "rejected.jsonl"
@@ -1297,6 +2259,91 @@ class Server:
             # Stated so the console can say it plainly rather than implying otherwise.
             "applies_changes": False,
         }
+
+    # ── the proposal lifecycle, driven from the console ─────────────────────
+    #
+    # Named `proposal_*` rather than a second `proposals` verb: the read command above is what the
+    # status poll calls, and each of these is a distinct act a person takes on one proposal. The
+    # implementation is `engine.proposals`, the same module the CLI drives, because two surfaces that
+    # each decided when a change may land would eventually disagree about it.
+
+    def _proposal_store(self) -> Any:
+        from .proposals import ProposalStore
+
+        return ProposalStore(workspace=self.workspace)
+
+    def _cmd_proposal_show(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """One proposal in full, with its patch inline so the panel can read a diff without a file."""
+        from .proposals import ProposalLifecycleError
+
+        store = self._proposal_store()
+        try:
+            proposal = store.load(str(payload.get("id") or ""))
+        except ProposalLifecycleError as exc:
+            raise ServerError(str(exc)) from exc
+        return {
+            **proposal.as_dict(),
+            "file": str(store.directory / f"{proposal.proposal_id}-{proposal.finding.kind}.md"),
+            "can_apply": store.can_apply(proposal),
+            "why_not": store.why_not(proposal),
+        }
+
+    def _cmd_proposal_accept(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from .proposals import ProposalLifecycleError
+
+        store = self._proposal_store()
+        try:
+            proposal = store.accept(str(payload.get("id") or ""), by="app")
+        except ProposalLifecycleError as exc:
+            raise ServerError(str(exc)) from exc
+        return {"proposal_id": proposal.proposal_id, "state": proposal.state, "applied": False,
+                **self._cmd_proposals({})}
+
+    def _cmd_proposal_reject(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from .proposals import ProposalLifecycleError
+
+        store = self._proposal_store()
+        try:
+            proposal = store.reject(str(payload.get("id") or ""),
+                                    reason=str(payload.get("reason") or ""), by="app")
+        except ProposalLifecycleError as exc:
+            raise ServerError(str(exc)) from exc
+        return {"proposal_id": proposal.proposal_id, "state": proposal.state,
+                "reason": proposal.refusal, "applied": False, **self._cmd_proposals({})}
+
+    def _cmd_proposal_apply(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Apply one proposal — the only console command that writes to the working tree.
+
+        Runs on the worker thread like every other command, which matters here: the suite runs twice,
+        and the read loop stays free so the console keeps answering while it does.
+
+        A refusal raises rather than returning `applied: false`, because the app's `mutate` helper
+        already turns a refusal into a notice and the person needs to read the reason. The refusal is
+        also *safe to raise*: it is decided before anything is written.
+        """
+        from .proposals import ProposalLifecycleError
+
+        store = self._proposal_store()
+        try:
+            outcome = store.apply(str(payload.get("id") or ""), by="app",
+                                  force=bool(payload.get("force")))
+        except ProposalLifecycleError as exc:
+            raise ServerError(str(exc)) from exc
+        if outcome.refused:
+            raise ServerError(outcome.refused)
+        return {**outcome.as_dict(), **self._cmd_proposals({})}
+
+    def _cmd_proposal_undo(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from .proposals import ProposalLifecycleError
+
+        store = self._proposal_store()
+        try:
+            outcome = store.undo(str(payload.get("id") or ""), by="app")
+        except ProposalLifecycleError as exc:
+            raise ServerError(str(exc)) from exc
+        if outcome.refused:
+            raise ServerError(outcome.refused)
+        return {**outcome.as_dict(), **self._cmd_proposals({})}
 
     def _cmd_improve(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Run one improver cycle, in the background, and report what it considered.
@@ -1485,17 +2532,30 @@ class Server:
     # ── portfolio: one principal, several orgs ──────────────────────────────
 
     def _load_portfolio(self) -> Any:
-        """The portfolio, loaded once. None when there is none (a single-org setup)."""
+        """The portfolio, loaded once. None when there is none (a single-org setup).
+
+        **Loaded is marked on success only.** It used to be marked *before* the attempt, which turned one
+        transient read failure into a permanent one: the failure was remembered as "there is no
+        portfolio" for the life of the process, and the next `portfolio_add` took that as licence to
+        build `Portfolio.new()` and `save()` it — replacing a register full of orgs with a one-org file.
+        A register that could not be read is not a register that is absent, so the read is retried on
+        the next command, and `_portfolio_error` remembers *why* it failed for the commands that must
+        refuse rather than act on it.
+        """
         if self._portfolio_loaded:
             return self._portfolio
-        self._portfolio_loaded = True
         from .portfolio import Portfolio, PortfolioError
 
         try:
-            self._portfolio = Portfolio.load()
-        except PortfolioError as exc:  # noqa: BLE001 - a broken register must not kill the server
+            portfolio = Portfolio.load()
+        except PortfolioError as exc:
+            # A broken register must not kill the server — but it must not be papered over either.
             _log(f"serve: cannot read the portfolio: {exc}")
-            self._portfolio = None
+            self._portfolio_error = str(exc)
+            return None
+        self._portfolio = portfolio
+        self._portfolio_error = ""
+        self._portfolio_loaded = True
         return self._portfolio
 
     def _fleet_for(self, portfolio: Any) -> Any:
@@ -1524,10 +2584,16 @@ class Server:
         A snapshot command rather than only events, so the console shows the whole portfolio from the
         poll it already makes. It does **not** load every org — that is `_cmd_portfolio_live` — because
         reading ten rosters on every 2s poll would be wasteful; the register is enough to list them.
+
+        `error` travels in **both** branches, like every other key here: a register that could not be
+        read renders as an empty one otherwise, and "no orgs" is precisely what invites a person to
+        create one — which is the overwrite `_cmd_portfolio_add` now refuses. An empty string means the
+        read succeeded (or there is no register, which is not an error).
         """
         portfolio = self._load_portfolio()
         if portfolio is None:
             return {"portfolio": None, "principal": None, "active_org_id": "", "orgs": [],
+                    "error": self._portfolio_error,
                     "counts": {"orgs": 0, "enabled": 0, "missing": 0}}
         return {
             "portfolio": {"principal": portfolio.principal.as_dict(),
@@ -1536,6 +2602,7 @@ class Server:
             "principal": portfolio.principal.as_dict(),
             "active_org_id": portfolio.active_org_id,
             "orgs": portfolio.inspect()["orgs"],
+            "error": "",
         }
 
     def _cmd_portfolio_live(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1585,7 +2652,26 @@ class Server:
         return {"stopped": detail, "fleet": fleet.status()}
 
     def _cmd_portfolio_select(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Select the active org — the one bare console commands act on."""
+        """Select the active org — the one bare console commands act on.
+
+        Selecting has to do more than write a field. `active_org_id` is a *label*: the server's own
+        `workspace` and `orchestrator` are what every bare command and every panel actually reads, and
+        they were built once at startup for the project the console was launched on. So switching used
+        to change the name in the register while the roster, the mission, the goal and the run history
+        on screen all went on describing the *previous* org — a switch that looked like it worked and
+        changed nothing a person could see. That is the complaint in one line.
+
+        So this re-points the server as well: the org's folder becomes the workspace, and the
+        orchestrator is dropped so the next bare command rebuilds against it. Rebuild-on-next-use
+        rather than building here, because building loads a roster and a workspace and this command is
+        on the path a person clicks a switcher — the cost belongs to the command that needs it.
+
+        A run already in flight is a **refusal, not a re-root**. The executing subprocess holds the
+        workspace path, so mutating it underneath a live run is how half the artifacts of one org land
+        in another's folder. `portfolio run` is the parallel path and does not touch this server's own
+        run, so a person running several orgs at once is never blocked by that — only a bare `start`
+        run is, and for that the answer is to stop it first.
+        """
         portfolio = self._load_portfolio()
         if portfolio is None:
             raise ServerError("no portfolio")
@@ -1595,14 +2681,77 @@ class Server:
             portfolio.save()
         except Exception as exc:  # noqa: BLE001
             raise ServerError(str(exc)) from exc
-        return {"active_org_id": entry.id, "active_org": entry.as_dict()}
+
+        detail: dict[str, Any] = {"active_org_id": entry.id, "active_org": entry.as_dict(),
+                                  "repointed": False, "repoint_reason": ""}
+        if self._has_live_run():
+            detail["repoint_reason"] = (
+                "a run is in flight in this window, so the engine is still pointed at it; "
+                "stop it to switch")
+            return detail
+        try:
+            workspace = self._workspace_for_org(entry)
+        except Exception as exc:  # noqa: BLE001 - a missing folder is reported, not fatal
+            # The register still moves: `portfolio use` from the CLI does the same, and refusing the
+            # whole switch would make a broken org impossible to select away *from*. What must not
+            # happen is silence about it — the console then says the engine stayed put and why.
+            detail["repoint_reason"] = str(exc)
+            return detail
+        workspace.ensure()
+        self.workspace = workspace
+        self.slug = entry.slug
+        # Dropped rather than rebuilt: an orchestrator holding the old workspace would answer the next
+        # bare command from the previous org, which is the failure this whole method exists to prevent.
+        self.orchestrator = None
+        detail["repointed"] = True
+        detail["workspace"] = self._workspace_info()
+        return detail
+
+    def _has_live_run(self) -> bool:
+        """Whether this server's own orchestrator has a run in flight.
+
+        Asked through `status` because that is the orchestrator's own answer, and a second liveness
+        rule written here would be a copy that drifts from the one the UI renders.
+        """
+        orch = self.orchestrator
+        if orch is None:
+            return False
+        try:
+            return bool(orch.status().get("running"))
+        except Exception:  # noqa: BLE001 - an unreadable run is not a reason to refuse a switch
+            return False
+
+    def _workspace_for_org(self, entry: Any) -> Any:
+        """The workspace an org runs in: its own folder, or a managed project keyed on its slug.
+
+        The same rule the fleet uses, so an org looked at through the switcher and an org run in
+        parallel resolve to one directory rather than two — one resolver, `portfolio.workspace_for`,
+        rather than a copy here that could drift from the fleet's.
+        """
+        from .portfolio import workspace_for
+
+        # The same managed root this server was started with, so an org registered with no folder
+        # lands under the projects directory the console is already reading rather than beside it.
+        return workspace_for(entry, root=getattr(self.workspace, "root", None))
 
     def _cmd_portfolio_add(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Register an org from the console."""
+        """Register an org from the console.
+
+        **Refused when the register could not be read.** The `None` branch used to build
+        `Portfolio.new()` and `save()` it unconditionally, and `Portfolio.save` replaces the file — so a
+        single failed read (a transient I/O error, a register another process was rewriting, a corrupt
+        byte) meant the next `Add org` replaced a register of ten orgs with a one-org file. The user's
+        orgs are the one thing this command must not be able to destroy, so the read failure is carried
+        up as a refusal: nothing is written, and the reason names the failure rather than the symptom.
+        """
         from .portfolio import Portfolio
 
         portfolio = self._load_portfolio()
         if portfolio is None:
+            if self._portfolio_error:
+                raise ServerError(
+                    f"the portfolio could not be read ({self._portfolio_error}), so adding an org "
+                    "would replace it; fix or move the register first")
             portfolio = Portfolio.new()
             self._portfolio = portfolio
         name = str(payload.get("name") or "").strip()
@@ -1620,16 +2769,143 @@ class Server:
         return {"org": entry.as_dict(), "portfolio": self._cmd_portfolio({})["portfolio"]}
 
     def _cmd_portfolio_remove(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Forget an org from the register. **Its folder and run history are left on disk.**
+
+        That is the engine's own documented behaviour (`portfolio.remove_org` and the CLI's
+        `portfolio remove` help both say it), and it is the fact a confirmation has to state before a
+        person agrees — "remove" that quietly leaves gigabytes behind is the surprise this method's
+        caller must not create.
+
+        Re-pointing when the *active* org is the one removed is not cosmetic. `remove_org` reassigns
+        `active_org_id` to another entry, but this server's `workspace` and `orchestrator` were built
+        for the org that just went — so without this the roster, mission, goal and run history would go
+        on describing an org no longer in the register, and the switcher would show nothing selected
+        while the panels showed the departed one.
+        """
+        portfolio = self._load_portfolio()
+        if portfolio is None:
+            raise ServerError("no portfolio")
+        ref = str(payload.get("org") or "").strip()
+        was_active = False
+        try:
+            entry = portfolio.org(ref)
+            was_active = entry.id == portfolio.active_org_id
+            entry = portfolio.remove_org(ref)
+            portfolio.save()
+        except Exception as exc:  # noqa: BLE001
+            raise ServerError(str(exc)) from exc
+
+        detail: dict[str, Any] = {
+            "removed": entry.as_dict(),
+            "portfolio": self._cmd_portfolio({})["portfolio"],
+            "folder_kept": entry.path,
+            "repointed": False, "repoint_reason": "",
+        }
+        if not was_active:
+            return detail
+        successor = portfolio.active_org()
+        if successor is None:
+            # The register is now empty. Nothing to point at, and saying so beats leaving the panels
+            # describing an org the person just deleted.
+            detail["repoint_reason"] = (
+                "the register is now empty; the next org you add becomes the active one")
+            self.orchestrator = None
+            return detail
+        if self._has_live_run():
+            detail["repoint_reason"] = (
+                f"a run is in flight in this window, so the engine is still pointed at {entry.slug}; "
+                "stop it to switch")
+            return detail
+        try:
+            workspace = self._workspace_for_org(successor)
+        except Exception as exc:  # noqa: BLE001 - a broken successor must not fail the removal
+            detail["repoint_reason"] = str(exc)
+            return detail
+        workspace.ensure()
+        self.workspace = workspace
+        self.slug = successor.slug
+        self.orchestrator = None
+        detail["repointed"] = True
+        detail["active_org_id"] = successor.id
+        detail["workspace"] = self._workspace_info()
+        return detail
+
+    def _cmd_portfolio_removal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """What removing one org would take away, and what it would leave behind.
+
+        A **preview**, asked before the confirmation is shown, so the sentence a person agrees to is
+        the engine's account of the consequence rather than a guess written in Swift. It walks the
+        org's folder to size it, which is why it is its own command and not a field on the portfolio
+        snapshot: that snapshot is on the 2s poll, and a directory walk per org per poll is exactly the
+        kind of silent cost this codebase avoids.
+
+        `can_delete_folder` is reported as the engine's **actual** capability, not as a wish. It is
+        false today (`portfolio.remove_org` has no delete arm, and the CLI's help says so), and the
+        console therefore offers no switch that would not work.
+        """
         portfolio = self._load_portfolio()
         if portfolio is None:
             raise ServerError("no portfolio")
         ref = str(payload.get("org") or "").strip()
         try:
-            entry = portfolio.remove_org(ref)
-            portfolio.save()
-        except Exception as exc:  # noqa: BLE001
+            entry = portfolio.org(ref)
+        except Exception as exc:  # noqa: BLE001 - a refusal is the answer, said plainly
             raise ServerError(str(exc)) from exc
-        return {"removed": entry.as_dict(), "portfolio": self._cmd_portfolio({})["portfolio"]}
+
+        path = entry.workspace_path
+        if path is None:
+            # A managed org names no folder at all. Report that honestly as an empty folder and a null
+            # size — never `.`, which `Path()` would have produced and which reads as a real directory
+            # the org is about to lose. The console's "it works under the managed projects directory"
+            # branch keys off exactly this empty string.
+            folder, exists = "", False
+        else:
+            folder, exists = str(path), path.is_dir()
+        return {
+            "org": entry.as_dict(),
+            "active": entry.id == portfolio.active_org_id,
+            "folder": folder,
+            "folder_exists": exists,
+            # `None` rather than 0 when there is no folder: "no folder to size" and "an empty folder"
+            # are different facts, and a 0 here would read as "nothing is on disk".
+            "folder_bytes": _directory_bytes(path) if exists else None,
+            "folder_kept": True,
+            "can_delete_folder": False,
+            "can_delete_folder_why": (
+                "the engine forgets the register entry and never touches the folder — "
+                f"`portfolio remove` leaves {entry.slug}'s state where it is, by design"),
+        }
+
+    def _cmd_schedules(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """The schedule for this workspace: what is armed, what is due, and what a fire did."""
+        from .schedules import ScheduleError, ScheduleStore
+
+        try:
+            store = ScheduleStore(self.workspace)
+        except ScheduleError as exc:
+            raise ServerError(str(exc)) from exc
+        view = store.view()
+        view["workspace"] = str(getattr(self.workspace, "path", ""))
+        return view
+
+    def _cmd_schedule_remove(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Forget one scheduled entry, leaving the rest of the schedule alone.
+
+        Destructive and unrecoverable — `ScheduleStore.remove` says as much, which is why it insists on
+        an id when a slug is ambiguous — so the reply carries the removed entry back, whole, for the
+        caller to read out. The engine's own refusals (no match, an ambiguous slug) surface unchanged.
+        """
+        from .schedules import ScheduleError, ScheduleStore
+
+        ref = str(payload.get("schedule_id") or payload.get("ref") or "").strip()
+        if not ref:
+            raise ServerError("schedule_remove needs a schedule_id")
+        try:
+            store = ScheduleStore(self.workspace)
+            entry = store.remove(ref)
+        except ScheduleError as exc:
+            raise ServerError(str(exc)) from exc
+        return {"removed": entry.as_dict(), "schedule": self._cmd_schedules({})}
 
     def _cmd_fanout(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Start a fan-out from the console: a template, some items, and go.
@@ -1708,7 +2984,15 @@ class Server:
         return self._last_fanout
 
     def _cmd_shutdown(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """A clean stop: the app asked, so the loop ends rather than being killed."""
+        """A clean stop: the app asked, so the loop ends rather than being killed.
+
+        The stop flag is what ends the read loop *and* the worker — after this command, which is why
+        `_shutdown` answers everything still queued rather than running it: the worker will not take
+        another command, so a queued one is a command that will never run, and leaving it unanswered
+        would leave the app waiting on it. The reason is recorded here so those refusals can say what
+        stopped them.
+        """
+        self._stop_reason = self._stop_reason or "the app asked the engine to stop (shutdown command)"
         self._stop.set()
         return {"stopping": True}
 
@@ -1730,7 +3014,8 @@ class Server:
         else:
             workspace = Workspace.for_project(slug, root=self.workspace.root)
         workspace.ensure()
-        bus = EventBus(run_id=f"serve_{slug}", trace_path=workspace.trace_path)
+        bus = EventBus(run_id=f"serve_{slug}", trace_path=workspace.trace_path,
+                       lifecycle=self.config, lifecycle_slug=workspace.display_name)
         org = None
         try:
             providers, _ = build_providers(self.config)
@@ -1749,10 +3034,24 @@ class Server:
         return self.orchestrator
 
     def _current_run(self) -> tuple[Any, Any | None]:
+        """The run a bare run-command acts on — the one already in memory, when there is one.
+
+        `load()` re-reads the checkpoint and, in doing so, **replaces the orchestrator's own run with a
+        copy loaded from disk**. That is exactly right on a server that has just started, where the only
+        run there is lives on disk. It is wrong while a graph is executing: the run thread holds the
+        other object, so an instruction appended to the copy is overwritten by the run's next persist —
+        accepted, acknowledged, and then silently lost. One object, or the two writers disagree.
+
+        Reachable now and not before: while the run executed on the command worker, no command could run
+        beside it, so this never raced.
+        """
         if self.orchestrator is None:
             return None, None
+        live = getattr(self.orchestrator, "_run", None)
+        if live is not None:
+            return self.orchestrator, live
         try:
-            return self.orchestrator, self.orchestrator.status() and self.orchestrator.load(self.slug)
+            return self.orchestrator, self.orchestrator.load(self.slug)
         except Exception:  # noqa: BLE001 - "no run" is reported by the caller, not raised here
             return self.orchestrator, None
 
@@ -1763,8 +3062,37 @@ class Server:
         return org.roster_view()
 
     def _cost(self) -> dict[str, Any]:
-        """Cost, labelled. An unmeasured figure is never rendered as zero."""
-        return {"runs": 0, "nodes": 0, "cost_usd": None}
+        """Cost for this workspace, read from the run's own budget. Never an invented figure.
+
+        This is the *idle* branch — it is called when no orchestrator is attached, which is exactly
+        the state after a run finishes. It used to return a hardcoded `{"runs": 0, "nodes": 0,
+        "cost_usd": None}`, so the cost panel emptied the moment a run ended and the person could not
+        see what the run they had just watched had cost. The figure lives in the run checkpoint, which
+        the executor writes from the agent runtime's running totals (`spent_tokens`/`spent_usd`), so
+        read it there rather than restating zero.
+
+        `cost_usd` is `None` unless a positive total is recorded. A stored `0.0` does not distinguish
+        "the provider never reported a price" from "this genuinely cost nothing", and the app renders
+        `None` as *cost unknown* — so the ambiguous zero reports as unknown rather than as free. That
+        is the same rule the ledger's own `cache_saving_usd` follows: unreported is not zero.
+        """
+        checkpoint = None
+        try:
+            checkpoint = self.workspace.load_checkpoint()
+        except Exception:  # noqa: BLE001 - an unreadable checkpoint is "no data", not a failure
+            checkpoint = None
+        if checkpoint is None:
+            return {"runs": 0, "nodes": 0, "cost_usd": None}
+        budget = getattr(checkpoint, "budget", None) or {}
+        try:
+            usd = float(budget.get("usd_used") or 0.0)
+        except (TypeError, ValueError):
+            usd = 0.0
+        # `cost_unreported_spans` is deliberately absent rather than 0: this branch has no ledger to
+        # ask, and the app reads a missing key as "no claim" while a present 0 would assert that every
+        # span reported its usage — a claim nothing here can support.
+        return {"runs": 1, "nodes": len(getattr(checkpoint, "nodes", None) or {}),
+                "cost_usd": usd if usd > 0 else None}
 
     def _forward_bus(self, orch: Any) -> None:
         """Forward the run's own events to the app.

@@ -4,30 +4,44 @@
 WHY THIS EXISTS
 ---------------
 AgentOrg does not merely *read* the zeroes-ones/Skills library: it treats it as a
-**dependency**. Skill bodies become system-prompt content, `workflow:` frontmatter
-supplies the completion criteria that gate every phase transition, `workflow/templates/`
-supply the boundary prompts, and `evals/golden/` supplies the health-probe corpus.
-A floating path is therefore a supply-chain hole: modify a `SKILL.md` on disk and you
-have silently changed what every agent is instructed to do.
+**dependency**. Skill bodies become system-prompt content and `workflow:` frontmatter
+supplies the completion criteria that gate every phase transition. A floating path is
+therefore a supply-chain hole: modify a `SKILL.md` on disk and you have silently changed
+what every agent is instructed to do.
+
+Only what is read is registered here. The library also ships `workflow/templates/`,
+`.skills-compiled/`, `evals/golden/` and `evals/tier3-behavioral/`, but those belong to the
+library's *own* consumers — its `iterative-task-execution` skill and its eval toolchain —
+and this engine never opens them: the boundary protocol is implemented in
+:mod:`engine.prompts`, and skills are parsed from raw markdown. Registering them anyway
+would put a resolved path in every diagnostic and, for the required ones, refuse startup
+over a directory no line of code reads.
 
 DESIGN
 ------
-- **Pin by commit SHA when the library is a git checkout.** The SHA is recorded in the
-  config; a mismatch is a hard failure, not a warning, because the alternative is
-  running a prompt you did not review.
+- **Pin by commit SHA when the library is a git checkout.** A mismatch is a hard failure,
+  not a warning, because the alternative is running a prompt you did not review.
 - **Verify a content manifest.** Every consumed file is hashed and checked against a
   recorded manifest, so tampering is detectable even without git.
-- **Fail loud, fail early.** A missing runner, a missing schema directory or a hash
-  mismatch raises :class:`LibraryError` at startup rather than surfacing as a confusing
-  failure three hours into a run.
+- **Report which check actually ran, never a single "verified".** `capabilities_verified`
+  means the paths resolved and the runner advertises the flags we call; `commit_pinned` and
+  `manifest_pinned` mean a *supplied* pin was compared and matched. With no pin there is no
+  comparison, so both pin flags stay false — collapsing the two facts into one boolean is
+  how a reader comes to believe content was hashed when nothing was.
+- **A pin is opt-in, but real.** A recorded pin is discovered at
+  :func:`default_pin_path` (or named explicitly), compared on every resolve, and refused
+  loudly on mismatch. Absent by default, so a first run against an unpinned checkout works.
+- **Fail loud, fail early.** A missing runner or a hash mismatch raises
+  :class:`LibraryError` at startup rather than surfacing as a confusing failure three hours
+  into a run.
 - **Never import from the library.** We read its files as data. Nothing in it is
   executed as code, and its content is confined to the prompt slot it belongs to.
 
 Usage:
     from engine.library import resolve
     lib = resolve()                      # uses config/defaults
-    lib.paths.runner                     # .../scripts/workflow-runner.py
-    lib.verify()                         # raises LibraryError on mismatch
+    lib.files.runner                     # .../scripts/workflow-runner.py
+    lib.verification_summary()           # what was actually checked
 """
 
 from __future__ import annotations
@@ -39,16 +53,18 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-__all__ = ["LibraryError", "LibraryFiles", "Library", "resolve", "sha256_file", "sha256_text"]
+__all__ = ["LibraryError", "LibraryFiles", "Library", "resolve", "sha256_file", "sha256_text",
+           "load_pin", "default_pin_path", "PIN_ENV"]
 
 
 class LibraryError(RuntimeError):
     """Raised when the pinned Skills library is missing, mismatched or unverifiable."""
 
 
-# Files the engine genuinely depends on. Each entry is (attribute, relative path).
-# `required` entries raise if absent; `optional` entries are recorded when present.
+# Files the engine genuinely depends on. Each entry is (attribute, relative path); an absent one
+# refuses startup, so an entry earns its place by having a reader.
 _REQUIRED = (
     ("runner", "scripts/workflow-runner.py"),
     ("validator", "scripts/validate-workflows.py"),
@@ -57,16 +73,16 @@ _REQUIRED = (
     ("safe_yaml", "scripts/lib/safe_yaml.py"),
     ("lint_workflow", "scripts/lib/lint-workflow.py"),
 )
+# Directories the engine reads. `schema` is required even though no AgentOrg line opens it:
+# `scripts/validate-workflows.py` — which this engine does invoke — is documented to validate
+# manifests against `workflow/schema/workflow-manifest.schema.yaml`, so the directory is a
+# precondition of a component we delegate to. The four directories that are *not* here
+# (`workflow/templates`, `.skills-compiled`, `evals/golden`, `evals/tier3-behavioral`) have no
+# such delegate: they serve the library's own skill and eval toolchain.
 _REQUIRED_DIRS = (
-    ("templates", "workflow/templates"),
     ("schema", "workflow/schema"),
     ("flat_skills", "skills-flat"),
     ("nested_skills", "skills"),
-)
-_OPTIONAL_DIRS = (
-    ("compiled", ".skills-compiled"),
-    ("golden", "evals/golden"),
-    ("behavioral", "evals/tier3-behavioral"),
 )
 # Substrings that must appear in the runner's argparse surface. If a future library
 # version drops one of these, our host integration silently degrades — so we assert
@@ -78,10 +94,61 @@ _RUNNER_CAPABILITIES = (
     "--state",
     "--memory",
     "--enforce-contracts",
+    "--contract-rework",
     "--max-steps",
 )
 # Directories pruned from manifest walks: never hash git objects or caches.
 _MANIFEST_PRUNE = {".git", "__pycache__", ".DS_Store", ".pytest_cache"}
+
+#: Environment variable naming a recorded pin document, so a CI checkout can be pinned without
+#: writing into the repository.
+PIN_ENV = "AGENTORG_LIBRARY_PIN"
+#: The recorded pin's conventional name, beside this module's repository root. Absent in a fresh
+#: checkout, which is what keeps pin enforcement opt-in rather than a refusal on every run.
+_PIN_FILENAME = ".library-pin.json"
+
+
+def default_pin_path() -> Path:
+    """Where a recorded pin is looked for when the caller names none.
+
+    The environment first, so a machine that checks out the library somewhere unusual can point at
+    its own pin; otherwise the engine repository's `.library-pin.json`. A path is returned whether
+    or not it exists — the caller decides what an absent pin means, and on a first run it means
+    "nothing to compare against", not a failure.
+    """
+    override = os.environ.get(PIN_ENV)
+    if override:
+        return Path(override).expanduser()
+    return Path(__file__).resolve().parent.parent / _PIN_FILENAME
+
+
+def load_pin(path: os.PathLike | str) -> tuple[str | None, dict[str, str], str | None]:
+    """Read a pin document written by :meth:`Library.write_manifest`.
+
+    Returns `(commit, files, library_root)`. A malformed document — or one carrying no file
+    hashes — raises rather than returning an empty pin, because an empty manifest compares
+    nothing and would then report a match: the same overstatement this module exists to remove.
+    """
+    target = Path(path)
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise LibraryError(f"cannot read library pin {target}: {exc}") from exc
+    except ValueError as exc:
+        raise LibraryError(f"library pin {target} is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise LibraryError(f"library pin {target} is not an object, so it records no comparison")
+    files = payload.get("files")
+    if not isinstance(files, dict) or not files:
+        raise LibraryError(
+            f"library pin {target} records no file hashes, so it cannot verify anything.\n"
+            "  record one with: python3 -m engine.cli skills pin"
+        )
+    commit = payload.get("commit")
+    root = payload.get("library_root")
+    return (str(commit) if commit else None,
+            {str(key): str(value) for key, value in files.items()},
+            str(root) if root else None)
 
 
 def sha256_file(path: os.PathLike | str) -> str:
@@ -100,7 +167,12 @@ def sha256_text(text: str) -> str:
 
 @dataclass(frozen=True)
 class LibraryFiles:
-    """Resolved absolute paths into the pinned library."""
+    """Resolved absolute paths into the parts of the pinned library the engine reads.
+
+    Every field here has a reader in `engine/`. A path that nothing opens is not a fact about a
+    dependency, it is a liability: it shows up in diagnostics as if it mattered, and when it is
+    required a missing directory refuses startup over something no code would have touched.
+    """
 
     root: Path
     runner: Path
@@ -109,13 +181,9 @@ class LibraryFiles:
     export_traces: Path
     safe_yaml: Path
     lint_workflow: Path
-    templates: Path
     schema: Path
     flat_skills: Path
     nested_skills: Path
-    compiled: Path | None
-    golden: Path | None
-    behavioral: Path | None
 
     def as_dict(self) -> dict[str, str | None]:
         """Serialise to plain strings for events and diagnostics."""
@@ -127,36 +195,88 @@ class LibraryFiles:
             "export_traces": str(self.export_traces),
             "safe_yaml": str(self.safe_yaml),
             "lint_workflow": str(self.lint_workflow),
-            "templates": str(self.templates),
             "schema": str(self.schema),
             "flat_skills": str(self.flat_skills),
             "nested_skills": str(self.nested_skills),
-            "compiled": str(self.compiled) if self.compiled else None,
-            "golden": str(self.golden) if self.golden else None,
-            "behavioral": str(self.behavioral) if self.behavioral else None,
         }
 
 
 @dataclass
 class Library:
-    """A pinned, verified view of the Skills library.
+    """A resolved view of the Skills library, with the two integrity facts kept apart.
 
     Attributes
     ----------
     files:
         Resolved paths.
     commit:
-        The git commit SHA of the checkout, when the library is a git repo.
+        The git commit SHA of the checkout, when the library is a git repo. Recorded whether or
+        not it was compared against anything.
     manifest:
-        Mapping of path-relative-to-root -> sha256 for every consumed file.
-    verified:
-        True once :meth:`verify` has passed against a recorded manifest.
+        Mapping of path-relative-to-root -> sha256, populated only by a manifest comparison or by
+        :meth:`build_manifest`.
+    capabilities_verified:
+        The paths resolved *and* the runner advertises every flag this engine calls. True on any
+        successful :func:`resolve`, and the only fact a run with no pin can honestly claim.
+    commit_pinned:
+        A supplied `expected_commit` was compared and matched.
+    manifest_pinned:
+        A supplied (or recorded) content manifest was compared and matched, file by file.
+    pin_source:
+        The pin document that was loaded, when one was.
+    pin_note:
+        Why an available pin was *not* compared — a pin recorded for a different checkout must
+        not refuse this one, but the skip has to be visible rather than silently relaxing the
+        check.
     """
 
     files: LibraryFiles
     commit: str | None = None
     manifest: dict[str, str] = field(default_factory=dict)
-    verified: bool = False
+    capabilities_verified: bool = False
+    commit_pinned: bool = False
+    manifest_pinned: bool = False
+    pin_source: str | None = None
+    pin_note: str | None = None
+
+    @property
+    def pinned(self) -> bool:
+        """True only when a recorded pin was actually compared and matched.
+
+        Deliberately not named `verified`: it says which question was answered, and the two flags
+        behind it say whether the evidence was a commit or file hashes.
+        """
+        return self.commit_pinned or self.manifest_pinned
+
+    def verification_report(self) -> dict[str, Any]:
+        """The integrity facts, separately, for a JSON consumer.
+
+        `doctor --json` and the session's `/doctor` render this, so an operator sees "capabilities
+        checked; content unpinned" instead of a boolean that would be true either way.
+        """
+        return {
+            "capabilities_verified": self.capabilities_verified,
+            "pinned": self.pinned,
+            "commit_pinned": self.commit_pinned,
+            "manifest_pinned": self.manifest_pinned,
+            "pin_source": self.pin_source,
+            "pin_note": self.pin_note,
+            "manifest_files": len(self.manifest),
+        }
+
+    def verification_summary(self) -> str:
+        """One honest sentence about what was checked, for a human-readable line."""
+        if self.manifest_pinned:
+            checked = f"content pin matched ({len(self.manifest)} files)"
+        elif self.commit_pinned:
+            checked = "commit pin matched; content not hash-checked"
+        elif self.capabilities_verified:
+            checked = "capabilities checked; content unpinned"
+        else:
+            checked = "nothing checked"
+        if self.pin_note:
+            checked += f"; pin not applied ({self.pin_note})"
+        return checked
 
     # ── verification ────────────────────────────────────────────────────────
 
@@ -184,6 +304,9 @@ class Library:
         A file existing is not the same as the file supporting what we need. Dropping
         `--guardrail` in a future library release would silently disable handoff
         safety, so we verify the surface we depend on at startup.
+
+        Success is recorded as `capabilities_verified` — one of the two integrity facts this class
+        reports, and the only one that is true without a pin to compare against.
         """
         try:
             text = self.files.runner.read_text(encoding="utf-8", errors="replace")
@@ -203,13 +326,17 @@ class Library:
                 "'execute_node(node_id, state, ctx)' executor contract; "
                 "AgentOrg's executor plugin would not be loaded."
             )
+        self.capabilities_verified = True
 
     def build_manifest(self) -> dict[str, str]:
         """Hash every file under the consumed directories.
 
-        The manifest is the tamper-evidence record: it is written next to the
-        workspace and re-checked on every startup, so a modified `SKILL.md` or a
-        swapped `workflow-runner.py` is detected before a single token is spent.
+        The manifest is the tamper-evidence record: recorded as a pin by `skills pin`, and
+        re-checked on every startup against it, so a modified `SKILL.md` or a swapped
+        `workflow-runner.py` is detected before a single token is spent. It covers `scripts/`,
+        `workflow/` and `evals/` including the material this engine does not read, because a pin
+        that skipped those directories would leave the library's own toolchain outside the
+        tamper boundary — and that toolchain is invoked.
         """
         manifest: dict[str, str] = {}
         for sub in ("scripts", "workflow", "evals"):
@@ -263,7 +390,13 @@ class Library:
 
     def verify(self, expected_commit: str | None = None,
                expected_manifest: dict[str, str] | None = None) -> None:
-        """Verify the library against a recorded commit and/or manifest.
+        """Compare the library against a recorded commit and/or manifest.
+
+        What this method does *not* do is claim a comparison that never happened. With no pin it
+        asserts capabilities and returns with both pin flags still false, because the honest answer
+        to "did the content match a recorded pin?" is "there was no pin to match" — and a single
+        flag set on both paths reads to every later reader as "hash checked" on a checkout where
+        not one hash was compared.
 
         Raises
         ------
@@ -286,9 +419,9 @@ class Library:
                     "  Review the change, then re-pin deliberately rather than running "
                     "against unreviewed prompt content."
                 )
+            self.commit_pinned = True
 
         if expected_manifest is None:
-            self.verified = True
             return
 
         actual = self.build_manifest()
@@ -310,7 +443,7 @@ class Library:
             )
 
         self.manifest = actual
-        self.verified = True
+        self.manifest_pinned = True
 
     # ── skill lookup ────────────────────────────────────────────────────────
 
@@ -383,9 +516,31 @@ def default_search_paths() -> list[str]:
     return candidates
 
 
+def _pin_from(pin_path: os.PathLike | str | None, root: Path,
+              lib: "Library") -> tuple[str | None, dict[str, str] | None]:
+    """Load the recorded pin, unless it describes a different checkout.
+
+    A pin names the root it was recorded from. Applying one to another checkout would refuse every
+    run on a second machine over a pin that was never about that tree, so the mismatch is recorded
+    on the handle as `pin_note` and nothing is enforced — visible in `doctor`, never silent. A pin
+    with no recorded root is applied, because omitting the root is a deliberate statement that the
+    pin describes whatever library it is pointed at.
+    """
+    target = Path(pin_path).expanduser() if pin_path else default_pin_path()
+    if not target.is_file():
+        return None, None
+    commit, manifest, recorded_root = load_pin(target)
+    lib.pin_source = str(target)
+    if recorded_root is not None and Path(recorded_root).expanduser() != root:
+        lib.pin_note = f"recorded for {recorded_root}, not {root}"
+        return None, None
+    return commit, manifest
+
+
 def resolve(root: os.PathLike | str | None = None, *,
             expected_commit: str | None = None,
             expected_manifest: dict[str, str] | None = None,
+            pin_path: os.PathLike | str | None = None,
             verify: bool = True) -> Library:
     """Resolve and (optionally) verify the pinned Skills library.
 
@@ -397,9 +552,15 @@ def resolve(root: os.PathLike | str | None = None, *,
         Pin. Raises on mismatch when supplied.
     expected_manifest:
         Recorded content manifest. Raises on any missing or changed file.
+    pin_path:
+        Where a recorded pin is looked for when one is not passed directly. Defaults to
+        :func:`default_pin_path` — `$AGENTORG_LIBRARY_PIN`, then `<repo>/.library-pin.json`. A path
+        that does not exist means "no pin", not an error: an unpinned checkout is the normal first
+        state.
     verify:
-        When False, only path resolution and capability assertions run. Used by
-        tooling that wants to *build* a manifest for the first time.
+        When False, only path resolution and capability assertions run, and a recorded pin is not
+        loaded. Used by tooling that wants to *build* a manifest for the first time: a tree being
+        pinned cannot be checked against the pin it is about to write.
     """
     resolved: Path | None
     if root is not None:
@@ -428,17 +589,18 @@ def resolve(root: os.PathLike | str | None = None, *,
         if not path.is_dir():
             raise LibraryError(f"library directory missing: {path}")
         attrs[attr] = path
-    for attr, rel in _OPTIONAL_DIRS:
-        path = resolved / rel
-        attrs[attr] = path if path.is_dir() else None
 
     files = LibraryFiles(root=resolved, **attrs)
+    # The commit is a fact about the checkout, not a result of checking it, so it is recorded even
+    # on the unverified path — that is what a pin document needs to carry.
     lib = Library(files=files, commit=None)
+    lib.commit = lib._git_commit()
 
-    if verify:
-        lib.commit = lib._git_commit()
-        lib.verify(expected_commit=expected_commit, expected_manifest=expected_manifest)
-    else:
+    if not verify:
         lib.assert_capabilities()
+        return lib
 
+    if expected_commit is None and expected_manifest is None:
+        expected_commit, expected_manifest = _pin_from(pin_path, resolved, lib)
+    lib.verify(expected_commit=expected_commit, expected_manifest=expected_manifest)
     return lib

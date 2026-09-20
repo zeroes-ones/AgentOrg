@@ -112,13 +112,18 @@ class AgentLoop:
                  max_steps: int = DEFAULT_MAX_STEPS,
                  can_continue: Callable[[], tuple[bool, str]] | None = None,
                  on_step: Callable[[dict[str, Any]], None] | None = None,
-                 max_output_tokens: int = 4096) -> None:
+                 max_output_tokens: int = 4096,
+                 repeat_reminders: Iterable[int] = ()) -> None:
         self.complete = complete
         self.tools = tools
         self.max_steps = max(1, int(max_steps))
         self.can_continue = can_continue
         self.on_step = on_step
         self.max_output_tokens = max_output_tokens
+        #: Step counts at which to remind a model that has repeated the same consecutive tool call.
+        #: Reminders, not stops: a legitimate retry after a transient failure is real, so the calls
+        #: still execute. Empty means the guard is off.
+        self.repeat_reminders = tuple(sorted(int(n) for n in (repeat_reminders or ()) if int(n) > 0))
 
     def run(self, *, system: str, user: str,
             history: Iterable[Any] = ()) -> LoopOutcome:
@@ -134,6 +139,9 @@ class AgentLoop:
         messages: list[Message] = list(history)
         messages.append(Message.text_message(Role.USER, user))
         specs = self.tools.specs() if hasattr(self.tools, "specs") else []
+        # Repetition tracking, for the guard below.
+        previous_signature: tuple[str, ...] | None = None
+        repeat_streak = 0
 
         # ── the step budget is declared, and the last step is reserved for the answer ──
         #
@@ -205,6 +213,18 @@ class AgentLoop:
                 outcome.stop_reason = "the model finished"
                 return outcome
 
+            # Repetition tracking: a model genuinely stuck on one call will otherwise spend its
+            # entire bound re-issuing it and finish with nothing — which for an *unattended* run is
+            # the quietest possible failure, because nobody is watching the steps go by. The reminder
+            # is injected rather than acted on: a repeated call is often a legitimate retry, so the
+            # loop says what it noticed and leaves the decision to the model.
+            signature = self._call_signature(calls)
+            if signature and signature == previous_signature:
+                repeat_streak += 1
+            else:
+                repeat_streak = 1
+            previous_signature = signature
+
             # Record the assistant turn *with* its tool calls, then each result, so the next request
             # carries the exchange rather than only the last message.
             messages.append(self._assistant_turn(text, calls))
@@ -220,11 +240,42 @@ class AgentLoop:
                 outcome.paths.extend(getattr(result, "paths", []) or [])
                 messages.append(self._tool_result(call, result))
 
+            # The reminder goes *after* the results, so it reads as feedback on what the model just
+            # did rather than as an instruction issued before it acted. Placing it first also put it
+            # between the assistant turn and its own tool results, which is a malformed exchange for a
+            # provider expecting the calls and their outputs to be adjacent.
+            if repeat_streak in self.repeat_reminders and not final:
+                messages.append(Message.text_message(
+                    Role.USER,
+                    f"[repeat] You have issued the same tool call {repeat_streak} times in a row. If "
+                    "it is not returning what you need, try a different call or different arguments "
+                    "rather than repeating it, or state what is blocking you."))
+
         # The bound ended it. Reported rather than hidden: a node that ran out of steps has not
         # finished, and calling that done is the failure the evidence contract exists to prevent.
         outcome.exhausted = True
         outcome.stop_reason = f"reached the {self.max_steps}-step bound without the model finishing"
         return outcome
+
+    @staticmethod
+    def _call_signature(calls: list[Any]) -> tuple[str, ...]:
+        """A stable fingerprint of one step's tool calls, for detecting a repeat.
+
+        Sorted by `(name, arguments)` so a model that swaps the order of two independent calls is not
+        counted as a repeat — what matters is issuing the *same work* again, not the sequence it was
+        written in. Arguments are canonicalised with `sort_keys`, matching how the rest of the engine
+        hashes a structure, so key order cannot masquerade as a difference.
+        """
+        parts: list[str] = []
+        for call in calls:
+            name = str(getattr(call, "name", "") or "")
+            arguments = getattr(call, "arguments", None) or {}
+            try:
+                rendered = json.dumps(arguments, sort_keys=True, default=str)
+            except Exception:  # noqa: BLE001 - an unrenderable argument is still a repeat signal
+                rendered = str(arguments)
+            parts.append(f"{name}({rendered})")
+        return tuple(sorted(parts))
 
     # ── message construction ────────────────────────────────────────────────
 

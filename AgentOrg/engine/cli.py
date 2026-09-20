@@ -39,6 +39,7 @@ from typing import Any
 
 from .bus import EventBus
 from .catalog import ModelCatalog
+from .completion import SUPPORTED_SHELLS
 from .config import ConfigError, load, scan_for_leaks
 from .library import LibraryError, resolve
 from .org import Binder, HiringDesk, PolicyResolver, Router, default_company
@@ -49,6 +50,7 @@ from .planner import PlanError, Planner, emit_safe_yaml
 from .state import Workspace
 from .providers.registry import build_providers
 from .resources import derive_ceiling, detect
+from .schedules import DEFAULT_TICK_S, MAX_TICK_S, MIN_TICK_S
 from .skills import FilesystemSkillSource, SkillError
 from .skills.bundle import Tier
 
@@ -91,7 +93,8 @@ def _load_stack(args: argparse.Namespace) -> tuple[Any, FilesystemSkillSource, d
         _warn(f"warning: {warning}")
 
     try:
-        library = resolve(getattr(args, "library", None))
+        library = resolve(getattr(args, "library", None),
+                          pin_path=getattr(args, "library_pin", None))
     except LibraryError as exc:
         _warn(f"library error: {exc}")
         raise SystemExit(EXIT_CHECK_FAILED) from exc
@@ -118,18 +121,95 @@ def _skill_source_for(library: Any, root: Any = None) -> Any:
 # ── doctor ───────────────────────────────────────────────────────────────────
 
 
+def cmd_completion(args: argparse.Namespace) -> int:
+    """Print a shell completion script for this command tree.
+
+    The script is the *only* thing on stdout — a banner or a progress line would corrupt
+    `engine.cli completion bash > file`, which is the single way this command is meant to be used.
+    A refusal (an unsupported shell) goes to stderr and exits as a usage error.
+    """
+    from .completion import script_for
+
+    try:
+        # `build_parser` is called here rather than taking the namespace's own parser, because the
+        # script must describe the tree as it exists at this moment; a cached script is exactly the
+        # staleness this module exists to avoid.
+        script = script_for(str(args.shell), build_parser(),
+                            program=getattr(args, "program", "engine.cli"))
+    except ValueError as exc:
+        _warn(str(exc))
+        return EXIT_USAGE
+    print(script, end="")
+    return EXIT_OK
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Check every precondition and report what was verified.
 
     This is the first command to run when something is wrong, and the reason it reports each check
     individually is that "it does not work" is not a diagnosis.
+
+    A thin renderer over :func:`doctor_checks`, so the chat's `/doctor` and this command cannot
+    disagree about what a healthy engine is.
+    """
+    try:
+        checks = doctor_checks(getattr(args, "config", None), getattr(args, "library", None),
+                               getattr(args, "library_pin", None))
+    except ConfigError as exc:
+        # A failure is a diagnostic, so it goes to stderr with the rest of them. stdout stays
+        # reserved for the answer, which is what makes `--json | tool` reliable.
+        _warn(f"FAIL configuration\n  {exc}")
+        if args.json:
+            print(json.dumps({"checks": [{"check": "configuration", "ok": False, "detail": str(exc)}],
+                              "failures": 1}, indent=2, sort_keys=True))
+        return EXIT_CHECK_FAILED
+
+    # A configuration that will not load stops the run of checks at the first one, and it is reported
+    # the old way: as a diagnostic on stderr, because nothing else can be checked without it. Detected
+    # from the shape `doctor_checks` returns rather than from a second exception, so the chat's
+    # `/doctor` sees the same failed check as a value instead of an abort.
+    if len(checks) == 1 and checks[0]["check"] == "configuration" and not checks[0]["ok"]:
+        _warn(f"FAIL configuration\n  {checks[0]['detail']}")
+        if args.json:
+            print(json.dumps({"checks": checks, "failures": 1}, indent=2, sort_keys=True))
+        return EXIT_CHECK_FAILED
+
+    failures = sum(1 for c in checks if not c["ok"])
+    if args.json:
+        print(json.dumps({"checks": checks, "failures": failures}, indent=2, sort_keys=True))
+    else:
+        width = max(len(c["check"]) for c in checks)
+        for check in checks:
+            mark = "OK  " if check["ok"] else "FAIL"
+            print(f"{mark} {check['check']:<{width}}  {check['detail']}")
+            for warning in check.get("warnings") or []:
+                print(f"     warning: {warning}")
+            for entry in check.get("skipped") or []:
+                print(f"     skipped: {entry}")
+        print()
+        print("doctor: all checks passed" if not failures
+              else f"doctor: {failures} check(s) failed")
+    return EXIT_OK if not failures else EXIT_CHECK_FAILED
+
+
+def doctor_checks(config_path: Any = None, library_path: Any = None,
+                  library_pin: Any = None) -> list[dict[str, Any]]:
+    """Every precondition, as a list of `{check, ok, detail, …}` — the one implementation of `doctor`.
+
+    Extracted from `cmd_doctor` for a concrete reason: the chat's `/doctor` must run the *same*
+    checks. Two copies of "what a healthy engine is" is a second thing to keep correct, and the first
+    time they drifted the session would bless an environment the command refuses.
+
+    `config_path` is honoured as the loader honours an explicit path — exclusively, with no fallback —
+    so a check run against one file cannot silently report on another. A missing configuration is
+    returned as a single failed check rather than raised: the caller decides whether that is fatal
+    (the CLI command exits 1) or merely the first thing to report (the chat keeps its session).
     """
     checks: list[dict[str, Any]] = []
-    failures = 0
 
     # 1. Configuration.
     try:
-        config = load(getattr(args, "config", None))
+        config = load(config_path)
         checks.append({
             "check": "configuration",
             "ok": True,
@@ -138,20 +218,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         })
     except ConfigError as exc:
         checks.append({"check": "configuration", "ok": False, "detail": str(exc)})
-        # A failure is a diagnostic, so it goes to stderr with the rest of them. stdout stays
-        # reserved for the answer, which is what makes `--json | tool` reliable.
-        _warn(f"FAIL configuration\n  {exc}")
-        if args.json:
-            print(json.dumps({"checks": checks, "failures": 1}, indent=2, sort_keys=True))
-        return EXIT_CHECK_FAILED
+        return checks
 
-    # 2. Library, pinned and hash-verified.
+    # 2. Library. The detail carries the two integrity facts separately rather than one word
+    # "verified", because a checkout with no pin has checked its runner's capabilities and nothing
+    # else — and an operator reading "verified" would not know that.
     try:
-        library = resolve(getattr(args, "library", None))
+        library = resolve(library_path, pin_path=library_pin)
         checks.append({
             "check": "skills library",
             "ok": True,
-            "detail": f"{library.files.root} at commit {str(library.commit or '')[:12]}",
+            "detail": (f"{library.files.root} at commit {str(library.commit or '')[:12]} — "
+                       f"{library.verification_summary()}"),
+            **library.verification_report(),
         })
     except LibraryError as exc:
         checks.append({"check": "skills library", "ok": False, "detail": str(exc)})
@@ -193,7 +272,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     })
 
     # 6. Model metadata: an agent can only bind to a model with a known context window.
-    catalog = ModelCatalog(config, providers)
     known_windows = len(config.known_models)
     checks.append({
         "check": "model catalog",
@@ -217,22 +295,170 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 - a scan failure must not crash doctor
         checks.append({"check": "secret hygiene", "ok": False, "detail": str(exc)})
 
-    failures = sum(1 for c in checks if not c["ok"])
+    # 8. The machine posture. The one section a person reaches for `doctor` *about* was the one
+    # section it could not see: this command never read `[system]`, while `systemcli._blocked`
+    # refuses by naming `engine.cli doctor` as the remedy. A full-access machine therefore printed
+    # "all checks passed" and the tool a person trusts most said nothing about the switch that
+    # decides whether the engine can act on their Mac at all.
+    checks.append(_system_access(config))
+
+    return checks
+
+
+def _system_access(config: Any) -> dict[str, Any]:
+    """The `[system]` block as a check: whether the machine tools are offered, and to how much.
+
+    **The check is `ok` in every mode, and that is deliberate.** A wide-open machine is the
+    operator's own decision rather than a fault, and a `doctor` that failed here would exit 1 on a
+    correctly configured machine — which is how a check teaches its reader to ignore it. What a
+    permissive posture gets instead is a *warning*, the channel this file already has for a fact
+    worth noticing that is not a failure, and a detail line that leads with the mode in capitals so
+    the `OK` never reads as "all clear".
+
+    The allowlist wording comes from `systemcli.allowlist_phrase` — the same function `system list`
+    prints — because the failure this exists to stop is two surfaces describing one mode two ways:
+    an empty allowlist read as "nothing allowed" while `allow_full_access` had already stepped the
+    allowlist check aside. The import is deferred because `cli` is what wires `systemcli` into the
+    parser, and a module-scope import would make that a cycle.
+    """
+    from .systemcli import allowlist_phrase
+
+    section = getattr(config, "system", None)
+    enabled = bool(getattr(section, "enabled", False))
+    full = bool(getattr(section, "allow_full_access", False))
+    if not enabled:
+        return {
+            "check": "system access",
+            "ok": True,
+            "detail": "OFF — no machine tool is offered to any agent, whatever capability it holds. "
+                      "Turn them on with: engine.cli system enable --on",
+        }
+    if full:
+        return {
+            "check": "system access",
+            "ok": True,
+            "detail": "ON with FULL ACCESS — the allowlists and the per-action approval are lifted",
+            # The sentence a person needs and could not get anywhere else: what this mode means for
+            # *them*, including the part the allowlist lines used to deny.
+            "warnings": [
+                "full access means any application may be launched, any AppleScript may run and any "
+                "Shortcut may be pulled, whatever the allowlists say — and no approval is asked for. "
+                "Any agent holding a system:* grant can drive this Mac. Turn it off with: "
+                "engine.cli system enable --no-full-access",
+            ],
+        }
+    lists = " | ".join(
+        f"{key}: {allowlist_phrase(list(getattr(section, key, None) or []), full_access=False)}"
+        for key in ("allow_apps", "allow_automation", "allow_shortcuts"))
+    return {"check": "system access", "ok": True, "detail": f"ON, scoped — {lists}"}
+
+
+# ── onboard ──────────────────────────────────────────────────────────────────
+
+
+def cmd_onboard(args: argparse.Namespace) -> int:
+    """Walk the first-run path: what is done, what is next, and the one command for it.
+
+    **Why a command of its own rather than another line in `doctor`.** They answer different
+    questions, and the difference is not cosmetic:
+
+    - `doctor` asks *"is this environment healthy?"* and reports its independent checks — skills
+      parse, the machine has capacity, no key material leaked into the run state. Several of them can
+      fail at once and none of them is ordered against another, because the point is a complete
+      picture of an environment that is already set up.
+    - `onboard` asks *"can a run happen yet, and what is the single next thing?"* It reports **one**
+      gate, because a list of five problems is not guidance — the whole failure this module exists to
+      fix is that a person at a fresh prompt was handed documentation instead of the next move.
+
+    Folding the second into the first would mean either an unordered list (which is the failure) or a
+    doctor that suppresses its own checks (which loses the diagnosis). They share every input and the
+    same loaded config; they are two readings of it.
+
+    Exit code follows the gate: **0 when a run is possible, 1 when it is not**, so a bootstrap script
+    can branch on readiness rather than parsing prose.
+
+    **`--project` is the project step's resolution, not a filter.** Naming a folder the engine can
+    work in *is* the answer to "which folder should the agents work in", so the command confirms it —
+    creating `<folder>/.agent_state/` exactly as a run does, and nothing else (see
+    `Workspace.ensure`). Without that, the guidance would name a command that leaves the gate exactly
+    where it was, which is worse than no guidance: it teaches the person that running the command does
+    not help. Naming an *existing engine-owned project* with `--slug`/`--root` counts the same way.
+    """
+    from .onboarding import GateKind, journey_payload, render_journey
+
+    try:
+        report = inspect_setup(args, confirm_project=True)
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a first-run command must never traceback
+        _warn(f"cannot evaluate setup: {type(exc).__name__}: {exc}")
+        return EXIT_CHECK_FAILED
+
+    for warning in report.warnings:
+        _warn(f"warning: {warning}")
+    # The engine's own reason for the first step, on the diagnostic stream. `inspect` degrades a
+    # failure into a gate rather than raising, and the *why* is the useful part — a step that says
+    # "the engine cannot start" without the reason sends the person to the wrong place, and this
+    # module's whole argument is that the engine's own words beat a sentence invented here.
+    if report.gate.kind is GateKind.ENGINE_UNAVAILABLE:
+        _warn(report.gate.why)
+
     if args.json:
-        print(json.dumps({"checks": checks, "failures": failures}, indent=2, sort_keys=True))
+        payload = journey_payload(report.gate)
+        payload["gate"] = report.gate.as_dict()
+        payload["config_path"] = report.config_path
+        payload["workspace"] = report.workspace
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
     else:
-        width = max(len(c["check"]) for c in checks)
-        for check in checks:
-            mark = "OK  " if check["ok"] else "FAIL"
-            print(f"{mark} {check['check']:<{width}}  {check['detail']}")
-            for warning in check.get("warnings") or []:
-                print(f"     warning: {warning}")
-            for entry in check.get("skipped") or []:
-                print(f"     skipped: {entry}")
-        print()
-        print("doctor: all checks passed" if not failures
-              else f"doctor: {failures} check(s) failed")
-    return EXIT_OK if not failures else EXIT_CHECK_FAILED
+        if report.confirmed:
+            print(f"project   : {report.confirmed}  (this is the folder the agents will work in)")
+            print()
+        for line in render_journey(report.gate):
+            print(line)
+    return EXIT_OK if not report.gate.is_blocking else EXIT_CHECK_FAILED
+
+
+def inspect_setup(args: argparse.Namespace, *, confirm_project: bool = False) -> Any:
+    """Gather the engine's own state and evaluate the gate — the one path `onboard` and the chat share.
+
+    Both callers go through `onboarding.inspect`, so the command and the session cannot disagree
+    about what needs doing; the only difference is that the command probes (it is a deliberate request
+    and has time for the network) while the session's greeting does not.
+
+    `confirm_project=True` is the `onboard` command's own act: a folder named on the command line is
+    the answer to the project step, so it is initialised rather than merely inspected. The session
+    passes nothing, because opening a chat must not create a workspace the person never named.
+    """
+    from .onboarding import inspect, remember_workspace
+
+    workspace = None
+    if getattr(args, "project", None):
+        from .state import Workspace
+
+        try:
+            workspace = Workspace.attach(args.project)
+        except Exception as exc:  # noqa: BLE001 - a bad path is the user's to hear about, plainly
+            _warn(f"cannot attach that project: {exc}")
+            raise SystemExit(EXIT_CHECK_FAILED) from exc
+    elif getattr(args, "root", None) or getattr(args, "slug", None):
+        workspace = _resolve_workspace(args, getattr(args, "slug", None) or "onboard")
+
+    confirmed = ""
+    if confirm_project and workspace is not None:
+        # `ensure()` and nothing more: an attached folder gets `.agent_state/` and no `docs/` or
+        # `src/`, so confirming a folder never edits the person's tree beyond the state directory the
+        # engine owns everywhere.
+        workspace.ensure()
+        # And remember it, so the next bare `onboard` finds the step behind it. Without this the
+        # command would ask the same question on every run — guidance that does not stick is guidance
+        # a person learns to ignore.
+        remember_workspace(workspace)
+        confirmed = str(workspace.path)
+    report = inspect(getattr(args, "config", None), workspace,
+                     probe=not getattr(args, "no_probe", False))
+    report.confirmed = confirmed
+    report.workspace = str(workspace.path) if workspace is not None else ""
+    return report
 
 
 # ── skills ───────────────────────────────────────────────────────────────────
@@ -329,6 +555,42 @@ def cmd_skills_show(args: argparse.Namespace) -> int:
         print(f"## Rationalizations this role forbids ({len(bundle.anti_rationalization)})")
         for rule in bundle.anti_rationalization:
             print(f"  {rule[:96]}")
+    return EXIT_OK
+
+
+def cmd_skills_pin(args: argparse.Namespace) -> int:
+    """Record the library's content pin, so later runs can prove it was not modified.
+
+    This is the caller `build_manifest`/`write_manifest` never had: without it, the manifest
+    machinery was a promise with no way to make or keep it, and no run could ever compare content
+    against anything. It resolves with `verify=False` deliberately — the point is to *create* the
+    baseline, and a tree that cannot be checked against the not-yet-written pin would make the first
+    run on a fresh checkout impossible.
+    """
+    from .library import default_pin_path
+
+    target = Path(args.out).expanduser() if args.out else default_pin_path()
+    try:
+        library = resolve(getattr(args, "library", None), verify=False)
+    except LibraryError as exc:
+        _warn(f"library error: {exc}")
+        return EXIT_CHECK_FAILED
+    try:
+        written = library.write_manifest(target)
+    except OSError as exc:
+        _warn(f"cannot write the pin: {exc}")
+        return EXIT_CHECK_FAILED
+
+    payload = {"pin": str(written), "root": str(library.files.root), "commit": library.commit,
+               "files": len(library.manifest)}
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+    print(f"recorded {payload['files']} file hashes from {payload['root']}")
+    print(f"  commit: {library.commit or '(not a git checkout)'}")
+    print(f"  pin:    {written}")
+    print("  every later run compares against it, and a mismatch refuses to start;"
+          " re-run this command deliberately after reviewing a library change")
     return EXIT_OK
 
 
@@ -702,13 +964,15 @@ def _orchestrator(args: argparse.Namespace, slug: str):
     """
     config, source, _, _ = _load_stack(args)
     try:
-        library = resolve(getattr(args, "library", None))
+        library = resolve(getattr(args, "library", None),
+                          pin_path=getattr(args, "library_pin", None))
     except LibraryError as exc:
         _warn(f"library error: {exc}")
         raise SystemExit(EXIT_CHECK_FAILED) from exc
     workspace = _resolve_workspace(args, slug)
     workspace.ensure()
-    bus = EventBus(run_id=f"cli_{slug}", trace_path=workspace.trace_path)
+    bus = EventBus(run_id=f"cli_{slug}", trace_path=workspace.trace_path,
+                   lifecycle=config, lifecycle_slug=workspace.display_name)
     # The roster the Owner hired is the roster the run uses. Without this, `hire` would write a file
     # nothing reads — the agents would exist on disk and never appear in a run, which is the exact
     # "capability with no effect" failure this project refuses elsewhere.
@@ -776,14 +1040,15 @@ def _org_entry(args: argparse.Namespace) -> Any:
 def _org_workspace_path(args: argparse.Namespace) -> Path | None:
     """The folder an ``--org`` names, or None.
 
-    A registered org with no folder yet falls back to the managed project its slug names, so an org
-    can be registered before its workspace is created — the same lazy creation a `--slug` run does.
+    None means one of two real things: no ``--org`` was given at all, or the org named has no folder
+    of its own and runs as a managed project under ``projects/<slug>``. The managed fallback is
+    deliberately **not** applied here — it belongs in `_project_root_for`, where a root can be
+    resolved; this function answers only "what folder did the entry name".
     """
     entry = _org_entry(args)
     if entry is None:
         return None
-    path = entry.workspace_path
-    return path if str(path) else None
+    return entry.workspace_path
 
 
 def _slug_for(args: argparse.Namespace) -> str:
@@ -796,8 +1061,13 @@ def _slug_for(args: argparse.Namespace) -> str:
     explicit = getattr(args, "slug", None)
     if explicit:
         return explicit
-    org_path = _org_workspace_path(args)
-    if org_path is not None:
+    entry = _org_entry(args)
+    if entry is not None:
+        org_path = entry.workspace_path
+        if org_path is None:
+            # A path-less org is a managed project keyed on its own slug, so return that. Before, this
+            # fell through to the usage error below, reading `--org ideas` as "you named no project".
+            return entry.slug
         from .state import Workspace
 
         return Workspace.attach(org_path).slug
@@ -817,17 +1087,30 @@ def _slug_for(args: argparse.Namespace) -> str:
 def _project_root_for(args: argparse.Namespace) -> Path | None:
     """The project root a command is aimed at, from `--org`, `--project` or `--root`.
 
-    `--org` selects a registered org and resolves to its folder; `--project` names the project folder
-    itself; `--root` names a directory *of* projects. All three mean "the roster and skills for this
-    work live here", so all three must be honoured — otherwise a command run with `--project Ideas`
-    silently ignored `Ideas/.agentorg/roster.json` and fell back to the built-in company, which is
-    exactly the "the CEO I hired was not used" failure.
+    `--org` selects a registered org; `--project` names the project folder itself; `--root` names a
+    directory *of* projects. All three mean "the roster and skills for this work live here", so all
+    three must be honoured — otherwise a command run with `--project Ideas` silently ignored
+    `Ideas/.agentorg/roster.json` and fell back to the built-in company, which is exactly the "the CEO
+    I hired was not used" failure.
+
+    An org resolves through the shared `workspace_for`, so a *managed* org — one with no folder of
+    its own — reads its roster and skills from `projects/<slug>` rather than from the current
+    directory. This is where the managed fallback belongs, because `entry.workspace_path` alone is
+    `None` for a path-less org.
     """
     from . import usercfg
 
-    org_path = _org_workspace_path(args)
-    if org_path is not None:
-        return org_path
+    entry = _org_entry(args)
+    if entry is not None:
+        from .portfolio import workspace_for
+        from .state import StateError
+
+        try:
+            return workspace_for(entry, root=getattr(args, "root", None)).path
+        except StateError:
+            # A named folder that has gone: return the path it would use rather than raising, so a
+            # roster load still falls back to the built-ins as it did before.
+            return entry.workspace_path
     if getattr(args, "project", None):
         return Path(args.project)
     if getattr(args, "root", None):
@@ -855,6 +1138,19 @@ def _roster_for(config: Any, library: Any, root: Any, *, args: Any = None) -> An
         if entry is not None:
             org_id, org_name = entry.id, entry.name
             principal_id = _principal_id()
+            if root is None:
+                # A path-less org must read its managed project, never the process's working
+                # directory — which for the console is the engine's own source tree and holds a
+                # roster that is not this org's. Through the shared resolver, tolerantly: a named
+                # folder that has gone falls back to its path rather than raising, because this
+                # function's whole contract is that a roster problem never blocks a run.
+                from .portfolio import workspace_for
+                from .state import StateError
+
+                try:
+                    root = workspace_for(entry, root=getattr(args, "root", None)).path
+                except StateError:
+                    root = entry.workspace_path
 
     try:
         people = People(library=library, config=config, catalog=ModelCatalog(config, {}),
@@ -881,6 +1177,66 @@ def _principal_id() -> str:
     return portfolio.principal.id if portfolio is not None else DEFAULT_PRINCIPAL_ID
 
 
+def _posture_policy(orch: Any, posture: str) -> Any:
+    """The goal policy for a named posture, keeping every other setting the default already chose.
+
+    Built by overriding the configured default rather than constructing from nothing, so
+    `run --posture supervised` narrows the authority to "ask me" without also silently resetting
+    auto-hire or persist-hires to something the config did not say.
+    """
+    from .goal import GoalPolicy, Posture
+
+    base = orch._default_goal_policy()
+    resolved = Posture(str(posture).strip().lower())
+    return GoalPolicy(
+        auto_approve=base.auto_approve if resolved is Posture.UNATTENDED else False,
+        auto_hire=base.auto_hire,
+        persist_hires=base.persist_hires,
+        posture=resolved,
+    )
+
+
+def _console_for(args: argparse.Namespace, *, workspace: Any = None,
+                 orchestrator: Any = None, slug: str | None = None,
+                 needs_workspace: bool = True) -> Any:
+    """A `serve.Server` over a workspace, for the operations the console already implements.
+
+    Built rather than re-implemented. Adding a provider is a validation, a normalisation, a merge-write
+    and a reload; a child's transcript is a byte-addressed page; a proposal list has a shape the panel
+    reads by name. `serve` owns every one of those rules, and a second copy here would be a second
+    definition — the two would drift apart and the CLI would accept what the app refuses.
+
+    `needs_workspace=False` leaves the workspace unset, for a handler that only reads the configuration
+    (`providers list`). Resolving a workspace there would *create* a project directory for a command
+    that never looks in it, which is state a person did not ask for.
+
+    Its events are swallowed: `Server.emit` writes the protocol to stdout, and stdout here belongs to
+    the answer. That is what keeps `--json` parseable.
+    """
+    from .serve import Server
+
+    if workspace is None and needs_workspace:
+        workspace = _resolve_workspace(args, slug or _slug_for(args))
+        workspace.ensure()
+    config, _, _, _ = _load_stack(args)
+    return Server(config=config,
+                  library=resolve(getattr(args, "library", None),
+                                  pin_path=getattr(args, "library_pin", None)),
+                  workspace=workspace, orchestrator=orchestrator,
+                  slug=slug or getattr(workspace, "slug", "console"),
+                  stdout=_NullStream())
+
+
+class _NullStream:
+    """A write sink that discards everything, for a `Server` whose protocol stream nobody reads."""
+
+    def write(self, text: str) -> int:
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Run a goal or an existing manifest, and report where it ended up.
 
@@ -889,6 +1245,20 @@ def cmd_run(args: argparse.Namespace) -> int:
     """
     slug = args.slug or (Path(args.manifest).stem if args.manifest else _slug_from_goal(args.goal))
     orch, workspace = _orchestrator(args, slug)
+
+    # `--posture` is a run-level convenience for the one thing a person most often wants to state on
+    # the command line: *should this finish without me?* It applies the posture to the goal this run
+    # belongs to, so `run --goal "…" --posture supervised` parks and `--posture unattended` does not.
+    # Without a goal on disk there is nothing to carry a posture, so it is recorded only when one
+    # exists — and a caller wanting full control uses `goal set --posture …` first.
+    if getattr(args, "posture", None) and orch.goal() is not None:
+        try:
+            existing = orch.goal()
+            orch.goal_set(existing.objective, armed=False, by="cli",
+                          policy=_posture_policy(orch, args.posture))
+        except Exception as exc:  # noqa: BLE001 - a posture that cannot be applied is reported
+            _warn(f"cannot apply --posture {args.posture}: {exc}")
+            return EXIT_CHECK_FAILED
 
     try:
         if args.manifest:
@@ -1025,6 +1395,323 @@ def cmd_status(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_session(args: argparse.Namespace) -> int:
+    """List, inspect, archive and branch the sessions a workspace and a root know about.
+
+    `list` answers "what have I run here, and what did it cost" over a whole projects root; `show`
+    is one session in full. The two write operations are deliberately asymmetric: `export` produces a
+    new archive (nothing on disk is at risk), while `fork` copies a session into a *new* slug and
+    refuses to touch the source at all — a branch that could damage the thing it branched from would
+    be worse than no branch.
+    """
+    from .session_exchange import (
+        SessionError,
+        export_session,
+        fork_session,
+        list_sessions,
+        session_detail,
+        sessions_under,
+        verify_export,
+    )
+
+    action = args.session_command
+
+    if action == "list":
+        root = getattr(args, "root", None)
+        if not root and getattr(args, "project", None):
+            # A single attached folder is a session of one, which is the honest answer rather than a
+            # refusal: the command was aimed at a project, and a project is a session.
+            sessions = [_resolve_workspace(args, _slug_for(args))]
+        else:
+            sessions = sessions_under(root or Path(__file__).resolve().parent.parent / "projects")
+        rows = list_sessions(sessions)
+        if args.json:
+            print(json.dumps({"count": len(rows), "root": str(root or ""), "sessions": rows},
+                             indent=2, sort_keys=True, default=str))
+            return EXIT_OK
+        if not rows:
+            print("no sessions found")
+            print(f"  looked in : {root or 'AgentOrg/projects'}")
+            return EXIT_OK
+        print(f"{len(rows)} session(s)")
+        for row in rows:
+            spend = row.get("spend") or {}
+            cost = (f"${spend['cost_usd']:.4f}" if spend.get("measured")
+                    else "unmeasured")
+            label = row["objective"] or row["run_id"] or "(no objective)"
+            print(f"  {row['slug']:28s} {str(row['phase']):14s} {cost:12s} {row['updated']}")
+            print(f"    {label[:96]}")
+            if row.get("error"):
+                _warn(f"    {row['slug']}: {row['error']}")
+        return EXIT_OK
+
+    if action in ("show", "export", "fork"):
+        slug = args.slug or _slug_for(args)
+        workspace = _resolve_workspace(args, slug)
+
+        if action == "show":
+            detail = session_detail(workspace)
+            if args.json:
+                print(json.dumps(detail, indent=2, sort_keys=True, default=str))
+                return EXIT_OK
+            print(f"session   : {detail['slug']}"
+                  + ("  (attached)" if detail.get("attached") else ""))
+            print(f"  where     : {detail['path']}")
+            print(f"  run       : {detail['run_id'] or '(none)'}   phase: {detail['phase']}")
+            if detail["objective"]:
+                print(f"  objective : {detail['objective'][:100]}")
+            if detail["goal_state"]:
+                print(f"  goal      : {detail['goal_state']}   posture: "
+                      f"{detail['posture'] or '(unset)'}   continues: "
+                      f"{'yes' if detail['live'] else 'no'}")
+            spend = detail.get("spend") or {}
+            cost = f"${spend['cost_usd']:.4f}" if spend.get("measured") else "unmeasured"
+            print(f"  spend     : {cost} over {spend.get('tokens') if spend.get('measured') else '?'}"
+                  f" token(s)")
+            print(f"  trace     : {detail['trace_events']} event(s)   "
+                  f"ledger: {len(detail.get('ledger') or [])} entr(ies)   "
+                  f"handoffs: {len(detail.get('handoffs') or [])}")
+            if detail.get("refused"):
+                for entry in detail["refused"]:
+                    _warn(f"  handoff {entry['handoff_id']} refused: {entry['reason']}")
+            if detail.get("load_error"):
+                _warn(f"  {detail['load_error']}")
+            rows = detail.get("rows") or []
+            if rows:
+                print()
+                print("  nodes:")
+                for row in rows:
+                    line = (f"    {str(row.get('node_id')):20s} {str(row.get('status')):14s} "
+                            f"{str(row.get('agent_name') or row.get('skill') or ''):18s}")
+                    summary = str(row.get("summary") or "").strip()
+                    if summary:
+                        line += f"  — {summary[:70]}"
+                    print(line)
+            return EXIT_OK
+
+        if action == "fork":
+            try:
+                report = fork_session(workspace, args.to)
+            except SessionError as exc:
+                _warn(str(exc))
+                return EXIT_CHECK_FAILED
+            if args.json:
+                print(json.dumps(report, indent=2, sort_keys=True, default=str))
+                return EXIT_OK
+            print(f"forked {report['from_slug']} -> {report['slug']}")
+            print(f"  from      : {report['from']}")
+            print(f"  to        : {report['to']}")
+            print(f"  copied    : {report['files']} file(s), {report['bytes']} byte(s)")
+            for note in report["notes"]:
+                print(f"  note      : {note}")
+            print(f"  the original is untouched; continue the branch with --slug {report['slug']}")
+            return EXIT_OK
+
+        destination = args.out or f"{slug}-session.zip"
+        try:
+            report = export_session(workspace, destination)
+        except SessionError as exc:
+            _warn(str(exc))
+            return EXIT_CHECK_FAILED
+        if args.verify:
+            try:
+                verify_export(report["path"])
+            except SessionError as exc:
+                _warn(f"the archive did not verify: {exc}")
+                return EXIT_CHECK_FAILED
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True, default=str))
+            return EXIT_OK
+        manifest = report["manifest"]
+        print(f"exported {manifest['slug']} -> {report['path']}")
+        print(f"  bytes     : {report['bytes']}")
+        print(f"  files     : {manifest['counts']['files']} "
+              f"({manifest['counts']['handoffs']} handoff(s), {manifest['counts']['nodes']} node(s))")
+        print(f"  schemas   : "
+              + (", ".join(f"{k}={v}" for k, v in sorted(manifest['schema_versions'].items()))
+                 or "(none)"))
+        if manifest["absent"]:
+            print(f"  absent    : {', '.join(manifest['absent'])}")
+        if args.verify:
+            print("  verified  : every member matches the manifest")
+        return EXIT_OK
+
+    _warn(f"unknown session action {action!r}")
+    return EXIT_USAGE
+
+
+def cmd_schedules(args: argparse.Namespace) -> int:
+    """Add, list, remove, enable and watch the objectives that fire on a clock.
+
+    The watcher is the only part that spends, and it is a **foreground** process: a schedule file
+    arms nothing on its own, exactly as a goal file arms nothing on its own. What makes the watch
+    safe is the rule it enforces rather than the interval — a fire that ends paused, blocked, gated
+    or failed disables its entry, so a failing objective cannot become an unattended spend loop.
+    """
+    from .schedules import (
+        DEFAULT_TICK_S,
+        MAX_TICK_S,
+        MIN_TICK_S,
+        PARKED_OUTCOMES,
+        ScheduleError,
+        ScheduleStore,
+        watch,
+    )
+
+    action = args.schedules_command
+    slug = getattr(args, "slug", None) or ""
+    if action in ("list", "add", "remove", "enable", "watch"):
+        slug = slug or _slug_for(args)
+    workspace = _resolve_workspace(args, slug)
+    workspace.ensure()
+    store = ScheduleStore(workspace)
+    if store.load_error:
+        _warn(store.load_error)
+
+    if action == "list":
+        view = store.view()
+        if args.json:
+            print(json.dumps(view, indent=2, sort_keys=True, default=str))
+            return EXIT_OK
+        counts = view["counts"]
+        print(f"{counts['total']} schedule(s): {counts['enabled']} armed, "
+              f"{counts['disabled']} disabled, {counts['due']} due")
+        print(f"  workspace : {workspace.path}")
+        if view["load_error"]:
+            _warn(f"  {view['load_error']}")
+        for entry in view["entries"]:
+            every = f"every {entry['interval_s']}s" if entry["interval_s"] else "once"
+            print(f"  {entry['id']:16s} {'armed ' if entry['enabled'] else 'paused'} {every:12s} "
+                  f"{entry['next_due_at'] or '-':24s} {entry['slug']}")
+            print(f"    {entry['objective'][:96]}")
+            if entry["last_outcome"]:
+                print(f"    last    : {entry['last_outcome']}"
+                      + (f" — {entry['last_detail'][:70]}" if entry["last_detail"] else ""))
+            if entry["disabled_reason"]:
+                print(f"    paused  : {entry['disabled_reason'][:90]}")
+        return EXIT_OK
+
+    if action == "add":
+        objective = " ".join(args.objective).strip()
+        try:
+            entry = store.add(objective=objective, slug=slug, posture=args.posture,
+                              every=args.every, at=args.at, due_now=args.due_now,
+                              enabled=not args.disabled)
+        except ScheduleError as exc:
+            _warn(str(exc))
+            return EXIT_USAGE if "say when it should fire" in str(exc) else EXIT_CHECK_FAILED
+        if args.json:
+            print(json.dumps(entry.as_dict(), indent=2, sort_keys=True, default=str))
+            return EXIT_OK
+        every = f"every {entry.interval_s}s" if entry.interval_s else "once"
+        print(f"added {entry.id}: {objective}")
+        print(f"  fires     : {every}, next {entry.next_due_at}")
+        print(f"  posture   : {entry.posture}")
+        print(f"  workspace : {workspace.path}")
+        print("  arm it    : engine.cli schedules watch --slug " + entry.slug)
+        return EXIT_OK
+
+    if action in ("remove", "enable"):
+        try:
+            if action == "remove":
+                entry = store.remove(args.ref)
+            else:
+                entry = store.enable(args.ref)
+        except ScheduleError as exc:
+            _warn(str(exc))
+            return EXIT_CHECK_FAILED
+        if args.json:
+            print(json.dumps(entry.as_dict(), indent=2, sort_keys=True, default=str))
+            return EXIT_OK
+        if action == "remove":
+            print(f"removed {entry.id}: {entry.objective[:80]}")
+        else:
+            print(f"armed {entry.id}: next due {entry.next_due_at}")
+        return EXIT_OK
+
+    if action == "watch":
+        def resolve(target: str):
+            """The orchestrator a fire lands in — the same resolution every other command uses.
+
+            Deliberately *not* an error path of its own: a slug that cannot be resolved disables its
+            entry inside `watch`, with the reason recorded, because a watcher that exited on the first
+            bad entry would stop the good ones that were still armed.
+            """
+            return _orchestrator(args, target)
+
+        if args.json:
+            # A watcher's whole point is a stream of results, so `--json` emits one JSON object per
+            # *fire* and one final summary, each on its own line. NDJSON is the only shape that keeps
+            # stdout a single machine-readable stream for a process that runs until interrupted.
+            def emit(record: dict[str, Any]) -> None:
+                for fire in record.get("fired") or []:
+                    print(json.dumps({"type": "fire", **fire}, sort_keys=True, default=str),
+                          flush=True)
+                for entry in record.get("disabled") or []:
+                    print(json.dumps({"type": "disabled", **entry}, sort_keys=True, default=str),
+                          flush=True)
+        else:
+            def emit(record: dict[str, Any]) -> None:
+                for fire in record.get("fired") or []:
+                    print(f"  fired   : {fire['slug']} -> {fire['outcome']}"
+                          + (f"  ({fire['detail'][:70]})" if fire["detail"] else ""))
+                for entry in record.get("disabled") or []:
+                    _warn(f"  PAUSED  : {entry['slug']} — {entry['reason'][:160]}")
+                for entry in record.get("removed") or []:
+                    # A fire that beat a removal: the run happened, but the entry was deleted beside
+                    # the watcher while it ran. Left removed (never re-armed), and named here so the
+                    # deletion is visible in the human-readable stream and not only under `--json`.
+                    _warn(f"  REMOVED : {entry['slug']} — {entry['detail'][:160]}")
+
+        if not args.json:
+            print(f"watching {len(store.entries)} entry(ies) every {args.interval}s; "
+                  "Ctrl-C to stop")
+            armed = [entry for entry in store.entries if entry.enabled]
+            if not armed:
+                print("  nothing is armed; `schedules enable <id>` arms an entry")
+            for entry in armed:
+                print(f"  {entry.id:16s} next {entry.next_due_at or '-'}  {entry.objective[:64]}")
+
+        try:
+            report = watch(store, resolve=resolve, tick_s=args.interval, ticks=args.ticks,
+                           max_fires=args.max_fires, on_tick=emit, executor=args.executor)
+        except ScheduleError as exc:
+            _warn(str(exc))
+            return EXIT_USAGE
+        except KeyboardInterrupt:
+            _warn("stopped")
+            if args.json:
+                print(json.dumps({"type": "summary", "ticks": 0, "fired": [], "disabled": [],
+                                  "stopped": "interrupted"}, sort_keys=True))
+            return EXIT_OK
+
+        summary = {"type": "summary", **report} if args.json else report
+        if args.json:
+            print(json.dumps(summary, sort_keys=True, default=str))
+            return EXIT_OK
+        print(f"stopped  : {report['stopped']}")
+        print(f"  ticks   : {report['ticks']}   fires: {len(report['fired'])}")
+        for fire in report["fired"]:
+            print(f"    {fire['slug']:24s} {fire['outcome']:10s} {fire['run_id']}")
+        if report["disabled"]:
+            print()
+            print("  paused for you — a schedule never re-arms a goal a previous fire left parked:")
+            for entry in report["disabled"]:
+                print(f"    {entry['slug']}: {entry['reason'][:110]}")
+        if report["removed"]:
+            # The other thing a fire can end in: the entry was deleted while its run was in flight, so
+            # the run's outcome is real but the schedule is gone. `--json` always carried this; the
+            # summary said nothing, which left a removal-invisible list of fires with no explanations.
+            print()
+            print("  removed while their run was in flight — left removed, not re-armed:")
+            for entry in report["removed"]:
+                print(f"    {entry['slug']}: {entry['detail'][:110]}")
+        return EXIT_OK
+
+    _warn(f"unknown schedules action {action!r}")
+    return EXIT_USAGE
+
+
 def cmd_flow(args: argparse.Namespace) -> int:
     """The org board: which agent is working on what, what moved between them, and what came back.
 
@@ -1033,7 +1720,7 @@ def cmd_flow(args: argparse.Namespace) -> int:
     out to whom — and its progress. It answers the question a person running an org actually asks
     when several things are in flight at once.
     """
-    from .flow import build_flow
+    from .flow import build_flow, clip
 
     slug = _slug_for(args)
     config, source, _, _ = _load_stack(args)
@@ -1075,7 +1762,9 @@ def cmd_flow(args: argparse.Namespace) -> int:
               f"{row['status']:13s} {(row['received_from'] or '—'):14s} "
               f"{(row['sent_to'] or '—'):14s} {row['verdict'] or ''}".rstrip())
         if row.get("blocked_by"):
-            print(f"      ↳ {row['blocked_by'][:100]}")
+            # Clipped on a word boundary, so the reason reads as shortened rather than as a typo —
+            # the headline above carries the full sentence for whoever wants all of it.
+            print(f"      ↳ {clip(row['blocked_by'], 100)}")
 
     handoffs = board.get("handoffs") or []
     if handoffs:
@@ -1219,6 +1908,233 @@ def cmd_decide(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_abort(args: argparse.Namespace) -> int:
+    """Stop a run for good, keeping its checkpoint.
+
+    **This is not `decide`, and the difference is the whole point.** `decide` answers the gate a run is
+    waiting on and lets it carry on; `abort` ends the run where it stands. A person reaching for "make
+    it stop" while money is being spent needs that stated, because approving a gate on the way to
+    stopping pays for work nobody asked for.
+    """
+    slug = _slug_for(args)
+    orch, workspace = _orchestrator(args, slug)
+    run = orch.load(slug)
+    if run is None:
+        _warn(f"no run found for {slug!r} in {workspace.path}; "
+              f"`engine.cli status --slug {slug}` shows what is actually there")
+        return EXIT_CHECK_FAILED
+    if run.phase.terminal:
+        _warn(f"the run is already {run.phase.value}, so there is nothing left to stop. "
+              f"`engine.cli run --slug {slug} --manifest <file>` starts a fresh one")
+        return EXIT_CHECK_FAILED
+
+    previous = run.phase.value
+    orch.abort(run)
+    if args.json:
+        print(json.dumps({**run.as_dict(), "aborted": True, "previous_phase": previous,
+                          "checkpoint": str(workspace.checkpoint_path)},
+                         indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+
+    print(f"aborted {run.run_id}  ({previous} -> {run.phase.value})")
+    print(f"  workspace : {workspace.path}")
+    print("  the checkpoint is kept, so what already finished is still there to read")
+    print(f"  read it   : engine.cli activity --slug {slug}")
+    print("  not a gate: `engine.cli decide` resolves a gate and lets the run carry on")
+    return EXIT_OK
+
+
+def cmd_reassign(args: argparse.Namespace) -> int:
+    """Pin a node to a different agent — the manual form of the router's job.
+
+    The router's refusals still hold: an agent without the node's skill, or one that produced the
+    artifact a review node would judge, is turned down here exactly as it is turned down there. The
+    Owner overrides a *choice*, never an invariant.
+    """
+    slug = _slug_for(args)
+    orch, workspace = _orchestrator(args, slug)
+    run = orch.load(slug)
+    if run is None:
+        _warn(f"no run found for {slug!r} in {workspace.path}; "
+              f"`engine.cli run --slug {slug} --manifest <file>` starts one")
+        return EXIT_CHECK_FAILED
+    if run.phase.terminal:
+        _warn(f"the run is {run.phase.value}, so no node of it will run again and the pin would "
+              f"change nothing. `engine.cli run --slug {slug} --manifest <file>` runs the graph again")
+        return EXIT_CHECK_FAILED
+
+    spec = _agent_for(orch, args.agent)
+    before = run.bindings.get(args.node)
+    try:
+        orch.reassign(args.node, spec.id, run=run)
+    except OrchestratorError as exc:
+        _warn(f"cannot reassign {args.node!r}: {exc}")
+        return EXIT_CHECK_FAILED
+
+    binding = run.bindings.get(args.node)
+    payload = {"run_id": run.run_id, "phase": run.phase.value, "node": args.node,
+               "agent_id": spec.id, "agent": spec.name,
+               "binding": _binding_dict(binding), "previous": _binding_dict(before)}
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+
+    print(f"{args.node} pinned to {spec.name} ({spec.id})")
+    print(f"  was       : {_binding_line(before)}")
+    print(f"  now       : {_binding_line(binding)}")
+    print(f"  run       : {run.run_id}  ({run.phase.value})")
+    print("  the decision is recorded on the run, so `flow` shows who was actually assigned")
+    return EXIT_OK
+
+
+def cmd_takeover(args: argparse.Namespace) -> int:
+    """Take a node over as the Owner, so a human produces that node's artifact.
+
+    The artifact then records a human producer, which is what an audit trail needs. Nothing executes
+    here: this records *who* will do the work, and the run picks it up on its next pass.
+    """
+    slug = _slug_for(args)
+    orch, workspace = _orchestrator(args, slug)
+    run = orch.load(slug)
+    if run is None:
+        _warn(f"no run found for {slug!r} in {workspace.path}; "
+              f"`engine.cli run --slug {slug} --manifest <file>` starts one")
+        return EXIT_CHECK_FAILED
+    if run.phase.terminal:
+        _warn(f"the run is {run.phase.value}, so no node of it will run again and the takeover would "
+              f"change nothing. `engine.cli run --slug {slug} --manifest <file>` runs the graph again")
+        return EXIT_CHECK_FAILED
+
+    # The orchestrator records the takeover without checking the node exists, so the check belongs
+    # here — a takeover of a node no run has is a line in a log that changes nothing.
+    nodes = [str(n.get("id")) for n in orch._nodes_of(run)]
+    if nodes and args.node not in nodes:
+        _warn(f"node {args.node!r} is not in this run's plan; nodes: {', '.join(nodes)}")
+        return EXIT_CHECK_FAILED
+
+    try:
+        orch.takeover(args.node, run=run)
+    except OrchestratorError as exc:
+        _warn(f"cannot take over {args.node!r}: {exc}")
+        return EXIT_CHECK_FAILED
+
+    decision = run.decisions[-1] if run.decisions else {}
+    payload = {"run_id": run.run_id, "phase": run.phase.value, "node": args.node,
+               "by": str(decision.get("by") or ""), "decision": decision}
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+
+    print(f"{args.node} taken over by the Owner ({payload['by']})")
+    print("  the artifact this node produces will record a human producer")
+    print(f"  run       : {run.run_id}  ({run.phase.value})")
+    print(f"  not the same as `engine.cli reassign --slug {slug} {args.node} --agent <id>`: that "
+          "hands the node to an agent, this does it yourself")
+    return EXIT_OK
+
+
+def _agent_for(orch: Any, ref: str) -> Any:
+    """The roster agent a person named, by id or by name.
+
+    A name is what `agents` shows; an id is what the engine stores on a binding. Resolving both in one
+    place means a mistyped reference is refused with the names that exist, rather than pinning a node
+    to nothing that quietly looks pinned.
+    """
+    agents = list(getattr(getattr(orch, "org", None), "agents", {}).values())
+    spec = next((a for a in agents if a.id == ref), None)
+    if spec is None:
+        spec = next((a for a in agents if a.name.lower() == ref.lower()), None)
+    if spec is None:
+        _warn(f"no agent {ref!r} in the roster; `engine.cli agents` lists every id and name")
+        raise SystemExit(EXIT_CHECK_FAILED)
+    return spec
+
+
+def _binding_dict(binding: Any) -> Any:
+    """A binding as data, whether it is a `Binding` object or the pinned dict `reassign` writes."""
+    return binding.as_dict() if hasattr(binding, "as_dict") else binding
+
+
+def _binding_line(binding: Any) -> str:
+    """A binding as one readable line — including "there was none", which is the router's own choice."""
+    if not binding:
+        return "(the router's choice, not pinned)"
+    if isinstance(binding, dict):
+        agents = [str(a) for a in (binding.get("agents") or [])]
+        if not agents and binding.get("pinned_id"):
+            agents = [str(binding["pinned_id"])]
+        return f"{', '.join(agents) or '(unknown)'}  [{binding.get('policy') or 'auto'}]"
+    return str(binding)
+
+
+def cmd_subagents(args: argparse.Namespace) -> int:
+    """The children a run started, and one child's transcript read a page at a time.
+
+    A child is a session rather than a node: its reads never accumulate in the parent's window, so what
+    the parent saw of it is a preview. This is how a person reads what it actually did, and the page is
+    the same byte-addressed one the agent's own `read_subagent_result` tool returns.
+
+    Both actions go through the console's handler, so the CLI cannot describe a child differently from
+    the panel that renders it.
+    """
+    from .serve import ServerError
+
+    slug = _slug_for(args)
+    orch, workspace = _orchestrator(args, slug)
+    # `load` also puts the run on the orchestrator, which is what scopes a child store to the run that
+    # produced it. Without it the console would look under the placeholder run id `run` and report
+    # "no children" for a run whose children are right there on disk.
+    orch.load(slug)
+    console = _console_for(args, workspace=workspace, orchestrator=orch)
+    action = args.subagents_command
+
+    if action == "result":
+        try:
+            page = console._cmd_subagent_result({
+                "child_id": args.child_id,
+                "offset_bytes": args.offset or 0,
+                "limit_bytes": args.limit or 0,
+            })
+        except ServerError as exc:
+            _warn(f"cannot read that child: {exc}; "
+                  f"`engine.cli subagents list --slug {slug}` lists the children of this run")
+            return EXIT_CHECK_FAILED
+        if args.json:
+            print(json.dumps(page, indent=2, sort_keys=True, default=str))
+            return EXIT_OK
+        end = page["offset_bytes"] + page["returned_bytes"]
+        print(f"{page['child_id']}  bytes {page['offset_bytes']}..{end} of {page['total_bytes']}")
+        print()
+        print(page["text"], end="" if page["text"].endswith("\n") else "\n")
+        print()
+        if page["more"]:
+            print(f"  more remains: --offset {page['next_offset_bytes']}")
+        else:
+            print("  that is the whole transcript")
+        return EXIT_OK
+
+    if action != "list":  # pragma: no cover - argparse guards this
+        _warn(f"unknown subagents action {action!r}")
+        return EXIT_USAGE
+
+    payload = console._cmd_subagents({})
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+
+    print(f"{payload['count']} child(ren) for this run"
+          + (f"  ({payload['running']} running, {payload['failed']} failed)"
+             if payload["count"] else ""))
+    for child in payload["children"]:
+        task = str(child.get("task") or "")[:52]
+        print(f"  {str(child.get('child_id')):14s} {str(child.get('status')):10s} "
+              f"{(child.get('skill') or '-'):24s} {task}")
+    if not payload["count"]:
+        print("  (none — a child appears once a node dispatches one; `run` and `fanout` start them)")
+        print(f"  a child's work is a session: `engine.cli subagents result <child_id> --slug {slug}`")
+    return EXIT_OK
+
+
 def cmd_goal(args: argparse.Namespace) -> int:
     """Set, inspect, pause, resume or clear the durable goal for a workspace.
 
@@ -1236,19 +2152,26 @@ def cmd_goal(args: argparse.Namespace) -> int:
             if not objective:
                 _warn("a goal needs an objective: engine.cli goal set \"what to achieve\"")
                 return EXIT_USAGE
-            from .goal import GoalPolicy
+            from .goal import GoalPolicy, Posture
 
             # Build the per-goal autonomy from the flags, falling back to the configured default for
-            # anything not named — so `goal set "…"` keeps the autonomous default and only an explicit
-            # flag narrows it.
+            # anything not named — so `goal set "…"` keeps the configured posture and only an explicit
+            # flag narrows it. `--posture` is the direct form; `--human-gate` is the legacy alias it
+            # supersedes, and the two cannot disagree because the posture is resolved first.
             base = orch._default_goal_policy()
-            gate_choice = None if getattr(args, "human_gate", False) else args.auto_approve
+            if getattr(args, "posture", None):
+                posture = Posture(args.posture)
+            elif getattr(args, "human_gate", False):
+                posture = Posture.SUPERVISED
+            else:
+                posture = base.posture
+            gate_choice = None if posture is Posture.SUPERVISED else args.auto_approve
             policy = GoalPolicy(
                 auto_approve=base.auto_approve if gate_choice is None else bool(gate_choice),
                 auto_hire=base.auto_hire if args.auto_hire is None else bool(args.auto_hire),
                 persist_hires=(base.persist_hires if args.persist_hires is None
                                else bool(args.persist_hires)),
-                human_gate=bool(getattr(args, "human_gate", False)),
+                posture=posture,
             )
             goal = orch.goal_set(objective, by="cli", armed=not args.no_arm, policy=policy)
         elif action == "status":
@@ -1289,6 +2212,10 @@ def cmd_goal(args: argparse.Namespace) -> int:
     # run will stop at a gate or pass it — the whole reason the pause happened.
     policy = status.get("policy") or {}
     if policy:
+        print(f"  posture   : {status.get('posture') or policy.get('posture') or 'unattended'}"
+              + ("  (every gate waits for you)"
+                 if (status.get("posture") or policy.get("posture")) == "supervised" else
+                 "  (the goal answers its own gates)"))
         print(f"  autonomy  : gates={'auto' if status.get('decides_gates') else 'human'}  "
               f"gaps={'auto' if status.get('staffs_gaps') else 'report'}  "
               f"hires={'persist' if policy.get('persist_hires') else 'ephemeral'}")
@@ -1497,85 +2424,143 @@ def cmd_propose(args: argparse.Namespace) -> int:
     validates against the behavioural suite, and leaves a readable proposal for the Owner to accept or
     delete. A loop that applied its own changes would be unguarded, because the suite that judges it is
     code it could rewrite.
+
+    Kept as its own name because it is the one most people already have in their fingers; `improve`
+    and `proposals` are the console's vocabulary for the same two operations, and all of them share
+    one implementation rather than rendering the directory three ways.
     """
-    from .improver import Improver, is_safety_surface
+    from .improver import Improver
 
     slug = _slug_for(args)
     orch, workspace = _orchestrator(args, slug)
-
-    # `--dry-run` lists what it found without drafting or writing anything, which is the honest way to
-    # see the loop working before it produces files.
     improver = Improver(workspace=workspace, memory=getattr(orch, "memory", None))
 
+    # `--list` shows what is already there; `--dry-run` shows the findings without drafting anything;
+    # a bare `propose` runs the cycle. Each is one of the renderers `improve`/`proposals` also use, so
+    # the two vocabularies cannot describe one directory differently.
     if args.list:
-        listing = _proposals_for(improver)
-        if args.json:
-            print(json.dumps(listing, indent=2, sort_keys=True, default=str))
-            return EXIT_OK
-        print(f"{listing['count']} proposal(s) in {listing['directory']}")
-        for entry in listing["proposals"]:
-            finding = entry.get("finding") or {}
-            print(f"  {entry['proposal_id']:12s} {finding.get('kind', '?'):20s} "
-                  f"{(entry.get('validation') or {}).get('improved')}")
-        if listing["refused_count"]:
-            print(f"\n  {listing['refused_count']} refused (the boundary working):")
-            for entry in listing["refused"][-5:]:
-                print(f"    {entry.get('kind', '?'):20s} {str(entry.get('reason'))[:80]}")
-        print("\n  Nothing here has been applied. Read a proposal, then apply it yourself.")
+        return _render_proposals(args, improver)
+    if args.dry_run:
+        return _render_findings(args, improver)
+    return _render_cycle(args, improver)
+
+
+def _render_proposals(args: argparse.Namespace, improver: Any) -> int:
+    """List the proposals directory, plus what the boundary refused. Applies nothing."""
+    listing = _proposals_for(improver)
+    if args.json:
+        print(json.dumps(listing, indent=2, sort_keys=True, default=str))
         return EXIT_OK
+    print(f"{listing['count']} proposal(s) in {listing['directory']}")
+    for entry in listing["proposals"]:
+        _print_proposal(entry)
+    if listing["refused_count"]:
+        print()
+        print(f"  {listing['refused_count']} refused (the boundary working):")
+        for entry in listing["refused"][-5:]:
+            print(f"    {str(entry.get('kind')):22s} {str(entry.get('reason'))[:80]}")
+    if not listing["count"]:
+        print("  (none — nothing has been measured as a defect yet)")
+    print()
+    print("  Nothing here has been applied, and nothing here will be. Read one, apply it yourself.")
+    return EXIT_OK
+
+
+def _render_findings(args: argparse.Namespace, improver: Any) -> int:
+    """What the detectors measured, without drafting or writing anything."""
+    from .improver import is_safety_surface
 
     findings = improver.detect()
-    if args.dry_run:
-        if args.json:
-            print(json.dumps([f.as_dict() for f in findings], indent=2, sort_keys=True, default=str))
-            return EXIT_OK
-        if not findings:
-            print("no findings: nothing the evidence supports as a defect")
-            return EXIT_OK
-        print(f"{len(findings)} finding(s), none drafted (dry run):")
-        for finding in findings:
-            refused = " [SAFETY SURFACE]" if is_safety_surface(finding.path) else ""
-            print(f"  [{finding.severity:8s}] {finding.summary()[:78]}{refused}")
-        return EXIT_OK
-
-    considered = improver.run_once()
     if args.json:
-        print(json.dumps({
-            "considered": [{"id": p.proposal_id, "kind": p.finding.kind, "state": p.state,
-                            "improved": p.validation.improved,
-                            "regressions": p.validation.regressions,
-                            "refusal": p.refusal} for p in considered],
-            "applies_changes": False,
-        }, indent=2, sort_keys=True, default=str))
+        print(json.dumps({"findings": [{**f.as_dict(), "safety_surface": is_safety_surface(f.path)}
+                                       for f in findings],
+                          "count": len(findings), "applies_changes": False},
+                         indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+    if not findings:
+        print("no findings: nothing the evidence supports as a defect")
+        return EXIT_OK
+    print(f"{len(findings)} finding(s), none drafted (dry run):")
+    for finding in findings:
+        refused = " [SAFETY SURFACE]" if is_safety_surface(finding.path) else ""
+        print(f"  [{finding.severity:8s}] {finding.summary()[:78]}{refused}")
+    print()
+    print("  Nothing has been applied. Without --dry-run a cycle drafts, validates and stops.")
+    return EXIT_OK
+
+
+def _render_cycle(args: argparse.Namespace, improver: Any) -> int:
+    """One improver cycle: detect, draft, validate, promote — and apply nothing, ever."""
+    considered = improver.run_once()
+    listing = _proposals_for(improver)
+    payload = {
+        "considered": _considered_dicts(considered),
+        "count": len(considered),
+        "applies_changes": False,
+        **listing,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
         return EXIT_OK
 
     promoted = [p for p in considered if p.state == "promoted"]
     print(f"{len(considered)} finding(s) considered, {len(promoted)} promoted")
     for proposal in considered:
         mark = {"promoted": "->", "rejected": "x ", "refused": "! "}.get(proposal.state, "? ")
-        print(f"  {mark} {proposal.proposal_id:12s} {proposal.finding.kind:20s} {proposal.state}")
+        print(f"  {mark} {proposal.proposal_id:12s} {proposal.finding.kind:22s} {proposal.state}")
         if proposal.refusal:
             print(f"      {proposal.refusal[:100]}")
         elif proposal.validation.improved:
             print(f"      improves: {', '.join(proposal.validation.improved)}")
+    print()
     if promoted:
-        print()
-        print(f"  Written to {improver.proposals_dir()}")
-        print("  Nothing has been applied. Read one, then apply it yourself if you agree.")
+        print(f"  Written to {listing['directory']}")
+    print("  Nothing has been applied. Read one, then apply it yourself if you agree.")
     return EXIT_OK
 
 
+def _considered_dicts(considered: list[Any]) -> list[dict[str, Any]]:
+    """The fields the console reads off a cycle's proposals, so both surfaces expose the same ones."""
+    return [{"id": p.proposal_id, "kind": p.finding.kind, "state": p.state,
+             "improved": p.validation.improved, "regressions": p.validation.regressions,
+             "refusal": p.refusal} for p in considered]
+
+
+def _print_proposal(entry: dict[str, Any]) -> None:
+    """One proposal as a human reads it: what was found, where, and the file to open."""
+    finding = entry.get("finding") or {}
+    print(f"  {str(entry.get('proposal_id')):12s} {str(finding.get('kind')):22s} "
+          f"{str(finding.get('path') or '')[:56]}")
+    if finding.get("summary"):
+        print(f"      {str(finding['summary'])[:88]}")
+    if entry.get("file"):
+        print(f"      read: {entry['file']}")
+
+
 def _proposals_for(improver: Any) -> dict[str, Any]:
-    """Read the proposals directory the way the CLI and the console both need it."""
+    """Read the proposals directory the way the CLI and the console both need it.
+
+    Each entry carries the `.md` path beside the JSON, which is the file a person actually reads — the
+    console does the same, so the two surfaces point at the same document.
+
+    Each entry also carries its `lifecycle` (state, whether `apply` would proceed, and why not), and
+    that is computed by `proposals.ProposalStore` rather than restated here: the panel offers an Apply
+    button on `can_apply`, and a second copy of the rule would show up as a button that refuses.
+    """
+    from .proposals import annotate, ProposalStore
+
     directory = improver.proposals_dir()
     proposals: list[dict[str, Any]] = []
     if directory.is_dir():
         for path in sorted(directory.glob("*.json")):
             try:
-                proposals.append(json.loads(path.read_text(encoding="utf-8")))
+                data = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
+            data["file"] = str(path.with_suffix(".md"))
+            proposals.append(data)
     proposals.sort(key=lambda p: str(p.get("at") or ""), reverse=True)
+    annotate(proposals, ProposalStore(workspace=improver.workspace))
     refused: list[dict[str, Any]] = []
     rejected = directory / "rejected.jsonl"
     if rejected.is_file():
@@ -1587,6 +2572,10 @@ def _proposals_for(improver: Any) -> dict[str, Any]:
                     continue
     return {"proposals": proposals, "count": len(proposals), "refused": refused[-20:],
             "refused_count": len(refused), "directory": str(directory),
+            # Still stated even now that `apply` exists, because it is the *listing* that applies
+            # nothing. The field means "this read changed no files", and a listing that stopped saying
+            # so would leave the guarantee people relied on unstated. The per-entry `lifecycle` says
+            # what each proposal *could* do; this says what reading the list did.
             "applies_changes": False}
 
 
@@ -1777,8 +2766,10 @@ def cmd_defaults(args: argparse.Namespace) -> int:
             goal["persist_auto_hires"] = bool(args.persist_hires)
         if args.max_tier is not None:
             goal["auto_hire_max_tier"] = int(args.max_tier)
+        if getattr(args, "posture", None):
+            goal["default_posture"] = str(args.posture)
         if not goal:
-            _warn("nothing to change: pass --auto-gates/--no-auto-gates, --auto-hire, "
+            _warn("nothing to change: pass --posture, --auto-gates/--no-auto-gates, --auto-hire, "
                   "--persist-hires or --max-tier")
             return EXIT_USAGE
         try:
@@ -1866,7 +2857,8 @@ def cmd_hire(args: argparse.Namespace) -> int:
                         provider=args.provider or "", model=args.model or "",
                         context_window=args.context_window, level=args.level or "senior",
                         role=args.role or "worker", team=args.team or "",
-                        title=args.title or "", max_concurrency=args.concurrency or 1),
+                        title=args.title or "", max_concurrency=args.concurrency or 1,
+                        capabilities=list(getattr(args, "capabilities", None) or [])),
             org=org, roster_root=_roster_root_for(args),
         )
     except HireError as exc:
@@ -1921,19 +2913,491 @@ def cmd_agents(args: argparse.Namespace) -> int:
         _warn(f"cannot load the roster: {exc}")
         return EXIT_CHECK_FAILED
     roster = [a for a in org.roster_view() if a.get("kind") != "human"]
+    # The anti-sprawl report, which existed on the desk and was reachable from nowhere — so a roster
+    # could grow a delegate that burns tokens without finishing work and no command would say so.
+    # Computed here because this is the only command that already holds the real roster; the desk's
+    # own `anti_sprawl` reads live runtimes, which an empty roster cannot supply.
+    sprawl = _sprawl_report(org, config)
     if args.json:
-        print(json.dumps({"agents": roster, "loaded_from": people.loaded_from},
+        print(json.dumps({"agents": roster, "sprawl": sprawl,
+                          "loaded_from": people.loaded_from},
                          indent=2, sort_keys=True, default=str))
         return EXIT_OK
     print(f"{len(roster)} agent(s)")
     for entry in roster:
         print(f"  {entry['name']:10s} {entry.get('title', ''):20s} "
               f"{entry.get('provider')}/{entry.get('model')}  [{', '.join(entry.get('skills') or [])}]")
+    if sprawl["suspects"]:
+        print()
+        print("Sprawl suspected — tokens per completed task is above the configured threshold:")
+        for name in sprawl["suspects"]:
+            print(f"  {name}")
+        print("  These agents spend more per finished task than the design expects. Retire one, or")
+        print("  check whether it is being delegated work its skill does not cover.")
     if people.loaded_from:
         print()
         for path in people.loaded_from:
             print(f"  roster: {path}")
     return EXIT_OK
+
+
+def _people_for(args: argparse.Namespace) -> Any:
+    """A roster manager aimed at the project this command named, with a catalog to resolve windows.
+
+    Built the same way `cmd_hire` and `cmd_agents` build it, so an edit validates against the models
+    the roster can actually see rather than against a bare config table.
+    """
+    from .catalog import ModelCatalog
+    from .people import People
+
+    config, source, providers, _ = _load_stack(args)
+    return People(library=source.library, config=config,
+                  catalog=ModelCatalog(config, providers), project=_project_root_for(args))
+
+
+def _agent_id_for(people: Any, ref: str) -> str:
+    """Resolve an agent named by id or by name to its id.
+
+    The console edits by id because it listed the roster first. A person at a terminal is likelier to
+    have the *name* in front of them, so both resolve here — and a miss is refused with the ids, since
+    an edit aimed at nothing that appears to succeed is the worse outcome.
+    """
+    org = people.org
+    if org is None:
+        org = people.load(project=people.project)
+    agents = list(org.agents.values())
+    spec = next((a for a in agents if a.id == ref), None)
+    if spec is None:
+        spec = next((a for a in agents if a.name.lower() == ref.lower()), None)
+    if spec is None:
+        _warn(f"no agent {ref!r} in the roster; `engine.cli agents` lists every id and name")
+        raise SystemExit(EXIT_CHECK_FAILED)
+    return spec.id
+
+
+def cmd_agent_update(args: argparse.Namespace) -> int:
+    """Change an agent's name, model, level or limits — keeping its id and its history.
+
+    Editing rather than firing-and-rehiring: the id is what the mailbox, the session history and the
+    health record are keyed on, so a rehire would look like a brand-new employee with no past. Only the
+    fields named are touched.
+
+    It edits the roster the *console* edits, through the same `People` object, so an agent changed here
+    is the agent the app then shows.
+    """
+    from .people import HireError
+
+    people = _people_for(args)
+    try:
+        org = people.load(project=_project_root_for(args))
+    except HireError as exc:
+        _warn(f"cannot load the roster: {exc}")
+        return EXIT_CHECK_FAILED
+    agent_id = _agent_id_for(people, args.agent)
+
+    changes = {"name": args.name, "provider": args.provider, "model": args.model,
+               "context_window": args.context_window, "level": args.level, "team": args.team,
+               "title": args.title, "max_concurrency": args.concurrency}
+    if all(value is None for value in changes.values()):
+        _warn("nothing to change: name at least one of --name, --provider, --model, --level, "
+              "--title, --team or --concurrency")
+        return EXIT_USAGE
+
+    try:
+        spec = people.update_agent(agent_id, org=org, roster_root=_roster_root_for(args), **changes)
+    except (HireError, ValueError, TypeError) as exc:
+        _warn(f"cannot update {agent_id}: {exc}")
+        return EXIT_CHECK_FAILED
+    for warning in people.warnings:
+        _warn(f"warning: {warning}")
+
+    payload = {"agent": spec.as_dict(), "changed": [k for k, v in changes.items() if v is not None],
+               "roster": str(_roster_root_for(args) or "") or None}
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+
+    print(f"updated {spec.name} ({spec.id})")
+    print(f"  changed : {', '.join(payload['changed'])}")
+    print(f"  model   : {spec.provider}/{spec.model}  (window {spec.context_window})")
+    print(f"  level   : {spec.level.label}   title: {spec.title}   team: {spec.team or '(none)'}")
+    print("  its id and its history are unchanged, so the run it belongs to keeps its bindings")
+    return EXIT_OK
+
+
+def cmd_agent_retire(args: argparse.Namespace) -> int:
+    """Remove an agent from the roster, keeping what it produced.
+
+    The org's own refusals hold: the Owner cannot be retired, and an agent whose reports are actively
+    working cannot be either — the work those reports hold would be orphaned mid-flight.
+    """
+    from .people import HireError
+
+    people = _people_for(args)
+    try:
+        org = people.load(project=_project_root_for(args))
+    except HireError as exc:
+        _warn(f"cannot load the roster: {exc}")
+        return EXIT_CHECK_FAILED
+    agent_id = _agent_id_for(people, args.agent)
+
+    try:
+        spec = people.retire_agent(agent_id, reason=args.reason or "", org=org,
+                                   roster_root=_roster_root_for(args))
+    except HireError as exc:
+        _warn(f"cannot retire {agent_id}: {exc}")
+        return EXIT_CHECK_FAILED
+
+    remaining = [a for a in people.org.roster_view() if a.get("kind") != "human"]
+    payload = {"retired": spec.as_dict(), "reason": args.reason or "",
+               "agents": remaining, "count": len(remaining)}
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+
+    print(f"retired {spec.name} ({spec.id})"
+          + (f" — {args.reason}" if args.reason else ""))
+    print(f"  {len(remaining)} agent(s) remain; what it produced is kept")
+    if not remaining:
+        print("  the roster is now empty of workers — `engine.cli hire` adds one back")
+    return EXIT_OK
+
+
+def cmd_providers(args: argparse.Namespace) -> int:
+    """List, add, test or remove provider endpoints.
+
+    One command with four actions rather than four nouns, because they are edits to one file and a
+    person doing one of them almost always does another next. It is the console's own handler in every
+    case, so a provider the CLI accepts is a provider the panel can edit.
+
+    **No key is ever printed.** `has_key` says whether a key resolves; the value stays in the file.
+    """
+    from .serve import ServerError
+
+    action = args.providers_command
+    # No workspace is resolved: these four actions read and write `credentials.json` and nothing else,
+    # and resolving one would *create* a project directory for a command that never looks in it.
+    console = _console_for(args, needs_workspace=False)
+
+    if action == "list":
+        payload = console._cmd_providers({})
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+            return EXIT_OK
+        print(f"{len(payload['providers'])} provider(s) from {payload['config_path'] or '(no file)'}")
+        for entry in payload["providers"]:
+            models = entry.get("model_count") or 0
+            line = (f"  {entry['id']:12s} {entry['kind']:10s} {entry['status']:18s} "
+                    f"{'key' if entry['has_key'] else 'no key':6s} {models:3d} model(s)  "
+                    f"{entry['base_url']}")
+            print(line)
+            if entry.get("base_url_note"):
+                print(f"      note: {entry['base_url_note'][:100]}")
+            if entry.get("error"):
+                print(f"      error: {str(entry['error'])[:100]}")
+        if payload["skipped"]:
+            print()
+            print("  skipped (could not be built):")
+            for entry in payload["skipped"]:
+                print(f"    {str(entry)[:110]}")
+        if not payload["providers"]:
+            print("  (none — add one with: engine.cli providers add <id> --kind openai "
+                  "--base-url https://host/v1 --key-env NAME)")
+        return EXIT_OK
+
+    # `remove` names nothing but the id, so the candidate payload is built only where it is used —
+    # reading flags a subparser never defines is the `AttributeError: no attribute 'kind'` failure.
+    payload: dict[str, Any] = {
+        "provider_id": args.provider_id or "",
+        "kind": getattr(args, "kind", None) or "openai",
+        "base_url": getattr(args, "base_url", None) or "",
+        "api_key": getattr(args, "key", None),
+        "api_key_env": getattr(args, "key_env", None),
+        "api_version": getattr(args, "api_version", None),
+        "timeout_s": getattr(args, "timeout_s", None),
+        "max_retries": getattr(args, "max_retries", None),
+        "concurrency": getattr(args, "concurrency", None),
+    }
+
+    if action == "test":
+        result = console._cmd_provider_test(payload)
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True, default=str))
+            return EXIT_OK
+        if result.get("ok"):
+            print(f"{payload['provider_id']} reachable — {result.get('model_count')} model(s)")
+        else:
+            print(f"{payload['provider_id']} not usable: {result.get('reason') or 'no reason given'}")
+        if result.get("status"):
+            print(f"  status    : {result['status']}")
+        if result.get("note"):
+            print(f"  note      : {result['note']}")
+        for model in (result.get("models") or [])[:12]:
+            window = model.get("context_window") if model.get("window_known") else "UNKNOWN"
+            print(f"    {model.get('model_id'):36s} window {window}")
+        return EXIT_OK
+
+    if action == "add":
+        try:
+            result = console._cmd_provider_add(payload)
+        except ServerError as exc:
+            _warn(f"cannot save that provider: {exc}")
+            return EXIT_CHECK_FAILED
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True, default=str))
+            return EXIT_OK
+        print(f"saved {result['provider_id']} to {result['saved']}")
+        if result.get("base_url_note"):
+            print(f"  note: {result['base_url_note']}")
+        print("  the live engine has already re-read the file, so `models` sees it now")
+        print(f"  test it: engine.cli providers test {result['provider_id']} --base-url "
+              f"{result['base_url']}")
+        return EXIT_OK
+
+    if action == "remove":
+        try:
+            result = console._cmd_provider_remove({"provider_id": args.provider_id})
+        except ServerError as exc:
+            # Includes the refusal to remove the *last* provider: the engine will not write a document
+            # with no providers, because no launch could read it (`config._build_providers`).
+            _warn(f"cannot remove {args.provider_id!r}: {exc}")
+            return EXIT_CHECK_FAILED
+        # The ids are read back from the *file*, not from the console's own provider list: that list is
+        # a live probe of the endpoints, and "what is left in the file" should not depend on a probe
+        # answering. Both are true statements, but only one of them is the answer to this command.
+        remaining = [str(pid) for pid in _provider_ids_from(console.config.path)]
+        payload = {"removed": result["removed"], "remaining": remaining}
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+            return EXIT_OK
+        print(f"removed {result['removed']}")
+        print(f"  remaining : {', '.join(remaining) or '(none)'}")
+        print("  a default, a concurrency limit or the reviewer default that named it was pruned in "
+              "the same write")
+        # The roster agents still bound to it travel in the engine's reply (`agents`), but this command
+        # resolves no project — it edits `credentials.json` and nothing else — so there is no roster to
+        # read here. The app has a workspace and shows the names; a CLI that guessed from the current
+        # directory would be reporting on a project nobody named.
+        return EXIT_OK
+
+    _warn(f"unknown providers action {action!r}")  # pragma: no cover - argparse guards this
+    return EXIT_USAGE
+
+
+def _provider_ids_from(path: Any) -> list[str]:
+    """The provider ids a credentials document actually holds, read from the file.
+
+    The file rather than `Config.providers`, because the answer must be what a *write* produced. A
+    document the loader refuses has no `Config` to read, so a reload can leave the in-memory object
+    stale on exactly the document this command is reporting about.
+    """
+    if not path:
+        return []
+    try:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    providers = document.get("providers")
+    return sorted(providers) if isinstance(providers, dict) else []
+
+
+def cmd_improve(args: argparse.Namespace) -> int:
+    """Run one cycle of the self-improvement loop. **Nothing is applied.**
+
+    The loop is propose-only by construction (`engine/improver.py`): it measures a defect, drafts a fix,
+    proves it against the eval baseline and *stops*, leaving a file for you to read and apply yourself.
+    The surfaces that judge the loop — the eval gate, the guardrail, the budget config — are refused
+    outright, because an improver that can rewrite its own gate can make anything pass.
+
+    `--list` shows what is already there; `--dry-run` shows the findings without drafting anything.
+    """
+    from .improver import Improver
+
+    slug = _slug_for(args)
+    orch, workspace = _orchestrator(args, slug)
+    improver = Improver(workspace=workspace, memory=getattr(orch, "memory", None))
+
+    if args.list:
+        return _render_proposals(args, improver)
+    if args.dry_run:
+        return _render_findings(args, improver)
+    code = _render_cycle(args, improver)
+    if not args.json:
+        print(f"  List them  : engine.cli proposals --slug {slug}")
+    return code
+
+
+def cmd_proposals(args: argparse.Namespace) -> int:
+    """What the self-improvement loop has proposed — and the lifecycle a person drives.
+
+    The listing half is read-only and says so. The subcommands are the part that was missing: a
+    detection nobody can act on is a report, not a loop, and the person's complaint was exactly that
+    the self-checks "don't have to move forward on fixes".
+
+    What still does not happen here, by construction:
+
+    - `accept` and `reject` are bookkeeping and cannot touch the tree.
+    - `apply` is the one transition that edits anything, so it requires a **demonstrated improvement**
+      *and* an accepted proposal, runs the project's own test suite before and after, and **reverts on
+      regression**. A proposal whose patch is a description rather than a diff is refused with that
+      said plainly rather than quietly "applied" as a no-op.
+    - Everything aimed at the machinery that judges this loop is still refused, and
+      `engine/proposals.py` — the applier itself — is on that list.
+    """
+    from .improver import Improver
+
+    slug = _slug_for(args)
+    workspace = _resolve_workspace(args, slug)
+    workspace.ensure()
+    action = getattr(args, "proposals_command", None)
+
+    if action in ("accept", "reject", "apply", "undo"):
+        return _proposal_lifecycle(args, workspace, action)
+
+    if getattr(args, "show", None):
+        return _show_proposal(args, workspace, args.show)
+
+    code = _render_proposals(args, Improver(workspace=workspace))
+    if not args.json:
+        print("  Move one  : engine.cli proposals accept <id> | reject <id> --reason '...'")
+        print("              engine.cli proposals apply <id>   (tests run before and after)")
+        print(f"  Draft one : engine.cli improve --slug {slug}")
+    return code
+
+
+def _proposal_store(workspace: Any) -> Any:
+    from .proposals import ProposalStore
+
+    return ProposalStore(workspace=workspace)
+
+
+def _show_proposal(args: argparse.Namespace, workspace: Any, proposal_id: str) -> int:
+    """One proposal in full: what it found, why, the evidence, and the patch."""
+    from .proposals import ProposalLifecycleError
+
+    store = _proposal_store(workspace)
+    try:
+        proposal = store.load(proposal_id)
+    except ProposalLifecycleError as exc:
+        _warn(str(exc))
+        return EXIT_CHECK_FAILED
+    payload = {
+        **proposal.as_dict(),
+        "file": str(store.directory / f"{proposal.proposal_id}-{proposal.finding.kind}.md"),
+        "can_apply": store.can_apply(proposal),
+        "why_not": store.why_not(proposal),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+    print(proposal.render())
+    return EXIT_OK
+
+
+def _proposal_lifecycle(args: argparse.Namespace, workspace: Any, action: str) -> int:
+    """One lifecycle step, with the same words and the same exit codes as every other command."""
+    from .proposals import ProposalLifecycleError
+
+    store = _proposal_store(workspace)
+    proposal_id = args.proposal_id
+    try:
+        if action == "accept":
+            proposal = store.accept(proposal_id)
+            payload = {"proposal_id": proposal.proposal_id, "state": proposal.state,
+                       "applied": False,
+                       "next": f"engine.cli proposals apply {proposal_id}"}
+        elif action == "reject":
+            proposal = store.reject(proposal_id, reason=args.reason or "")
+            payload = {"proposal_id": proposal.proposal_id, "state": proposal.state,
+                       "reason": proposal.refusal, "applied": False}
+        elif action == "undo":
+            outcome = store.undo(proposal_id)
+            payload = {**outcome.as_dict(), "applied": False}
+            if outcome.refused:
+                _warn(outcome.refused)
+                return EXIT_CHECK_FAILED
+        else:
+            outcome = store.apply(proposal_id, force=bool(getattr(args, "force", False)))
+            payload = outcome.as_dict()
+            if outcome.refused:
+                # A refusal is *data*, so `--json` gets the whole outcome before the code is returned:
+                # a caller that only saw exit 1 would not know whether the tree was touched, and the
+                # answer here is always "no", which is worth being able to assert.
+                if args.json:
+                    print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+                _warn(outcome.refused)
+                return EXIT_CHECK_FAILED
+    except ProposalLifecycleError as exc:
+        _warn(str(exc))
+        return EXIT_CHECK_FAILED
+
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+    _print_lifecycle(action, payload)
+    return EXIT_OK
+
+
+def _print_lifecycle(action: str, payload: dict[str, Any]) -> None:
+    """The human half. Every line about what was touched is derived from the outcome, not assumed."""
+    if action == "accept":
+        print(f"accepted   : {payload['proposal_id']}  (state {payload['state']})")
+        print("  applied  : nothing — accepting is a decision, not an edit")
+        print(f"  next     : {payload['next']}")
+        return
+    if action == "reject":
+        print(f"rejected   : {payload['proposal_id']}  (state {payload['state']})")
+        print(f"  reason   : {payload['reason']}")
+        print("  recorded : the same finding is not re-drafted every cycle")
+        return
+    if action == "undo":
+        print(f"undone     : {payload['proposal_id']}")
+        for path in payload.get("files") or []:
+            print(f"  restored : {path}")
+        if payload.get("detail"):
+            print(f"  {payload['detail']}")
+        return
+    # apply
+    if payload.get("reverted"):
+        print(f"REVERTED   : {payload['proposal_id']} — the tree is back as it was")
+        print(f"  {payload['detail']}")
+        return
+    print(f"applied    : {payload['proposal_id']}")
+    for path in payload.get("files") or []:
+        print(f"  changed  : {path}")
+    before = payload.get("tests_before") or {}
+    after = payload.get("tests_after") or {}
+    if before or after:
+        print(f"  tests    : {before.get('passed', '?')} -> {after.get('passed', '?')} passed, "
+              f"{after.get('failed', '?')} failed")
+    if payload.get("backup_dir"):
+        print(f"  undo     : engine.cli proposals undo {payload['proposal_id']}")
+        print(f"  copy of the originals: {payload['backup_dir']}")
+
+
+def _sprawl_report(org: Any, config: Any) -> dict[str, Any]:
+    """The anti-sprawl metric over the real roster, from the configured window and threshold.
+
+    Degrades to an empty report rather than failing: a roster with no completed tasks has nothing to
+    measure, and that is not an error.
+    """
+    from .org import HiringDesk
+
+    try:
+        desk = HiringDesk(
+            org, max_depth=int(config.delegation.max_depth),
+            span_of_control=int(config.delegation.span_of_control),
+            allow_ephemeral=bool(config.delegation.allow_ephemeral),
+            budget_share_max=float(config.delegation.budget_share_max),
+            approval_tiers=dict(config.delegation.approval_tiers or {}),
+        )
+        return desk.anti_sprawl(
+            window_runs=int(getattr(config.delegation, "anti_sprawl_window_runs", 5)),
+            growth_threshold=float(
+                getattr(config.delegation, "anti_sprawl_growth_threshold", 0.20)),
+        )
+    except Exception as exc:  # noqa: BLE001 - a metric that cannot be computed is not a failure
+        return {"agents": {}, "suspects": [], "error": str(exc)}
 
 
 def cmd_portfolio(args: argparse.Namespace) -> int:
@@ -2051,7 +3515,14 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
         config, source, _, _ = _load_stack(args)
         roster: list[dict[str, Any]] = []
         if inspected["exists"]:
-            org = _roster_for(config, source.library, entry.workspace_path)
+            # Through the shared resolver: `entry.workspace_path` is `None` for a managed org, and
+            # handing a None root to `_roster_for` read the *current directory's* roster — the engine's
+            # own source tree — instead of the org's managed project. `exists` above is computed from
+            # this same resolver, so the folder read here is the folder the check just approved.
+            from .portfolio import workspace_for
+
+            org = _roster_for(config, source.library,
+                              workspace_for(entry, root=getattr(args, "root", None)).path)
             if org is not None:
                 roster = [a for a in org.roster_view() if a.get("kind") != "human"]
         if args.json:
@@ -2487,14 +3958,22 @@ def cmd_chat(args: argparse.Namespace) -> int:
         try:
             workspace = _resolve_workspace(args, args.slug or "chat")
             workspace.ensure()
-            bus = EventBus(run_id=f"chat_{args.slug or 'chat'}", trace_path=workspace.trace_path)
+            # `lifecycle=` so the session gets the same hooks and notifications a `run` does. Without
+            # it a configured `run.end` hook fired for `engine.cli run` and silently did not for the
+            # session — which is the front door now, so the feature would have appeared broken for
+            # the workflow it exists to serve. Found by configuring a hook and watching it not fire.
+            bus = EventBus(run_id=f"chat_{args.slug or 'chat'}", trace_path=workspace.trace_path,
+                           lifecycle=config, lifecycle_slug=workspace.display_name)
             orch = Orchestrator(config=config, library=source.library, workspace=workspace, bus=bus)
             org = orch.org
         except Exception as exc:  # noqa: BLE001 - the chat must open even if the org cannot
             _warn(f"no org available for this chat: {exc}")
 
+    # `source.library` rather than `source`, because `/setup` and `/cache` drive the console handlers
+    # and those take the pinned library handle, not the overlay.
     session = ChatSession(config=config, gateway=gateway, org=org, orchestrator=orch,
-                          workspace=workspace, skills=source, catalog=catalog)
+                          workspace=workspace, skills=source, catalog=catalog,
+                          library=source.library)
     if args.agent and org is not None:
         session._cmd_agent(args.agent)
     if args.model:
@@ -2538,6 +4017,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="path to credentials.json (default: auto-discover)")
     common.add_argument("--library", default=argparse.SUPPRESS,
                         help="path to the Skills library root (default: auto-discover)")
+    # A run compares the library against a recorded pin when one exists. This flag names that pin;
+    # without it, `$AGENTORG_LIBRARY_PIN` and then `<repo>/.library-pin.json` are tried. The flag
+    # exists because an unpinned checkout is the normal first state — a pin is opt-in, but once
+    # recorded it is enforced, and the enforcement has to be reachable from a real command line.
+    common.add_argument("--library-pin", dest="library_pin", default=argparse.SUPPRESS,
+                        help="path to a recorded library pin (default: $AGENTORG_LIBRARY_PIN, "
+                             "then <engine repo>/.library-pin.json)")
     # `default=argparse.SUPPRESS` is load-bearing. With a normal default, the subparser's own copy of
     # this flag would set `False` and silently overwrite a `--json` given before the subcommand,
     # which is the classic argparse subparser-default trap.
@@ -2567,7 +4053,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  0  success\n"
             "  1  a check failed or the command could not complete\n"
             "  2  usage error\n\n"
-            "start with:  python3 -m engine.cli doctor"
+            "start with:  python3 -m engine.cli          (opens the session)\n"
+            "or:          python3 -m engine.cli doctor   (checks the environment)"
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2575,6 +4062,38 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", parents=[common],
                             help="check every precondition and say what failed")
     doctor.set_defaults(func=cmd_doctor)
+
+    # Both reference agents ship this (`reasonix completion bash|zsh|fish`), and a forty-subcommand CLI
+    # whose only discovery path is `--help` is one people use two commands of. The script is generated
+    # from the parser rather than written by hand, so a renamed verb cannot keep being offered.
+    completion = sub.add_parser(
+        "completion", parents=[common],
+        help="print a shell completion script for this command tree",
+        description=("Print a completion script for bash, zsh or fish. Generated from the argument "
+                     "parser itself, so it cannot offer a command that no longer exists."),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=("install:\n"
+                "  bash : python3 -m engine.cli completion bash > /etc/bash_completion.d/engine.cli\n"
+                "  zsh  : python3 -m engine.cli completion zsh  > \"${fpath[1]}/_engine.cli\"\n"
+                "  fish : python3 -m engine.cli completion fish > ~/.config/fish/completions/engine.cli.fish"))
+    completion.add_argument("shell", choices=list(SUPPORTED_SHELLS),
+                            help="which shell to emit for")
+    completion.set_defaults(func=cmd_completion)
+
+    onboard = sub.add_parser(
+        "onboard", parents=[common],
+        help="the first-run path: every step, which are done, and the one command for the next")
+    onboard.add_argument("--slug", help="a managed project to treat as the chosen one")
+    onboard.add_argument("--root", help="projects root, so a managed project can be found")
+    # The escape hatch for a script or a CI check that must not touch the network. It removes the
+    # *lookup*, never the requirement: a model whose window is unknown still blocks, because an agent
+    # cannot be bound to one — and the step's own `--context-window` command is the fix that needs no
+    # probe. Silently passing a model the engine would refuse to hire onto is the one direction this
+    # flag must not take.
+    onboard.add_argument("--no-probe", action="store_true", dest="no_probe",
+                         help="do not contact providers; decide from the configuration alone "
+                              "(a model with no known window still blocks)")
+    onboard.set_defaults(func=cmd_onboard)
 
     skills = sub.add_parser("skills", parents=[common], help="inspect the skill library")
     skills_sub = skills.add_subparsers(dest="skills_command", required=True)
@@ -2588,6 +4107,12 @@ def build_parser() -> argparse.ArgumentParser:
     skills_show.add_argument("name", help="skill name, e.g. code-reviewer")
     skills_show.add_argument("--root", help="project root, so your own skills are found too")
     skills_show.set_defaults(func=cmd_skills_show)
+    skills_pin = skills_sub.add_parser(
+        "pin", parents=[common],
+        help="record the library's content pin, which every later run is checked against")
+    skills_pin.add_argument("--out", help="where to write the pin (default: $AGENTORG_LIBRARY_PIN, "
+                                         "then <engine repo>/.library-pin.json)")
+    skills_pin.set_defaults(func=cmd_skills_pin)
 
     skills_graph = skills_sub.add_parser(
         "graph", parents=[common],
@@ -2653,6 +4178,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-iterations", type=int, default=3, dest="max_iterations",
                      help="cap on the review-fix loop (default: 3)")
     run.add_argument("--executor", help="override the executor plugin path (testing)")
+    run.add_argument("--posture", choices=["unattended", "supervised"],
+                     help="how far this run's goal may go on its own: unattended (default) lets it "
+                          "answer its own gates and finish alone; supervised parks at every gate")
     run.add_argument("--dry-run", action="store_true", dest="dry_run",
                      help="plan and bind, but do not execute")
     run.set_defaults(func=cmd_run)
@@ -2702,6 +4230,56 @@ def build_parser() -> argparse.ArgumentParser:
                           help="make it non-negotiable, so it survives compaction and rotation")
     instruct.set_defaults(func=cmd_instruct)
 
+    abort = sub.add_parser(
+        "abort", parents=[common],
+        help="STOP the run for good, keeping its checkpoint — not `decide`, which answers a gate and "
+             "lets the run carry on spending")
+    abort.add_argument("--slug", help="project name (optional with --project, which names it)")
+    abort.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    abort.set_defaults(func=cmd_abort)
+
+    reassign = sub.add_parser(
+        "reassign", parents=[common],
+        help="pin a node to a different agent instead of letting the router choose")
+    reassign.add_argument("node", help="the node id in this run's plan")
+    reassign.add_argument("--agent", required=True,
+                          help="the agent to pin it to, by name or id (`agents` lists both)")
+    reassign.add_argument("--slug", help="project name (optional with --project, which names it)")
+    reassign.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    reassign.set_defaults(func=cmd_reassign)
+
+    takeover = sub.add_parser(
+        "takeover", parents=[common],
+        help="take a node over yourself, so its artifact records a human producer")
+    takeover.add_argument("node", help="the node id in this run's plan")
+    takeover.add_argument("--slug", help="project name (optional with --project, which names it)")
+    takeover.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    takeover.set_defaults(func=cmd_takeover)
+
+    subagents = sub.add_parser(
+        "subagents", parents=[common],
+        help="the children a run started, and one child's transcript read a page at a time")
+    subagents_sub = subagents.add_subparsers(dest="subagents_command", required=True)
+
+    subagents_list = subagents_sub.add_parser(
+        "list", parents=[common],
+        help="every child this run started, as the bounded frame its parent saw")
+    subagents_list.add_argument("--slug", help="project name (optional with --project)")
+    subagents_list.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    subagents_list.set_defaults(func=cmd_subagents)
+
+    subagents_result = subagents_sub.add_parser(
+        "result", parents=[common],
+        help="read one child's transcript by byte range — the same page the agent's own tool returns")
+    subagents_result.add_argument("child_id", help="the child id from `subagents list`")
+    subagents_result.add_argument("--offset", type=int,
+                                  help="byte offset to read from (default: 0)")
+    subagents_result.add_argument("--limit", type=int,
+                                  help="bytes to read (clamped by the engine, not unbounded)")
+    subagents_result.add_argument("--slug", help="project name (optional with --project)")
+    subagents_result.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    subagents_result.set_defaults(func=cmd_subagents)
+
     goal = sub.add_parser("goal", parents=[common],
                           help="set, inspect, pause, resume or clear the durable goal (the loop "
                                "that continues past a model finishing)")
@@ -2712,8 +4290,12 @@ def build_parser() -> argparse.ArgumentParser:
     goal_set.add_argument("objective", nargs="+", help="what should be achieved")
     goal_set.add_argument("--no-arm", action="store_true", dest="no_arm",
                           help="record the objective but do not start working on it")
+    goal_set.add_argument("--posture", choices=["unattended", "supervised"],
+                          help="unattended (default): the goal answers its own gates and can finish "
+                               "alone. supervised: every gate waits for you.")
     goal_set.add_argument("--human-gate", action="store_true", dest="human_gate",
-                          help="stop at every gate: you decide, the org does not")
+                          help="stop at every gate: you decide, the org does not "
+                               "(same as --posture supervised)")
     goal_set.add_argument("--auto-approve", action="store_true", default=None, dest="auto_approve",
                           help="pass gates the org can decide (the default)")
     goal_set.add_argument("--no-auto-approve", action="store_false", default=None,
@@ -2919,6 +4501,9 @@ def build_parser() -> argparse.ArgumentParser:
                                    help="auto-created helpers are temporary (the default)")
     defaults_autonomy.add_argument("--max-tier", type=int, default=None, dest="max_tier",
                                    help="highest delegation tier an auto-hire may reach (0-2)")
+    defaults_autonomy.add_argument("--posture", choices=["unattended", "supervised"],
+                                   help="the posture a new goal inherits: unattended lets it "
+                                        "answer its own gates and finish alone")
     defaults_autonomy.set_defaults(func=cmd_defaults)
 
     hire = sub.add_parser("hire", parents=[common],
@@ -2933,6 +4518,11 @@ def build_parser() -> argparse.ArgumentParser:
     hire.add_argument("--title", help="a human title for the roster (default: derived from the skill)")
     hire.add_argument("--team", help="the team it joins")
     hire.add_argument("--concurrency", type=int, help="how many tasks it may run at once")
+    hire.add_argument("--capability", action="append", dest="capabilities", metavar="GRANT",
+                      help="what this agent may reach, repeatable: read:*, write:src/**, exec:*, "
+                           "system:state, system:clipboard, system:screenshot, system:media, "
+                           "system:open, system:automation. Given, it REPLACES the skill's default "
+                           "least-privilege set rather than adding to it, so revoking is expressible.")
     hire.add_argument("--root", help="project root to find .agentorg in (default: walk up)")
     hire.add_argument("--roster-root", help="write the roster here (default: the project root)")
     hire.set_defaults(func=cmd_hire)
@@ -2941,6 +4531,97 @@ def build_parser() -> argparse.ArgumentParser:
                             help="list the effective roster: built-ins plus every hire")
     agents.add_argument("--root", help="project root to find .agentorg in (default: walk up)")
     agents.set_defaults(func=cmd_agents)
+
+    agent = sub.add_parser("agent", parents=[common],
+                           help="change the roster the console edits: update or retire one agent")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+
+    agent_update = agent_sub.add_parser(
+        "update", parents=[common],
+        help="change an agent's name, model, level or limits, keeping its id and its history")
+    agent_update.add_argument("agent", help="the agent's name or id (`agents` lists both)")
+    agent_update.add_argument("--name", help="a new name (must be unique in the roster)")
+    agent_update.add_argument("--provider", help="move it to this provider")
+    agent_update.add_argument("--model", help="move it to this model")
+    agent_update.add_argument("--context-window", type=int, dest="context_window",
+                              help="an explicit window, when the provider cannot report one")
+    agent_update.add_argument("--level", help="junior | practitioner | senior | staff | principal")
+    agent_update.add_argument("--title", help="a human title for the roster")
+    agent_update.add_argument("--team", help="the team it joins (empty moves it to none)")
+    agent_update.add_argument("--concurrency", type=int,
+                              help="how many tasks it may run at once")
+    agent_update.add_argument("--root", help="project root to find .agentorg in (default: walk up)")
+    agent_update.add_argument("--roster-root", help="write the roster here (default: the project root)")
+    agent_update.set_defaults(func=cmd_agent_update)
+
+    agent_retire = agent_sub.add_parser(
+        "retire", parents=[common],
+        help="remove an agent from the roster, keeping what it produced")
+    agent_retire.add_argument("agent", help="the agent's name or id (`agents` lists both)")
+    agent_retire.add_argument("--reason", help="why; recorded with the termination")
+    agent_retire.add_argument("--root", help="project root to find .agentorg in (default: walk up)")
+    agent_retire.add_argument("--roster-root", help="write the roster here (default: the project root)")
+    agent_retire.set_defaults(func=cmd_agent_retire)
+
+    providers = sub.add_parser(
+        "providers", parents=[common],
+        help="list, add, test or remove provider endpoints — the same edits the console makes")
+    providers_sub = providers.add_subparsers(dest="providers_command", required=True)
+
+    providers_list = providers_sub.add_parser(
+        "list", parents=[common],
+        help="every configured provider, whether it is reachable, and how many models it offers")
+    providers_list.add_argument("--slug", help="project name, used only to locate the workspace")
+    providers_list.set_defaults(func=cmd_providers)
+
+    providers_add = providers_sub.add_parser(
+        "add", parents=[common],
+        help="add or replace one provider in credentials.json, then re-read it in place")
+    providers_add.add_argument("provider_id", help="the provider id, e.g. groq")
+    providers_add.add_argument("--kind", choices=["openai", "anthropic", "ollama"],
+                               help="the protocol it speaks (default: openai)")
+    providers_add.add_argument("--base-url", required=True, dest="base_url",
+                               help="the API base, e.g. https://api.groq.com/openai/v1 — a base is "
+                                    "the part before the operation, so a pasted full endpoint is "
+                                    "reduced to one and you are told")
+    providers_add.add_argument("--key-env", dest="key_env",
+                               help="the environment variable holding the key (preferred: it stays "
+                                    "out of the file)")
+    providers_add.add_argument("--key", help="the key itself, when there is no variable to use")
+    providers_add.add_argument("--api-version", dest="api_version",
+                               help="the API version header, for endpoints that need one")
+    providers_add.add_argument("--timeout-s", type=float, dest="timeout_s",
+                               help="request timeout in seconds (default: 120)")
+    providers_add.add_argument("--max-retries", type=int, dest="max_retries",
+                               help="retries before a call fails (default: 3)")
+    providers_add.add_argument("--concurrency", type=int,
+                               help="how many requests this endpoint may serve at once")
+    providers_add.add_argument("--slug", help="project name, used only to locate the workspace")
+    providers_add.set_defaults(func=cmd_providers)
+
+    providers_test = providers_sub.add_parser(
+        "test", parents=[common],
+        help="probe an entry before it is saved, and list the models it offers")
+    providers_test.add_argument("provider_id", help="the provider id to test")
+    providers_test.add_argument("--kind", choices=["openai", "anthropic", "ollama"],
+                                help="the protocol it speaks (default: openai)")
+    providers_test.add_argument("--base-url", required=True, dest="base_url",
+                                help="the API base to probe")
+    providers_test.add_argument("--key-env", dest="key_env", help="the environment variable holding it")
+    providers_test.add_argument("--key", help="the key itself")
+    providers_test.add_argument("--api-version", dest="api_version", help="the API version header")
+    providers_test.add_argument("--timeout-s", type=float, dest="timeout_s", help="request timeout")
+    providers_test.add_argument("--max-retries", type=int, dest="max_retries", help="retries")
+    providers_test.add_argument("--concurrency", type=int, help="concurrent requests")
+    providers_test.add_argument("--slug", help="project name, used only to locate the workspace")
+    providers_test.set_defaults(func=cmd_providers)
+
+    providers_remove = providers_sub.add_parser(
+        "remove", parents=[common],
+        help="remove one provider, pruning the defaults and limits that named it")
+    providers_remove.add_argument("provider_id", help="the provider id to remove")
+    providers_remove.add_argument("--slug", help="project name, used only to locate the workspace")
+    providers_remove.set_defaults(func=cmd_providers)
 
     portfolio = sub.add_parser(
         "portfolio", parents=[common],
@@ -3024,6 +4705,62 @@ def build_parser() -> argparse.ArgumentParser:
     propose.add_argument("--root", help="projects root (default: AgentOrg/projects)")
     propose.set_defaults(func=cmd_propose)
 
+    improve = sub.add_parser(
+        "improve", parents=[common],
+        help="run one cycle of the self-improvement loop — it drafts, proves and STOPS: nothing is "
+             "applied, by any code path")
+    improve.add_argument("--list", action="store_true",
+                         help="show the proposals already written, and what was refused")
+    improve.add_argument("--dry-run", action="store_true", dest="dry_run",
+                         help="measure and list the findings without drafting anything")
+    improve.add_argument("--slug", help="project name (optional with --project)")
+    improve.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    improve.set_defaults(func=cmd_improve)
+
+    proposals = sub.add_parser(
+        "proposals", parents=[common],
+        help="what the self-improvement loop has proposed — the loop never applies anything, and "
+             "`accept`/`reject` move one forward while `apply` is a separate, re-verified step")
+    proposals.add_argument("--slug", help="project name (optional with --project)")
+    proposals.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    proposals.add_argument("--show", metavar="ID",
+                           help="read one proposal in full: its rationale, evidence and patch")
+    proposals.set_defaults(func=cmd_proposals)
+    # Not `required`: a bare `proposals` is the listing, which is the commonest thing anyone types.
+    proposals_sub = proposals.add_subparsers(dest="proposals_command")
+
+    # The lifecycle, as subcommands of the listing. Deliberately *not* separate top-level nouns:
+    # `decide` already owns approve/reject for gates, and a second `accept` at the top level would be
+    # a second word for one idea. Under `proposals` the object is unambiguous.
+    proposals_accept = proposals_sub.add_parser(
+        "accept", parents=[common],
+        help="agree with a proposal — records the decision and applies NOTHING")
+    proposals_accept.add_argument("proposal_id", help="the proposal id, e.g. prop_0001")
+    proposals_accept.set_defaults(func=cmd_proposals)
+
+    proposals_reject = proposals_sub.add_parser(
+        "reject", parents=[common],
+        help="decline a proposal; the reason is recorded so the finding is not re-drafted")
+    proposals_reject.add_argument("proposal_id", help="the proposal id, e.g. prop_0001")
+    proposals_reject.add_argument("--reason", default="", help="why, in your words")
+    proposals_reject.set_defaults(func=cmd_proposals)
+
+    proposals_apply = proposals_sub.add_parser(
+        "apply", parents=[common],
+        help="apply an accepted proposal — runs the test suite before and after and reverts on "
+             "regression")
+    proposals_apply.add_argument("proposal_id", help="the proposal id, e.g. prop_0001")
+    proposals_apply.add_argument("--force", action="store_true",
+                                 help="apply even without a demonstrated improvement (still reverts "
+                                      "on a regression)")
+    proposals_apply.set_defaults(func=cmd_proposals)
+
+    proposals_undo = proposals_sub.add_parser(
+        "undo", parents=[common],
+        help="put an applied proposal's files back, from the copy taken before it was applied")
+    proposals_undo.add_argument("proposal_id", help="the proposal id, e.g. prop_0001")
+    proposals_undo.set_defaults(func=cmd_proposals)
+
     pool = sub.add_parser("pool", parents=[common],
                           help="the task pool: work agents pull, capability-routed")
     pool_sub = pool.add_subparsers(dest="pool_command", required=True)
@@ -3054,15 +4791,151 @@ def build_parser() -> argparse.ArgumentParser:
     pool_claim.add_argument("--task", help="a specific task id instead of the best eligible one")
     pool_claim.set_defaults(func=cmd_pool)
 
+    session = sub.add_parser(
+        "session", parents=[common],
+        help="the sessions this root knows: list them, inspect one, export it, or branch it")
+    session_sub = session.add_subparsers(dest="session_command", required=True)
+
+    session_list = session_sub.add_parser(
+        "list", parents=[common], help="every session under a projects root, newest first")
+    session_list.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    session_list.set_defaults(func=cmd_session)
+
+    session_show = session_sub.add_parser(
+        "show", parents=[common],
+        help="one session in full: the goal, the run, the nodes, the handoffs and the spend")
+    session_show.add_argument("--slug", help="project name (optional with --project)")
+    session_show.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    session_show.set_defaults(func=cmd_session)
+
+    session_export = session_sub.add_parser(
+        "export", parents=[common],
+        help="write a self-contained ZIP of one session, with a manifest naming what is inside")
+    session_export.add_argument("--slug", help="project name (optional with --project)")
+    session_export.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    session_export.add_argument("--out", help="where to write it (default: <slug>-session.zip)")
+    session_export.add_argument("--verify", action="store_true",
+                                help="re-read the archive and check every member against its hash")
+    session_export.set_defaults(func=cmd_session)
+
+    session_fork = session_sub.add_parser(
+        "fork", parents=[common],
+        help="branch a session into a NEW slug; the original is left byte-identical")
+    session_fork.add_argument("--to", required=True,
+                              help="the new slug to branch into (refused if it already exists)")
+    session_fork.add_argument("--slug", help="the session to branch (optional with --project)")
+    session_fork.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    session_fork.set_defaults(func=cmd_session)
+
+    schedules = sub.add_parser(
+        "schedules", parents=[common],
+        help="objectives that fire on a clock — and the rule that stops a failing one firing for ever")
+    schedules_sub = schedules.add_subparsers(dest="schedules_command", required=True)
+
+    schedules_list = schedules_sub.add_parser("list", parents=[common],
+                                              help="the schedule, what is due and what is paused")
+    schedules_list.add_argument("--slug", help="project name (optional with --project)")
+    schedules_list.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    schedules_list.set_defaults(func=cmd_schedules)
+
+    schedules_add = schedules_sub.add_parser(
+        "add", parents=[common], help="schedule an objective to fire once, or on an interval")
+    schedules_add.add_argument("objective", nargs="+", help="what the scheduled goal should achieve")
+    schedules_add.add_argument("--every", help="repeat: 30s, 15m, 6h, 2d (a bare number is minutes)")
+    schedules_add.add_argument("--at", help="fire once at a UTC ISO instant (2026-09-18T07:30:00)")
+    schedules_add.add_argument("--due-now", action="store_true", dest="due_now",
+                               help="fire at the watcher's next tick")
+    schedules_add.add_argument("--posture", choices=["unattended", "supervised"],
+                               default="unattended",
+                               help="unattended (default) lets the scheduled goal answer its own "
+                                    "gates and finish alone; supervised parks at every gate")
+    schedules_add.add_argument("--disabled", action="store_true",
+                               help="record it without arming it")
+    schedules_add.add_argument("--slug", help="project name (optional with --project)")
+    schedules_add.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    schedules_add.set_defaults(func=cmd_schedules)
+
+    schedules_remove = schedules_sub.add_parser("remove", parents=[common],
+                                                help="forget a scheduled entry")
+    schedules_remove.add_argument("ref", help="the entry's id, or its slug")
+    schedules_remove.add_argument("--slug", help="project name (optional with --project)")
+    schedules_remove.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    schedules_remove.set_defaults(func=cmd_schedules)
+
+    schedules_enable = schedules_sub.add_parser(
+        "enable", parents=[common],
+        help="arm an entry again (the deliberate act that undoes a no-re-arm refusal)")
+    schedules_enable.add_argument("ref", help="the entry's id, or its slug")
+    schedules_enable.add_argument("--slug", help="project name (optional with --project)")
+    schedules_enable.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    schedules_enable.set_defaults(func=cmd_schedules)
+
+    schedules_watch = schedules_sub.add_parser(
+        "watch", parents=[common],
+        help="start what is due, in the foreground, until interrupted")
+    schedules_watch.add_argument("--slug", help="project name (optional with --project)")
+    schedules_watch.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    schedules_watch.add_argument("--interval", type=int, default=DEFAULT_TICK_S, dest="interval",
+                                 help=f"seconds between ticks, {MIN_TICK_S}-{MAX_TICK_S} "
+                                      f"(default: {DEFAULT_TICK_S})")
+    schedules_watch.add_argument("--ticks", type=int,
+                                 help="stop after this many ticks (default: run until interrupted)")
+    schedules_watch.add_argument("--max-fires", type=int, dest="max_fires",
+                                 help="stop after this many runs in total")
+    schedules_watch.add_argument("--executor", help="override the executor plugin path (testing)")
+    schedules_watch.set_defaults(func=cmd_schedules)
+
+    # The machine-facing commands live in their own module and take this parser's own `common` parent,
+    # so a global flag added above reaches them without an edit here. Kept out of this file because
+    # `cli.py` is already the largest module in the engine and every system command is a leaf that
+    # delegates to `sysctl_tools` — there is no orchestration for this file to own.
+    from .systemcli import install as _install_system
+    _install_system(sub, common)
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Entry point. Returns an exit code; never raises for an expected failure."""
+    """Entry point. Returns an exit code; never raises for an expected failure.
+
+    **A bare invocation opens the session.** `python3 -m engine.cli` with no argument enters the chat
+    loop instead of printing a usage error, because a person who typed the program's name wants to
+    use the program, not to be handed a list of 25 commands to choose from. This is a *front door*,
+    not a second implementation: the arguments are those of `chat`, and every existing subcommand
+    resolves through the same parser it always did, byte-for-byte.
+
+    The injection is done by prepending the subcommand token rather than by making `command` optional,
+    because `sub.add_subparsers(dest="command", required=True)` is what makes `engine.cli teleport`
+    fail with a usage error — and relaxing it would let a mistyped command fall through to opening an
+    interactive session, which is a worse outcome than an error message.
+
+    **The verb index is a front door too, and it was the one door with no handle.** `--help` starts
+    with a dash, so `_names_a_subcommand` answers False and the token was prepended with `chat`: the
+    command everyone types to find out what exists printed *chat's* options, and `-h` did the same.
+    `engine.cli help` — the other spelling of the same request — had no subcommand by that name and
+    was reported as an unrecognised argument. The only honest way to discover the verbs was
+    `engine.cli completion bash`, which is not a thing a person guesses. So a *leading* `-h`,
+    `--help` or `help` is answered with the top-level help, and `help <verb> [<sub>]` with that
+    verb's own help. The rule is deliberately about the first token: `chat --help` still describes
+    chat, and a bare invocation still opens the session.
+    """
+    resolved = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    if resolved and resolved[0] in ("-h", "--help"):
+        parser.print_help()
+        return EXIT_OK
+    if resolved[:1] == ["help"]:
+        if len(resolved) == 1:
+            parser.print_help()
+            return EXIT_OK
+        # Translating rather than looking the parser up by hand: argparse already knows how to
+        # describe a leaf, and a second traversal here would be a second description of the tree.
+        resolved = [*resolved[1:], "--help"]
+    if not _names_a_subcommand(parser, resolved):
+        resolved = ["chat", *resolved]
+    args = parser.parse_args(resolved)
     # Suppressed flags may be absent entirely; normalise so every command can read them the same way.
-    for name, default in (("json", False), ("config", None), ("library", None)):
+    for name, default in (("json", False), ("config", None), ("library", None), ("library_pin", None)):
         if not hasattr(args, name):
             setattr(args, name, default)
     try:
@@ -3073,6 +4946,62 @@ def main(argv: list[str] | None = None) -> int:
     except BrokenPipeError:
         # A closed pipe (e.g. `| head`) is not an error worth a traceback.
         return EXIT_OK
+
+
+#: The parser's own table answers "did the user name a subcommand?", rather than a second list that
+#: would go stale the first time a command was added.
+def _names_a_subcommand(parser: argparse.ArgumentParser, argv: list[str]) -> bool:
+    """Whether an argument list names a subcommand the parser knows.
+
+    Scanned rather than pattern-matched, because the global flags accept *values*: `--config chat`
+    names a file called `chat`, and treating that value as the subcommand would open a session
+    against the wrong config. Flags are recognised by their leading dashes, `--` ends the scan
+    explicitly, and the first bare word decides.
+
+    A bare word that is **not** a known command answers False — which means it is treated as no
+    subcommand and the token is prepended with `chat`. argparse then reports it as an unrecognised
+    positional, so `engine.cli teleport` still fails with a usage error rather than opening a session.
+    """
+    known = _subcommand_names(parser)
+    takes_value = _value_taking_flags(parser)
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return False
+        if token.startswith("-"):
+            # A flag's *value* is a bare word too: `--config chat` names a file called `chat`, and
+            # treating that as the subcommand would open a session against the wrong configuration.
+            # `--flag=value` carries its own value, so only a separate token is skipped.
+            if token in takes_value:
+                index += 2
+                continue
+            index += 1
+            continue
+        return token in known
+    return False
+
+
+def _value_taking_flags(parser: argparse.ArgumentParser) -> set[str]:
+    """The parser's own option strings that consume a following value."""
+    flags: set[str] = set()
+    for action in parser._actions:  # noqa: SLF001 - argparse exposes no public accessor for this
+        if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction,  # noqa: SLF001
+                               argparse._CountAction, argparse._HelpAction)):  # noqa: SLF001
+            continue
+        if getattr(action, "nargs", None) == 0:
+            continue
+        flags.update(action.option_strings)
+    return flags
+
+
+def _subcommand_names(parser: argparse.ArgumentParser) -> set[str]:
+    """The parser's own subcommand names, read off the action rather than duplicated as a list."""
+    for action in parser._actions:  # noqa: SLF001 - argparse exposes no public accessor for this
+        choices = getattr(action, "choices", None)
+        if action.dest == "command" and isinstance(choices, dict):
+            return set(choices)
+    return set()
 
 
 if __name__ == "__main__":

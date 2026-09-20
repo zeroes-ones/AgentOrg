@@ -71,7 +71,10 @@ def build_provider(spec: ProviderConfig, *, transport: Any = None) -> Provider:
     if kind in ("openai", "anthropic") and not api_key and _looks_cloud(spec.base_url):
         raise ConfigError(
             f"provider {spec.id!r} ({kind}) has no API key. "
-            + (f"Set the ${spec.api_key_env} environment variable." if spec.api_key_env
+            + (f"${spec.api_key_env} is not set in this environment, and no key is stored in the "
+               f"config either — set ${spec.api_key_env}, or paste the key into the provider's "
+               f"api_key field (either one works; the variable is preferred because it stays out of "
+               f"the file)." if spec.api_key_env
                else "Set api_key_env (preferred) or api_key in credentials.json.")
         )
 

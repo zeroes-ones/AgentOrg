@@ -28,6 +28,7 @@ from engine.portfolio import (
     Portfolio,
     PortfolioError,
     Principal,
+    workspace_for,
 )
 
 
@@ -187,6 +188,46 @@ def test_inspect_reports_state_presence(root):
     portfolio.add_org(name="Real", slug="real", path=folder)
     row = portfolio.inspect()["orgs"][0]
     assert row["exists"] is True and row["has_state"] is True
+
+
+# ── where an org runs: its folder, or a managed project ──────────────────────
+
+
+def test_a_path_less_org_has_no_workspace_path():
+    """`None`, and not the truthy `Path('.')` the guards missed: `str(Path('.'))` is `"."`.
+
+    Every caller writes `if not str(path)` or `if not path`, so a `Path('.')` slips past the guard and
+    resolves the org to the process's current working directory instead of its managed project.
+    """
+    entry = OrgEntry(id="org_ideas", name="Ideas", slug="ideas")
+    assert entry.workspace_path is None
+
+
+def test_workspace_for_a_path_less_org_is_its_managed_project(root):
+    """The exact bug: a path-less org used to resolve to the engine's own source directory."""
+    portfolio = Portfolio.new()
+    entry = portfolio.add_org(name="Ideas", slug="ideas")
+    workspace = workspace_for(entry, root=root)
+    assert workspace.path == root / "ideas", "a managed org lives under projects/<slug>"
+    assert workspace.path != pathlib.Path.cwd(), "and never at the console's own working directory"
+
+
+def test_workspace_for_an_org_with_a_folder_is_that_folder(root):
+    portfolio = Portfolio.new()
+    folder = root / "tesla"
+    folder.mkdir(parents=True)
+    entry = portfolio.add_org(name="Tesla", slug="tesla", path=folder)
+    assert workspace_for(entry).path == folder.resolve()
+
+
+def test_inspect_reports_a_path_less_org_as_managed_not_missing(root):
+    """Managed means "no folder of its own yet", which is not the same as a named folder gone."""
+    portfolio = Portfolio.new()
+    portfolio.add_org(name="Ideas", slug="ideas")
+    report = portfolio.inspect()
+    assert report["orgs"][0]["managed"] is True
+    assert report["counts"]["missing"] == 0, (
+        "a managed org with no folder yet has not gone missing")
 
 
 def test_rollup_marks_an_org_with_no_live_picture_as_not_loaded():

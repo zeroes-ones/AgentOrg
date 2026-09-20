@@ -152,6 +152,40 @@ def test_rollup_counts_loaded_orgs_and_reports_the_rest_as_not_loaded(config, li
     assert rows["spacex"]["spend_usd"] is None, "an unloaded org has no figure, not zero"
 
 
+def test_org_spend_reads_the_cost_ledger_not_the_decision_ledger(config, library, portfolio):
+    """The figure comes from the ledger the run spent against, not the one that records decisions.
+
+    `orch.ledger` is the *decision* gate ledger: it has no `snapshot()` and no cost in it. Reading it
+    raised, the exception branch returned None, and every org's spend was silently unknown.
+    """
+    fleet = _fleet(config, library, portfolio)
+    orch = fleet._runtime_for("tesla").orchestrator
+    orch.cost_snapshot = lambda: {  # type: ignore[assignment]
+        "total_usd": 1.25, "total_tokens": 4200, "calls": 7,
+        "unknown_cost_calls": 0, "cost_complete": True}
+    assert fleet._org_spend(orch) == 1.25
+
+
+def test_an_unreported_cost_is_unknown_not_zero(config, library, portfolio):
+    """A total that is really a floor must not be presented as a figure."""
+    fleet = _fleet(config, library, portfolio)
+    orch = fleet._runtime_for("tesla").orchestrator
+    orch.cost_snapshot = lambda: {  # type: ignore[assignment]
+        "total_usd": 0.0, "total_tokens": 0, "calls": 1,
+        "unknown_cost_calls": 1, "cost_complete": False}
+    assert fleet._org_spend(orch) is None
+
+
+def test_a_genuine_zero_is_reported_as_zero(config, library, portfolio):
+    """A run that made no billable call spent nothing — that is known, not unknown."""
+    fleet = _fleet(config, library, portfolio)
+    orch = fleet._runtime_for("tesla").orchestrator
+    orch.cost_snapshot = lambda: {  # type: ignore[assignment]
+        "total_usd": 0.0, "total_tokens": 0, "calls": 0,
+        "unknown_cost_calls": 0, "cost_complete": True}
+    assert fleet._org_spend(orch) == 0.0
+
+
 # ── refusals ─────────────────────────────────────────────────────────────────
 
 
@@ -224,8 +258,11 @@ def test_the_per_org_budget_refuses_a_spent_org(config, library, portfolio):
     portfolio.update_org("tesla", daily_budget_usd=0.01)
     fleet = _fleet(config, library, portfolio, ceiling=2)
     runtime = fleet._runtime_for("tesla")
-    # A ledger that says the org has spent more than its ceiling.
-    runtime.orchestrator.ledger.snapshot = lambda: {"cost_usd": 5.0}  # type: ignore[assignment]
+    # A cost ledger that says the org has spent more than its ceiling. Patched on the accessor the
+    # fleet actually reads — the *cost* ledger the run kept, not the orchestrator's decision ledger.
+    runtime.orchestrator.cost_snapshot = lambda: {  # type: ignore[assignment]
+        "total_usd": 5.0, "total_tokens": 10, "calls": 1,
+        "unknown_cost_calls": 0, "cost_complete": True}
     with pytest.raises(FleetError, match="daily budget"):
         fleet.run_org("tesla", goal="x")
 

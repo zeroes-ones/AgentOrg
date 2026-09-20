@@ -396,6 +396,17 @@ class ExecutorConfig:
     tools_read_only: bool = False
     #: The model-call bound for one tool-using node.
     max_tool_steps: int = 12
+    #: How many times a node whose handoff payload the contract refused is retried, when the refusal
+    #: happens **outside any loop**. This is the *width* of the window; whether there is one at all
+    #: is the goal's posture (see `Orchestrator._contract_rework_attempts`), because that is an
+    #: autonomy decision and this is a tuning one.
+    #:
+    #: A contract refusal is a fixable defect in how a node *reported* its work, not proof the work
+    #: failed — and until this existed, a node outside a loop got no retry at all, so one oversized
+    #: payload (`R6: 9 open questions exceed the 3 ceiling`) ended a run that had done real work and
+    #: left every downstream node pending. A loop member has always had this patience; this extends
+    #: it to the node that is not in a loop. Three matches a composed plan's default loop bound.
+    contract_rework: int = 3
     #: Whether a tool-using node may dispatch isolated subagents (`task`/`fleet`). Off by default: a
     #: fan-out of tool-using children multiplies cost, so it is opt-in rather than incidental.
     subagents_enabled: bool = False
@@ -435,6 +446,11 @@ class ExecutorConfig:
         if self.subagent_max_parallel < 1:
             raise ConfigError(
                 f"executor.subagent_max_parallel must be >= 1; got {self.subagent_max_parallel}"
+            )
+        if int(self.contract_rework) < 0:
+            raise ConfigError(
+                f"executor.contract_rework must be >= 0 (0 disables the window); "
+                f"got {self.contract_rework}"
             )
 
 
@@ -480,8 +496,30 @@ class GoalConfig:
     #: the created employee appears in `agents` and the Org/People panels like any other hire.
     persist_auto_hires: bool = False
     #: The highest delegation tier an auto-hire may reach without asking. `0` means the safest tier
-    #: only: a cheap, reversible helper. Anything above it parks rather than silently spending.
+    #: only: a cheap, reversible helper. Above it the gap is reported to the Owner — with the tier the
+    #: helper would have landed in and the reason — rather than being staffed silently.
+    #:
+    #: The tier is the *delegation desk's* own classification of the helper the engine is about to
+    #: create, not a second opinion, so the cap bounds the same risk `HiringDesk.evaluate` would have
+    #: judged. A helper whose grant is contained to the project (read anywhere, write inside it) is
+    #: T0; one requesting a wildcard or privileged capability is T3 and will not be created under any
+    #: setting this config accepts.
     auto_hire_max_tier: int = 0
+    #: The posture a *new* goal inherits: `unattended` or `supervised`. See `goal.Posture`.
+    #:
+    #: `unattended` matches the documented polarity — a human is involved only if you chose one — and
+    #: is what makes a goal able to reach its terminal gate with nobody watching. `supervised` is the
+    #: org-wide "always ask me" setting: every gate parks, exactly as the engine behaved before
+    #: autonomy existed. A goal copies this at creation and then owns its copy, so editing the file
+    #: cannot change the authority of an objective already in flight.
+    default_posture: str = "unattended"
+    #: How many continuation rounds one goal slice may run before it stops itself.
+    #:
+    #: `orchestrator._goal_max_rounds` read this and there was no such field, so the documented cap
+    #: was unreachable and only the hardcoded fallback applied. Declaring it makes the documented knob
+    #: real. The fallback is high on purpose: a goal is meant to keep going, and the budgets are what
+    #: bound the *spend*.
+    max_rounds: int = 10_000
 
     def __post_init__(self) -> None:
         if self.token_budget < 0:
@@ -496,6 +534,15 @@ class GoalConfig:
                 "goal.auto_hire_max_tier must be between 0 (safest only) and 2; got "
                 f"{self.auto_hire_max_tier}"
             )
+        posture = str(self.default_posture or "").strip().lower()
+        if posture not in ("unattended", "supervised"):
+            raise ConfigError(
+                f"goal.default_posture must be 'unattended' or 'supervised'; got "
+                f"{self.default_posture!r}"
+            )
+        self.default_posture = posture
+        if int(self.max_rounds) < 1:
+            raise ConfigError(f"goal.max_rounds must be >= 1; got {self.max_rounds}")
 
 
 @dataclass
@@ -594,11 +641,23 @@ class DelegationConfig:
             )
 
     def elevated_markers(self) -> tuple[str, ...]:
-        """Capability prefixes that force an Owner gate regardless of budget."""
+        """Capability prefixes that force an Owner gate regardless of budget.
+
+        `system:` belongs here for the same reason `deploy:` does, and leaving it out was a real hole:
+        a requisition asking for `system:automation` — the ability to run AppleScript on the person's
+        machine — classified **T1**, auto-approved with a notification, because the markers only knew
+        about file and deploy capabilities. An agent could therefore be handed machine access by the
+        delegation desk without anyone deciding it, which is the opposite of what every other part of
+        this design does.
+
+        It is an approval gap rather than a grant gap (`people._capabilities_for` confers no `system:`
+        capability, so an auto-hire cannot obtain one this way), and it is closed here because the
+        desk's own answer should be the same one a person would give.
+        """
         raw = self.approval_tiers.get("elevated_capability_markers")
         if isinstance(raw, list) and raw:
             return tuple(str(m) for m in raw)
-        return ("write:", "deploy:", "exec:", "admin:")
+        return ("write:", "deploy:", "exec:", "admin:", "system:")
 
 
 @dataclass
@@ -683,6 +742,196 @@ class TelemetryConfig:
     export_enabled: bool = True
 
 
+@dataclass
+class SandboxConfig:
+    """Confinement for a command an agent asks to run.
+
+    A shell inside a real repository is a far larger risk than a file write, which is why this engine
+    shipped without one. The answer is not "never allow it" — an unattended agent that cannot run the
+    test suite it just wrote is limited to guessing — but to confine it and to make the confinement
+    the *default* rather than something a caller remembers to ask for.
+    """
+
+    #: Whether the `run_command` tool is offered at all. Off means the registry never advertises it,
+    #: so a model cannot be tempted by a tool it would only be refused.
+    enabled: bool = False
+    #: Whether a confined command may reach the network. Off by default: a build that needs to fetch
+    #: is a decision, not an accident.
+    allow_network: bool = False
+    #: Extra absolute paths a command may write, beyond the project itself.
+    allow_write: list[str] = field(default_factory=list)
+    #: Wall-clock ceiling for one command, and the output cap. Both bounded because an unattended
+    #: run must not be able to hang or flood on a command nobody is watching.
+    max_seconds: int = 120
+    max_output_bytes: int = 100_000
+
+    def __post_init__(self) -> None:
+        if int(self.max_seconds) < 1:
+            raise ConfigError("sandbox.max_seconds must be >= 1")
+        if int(self.max_output_bytes) < 1:
+            raise ConfigError("sandbox.max_output_bytes must be >= 1")
+
+
+@dataclass
+class SystemConfig:
+    """Whether agents may act on the machine itself, and how far.
+
+    The engine confines what an agent touches *inside* a project. This section is the other question:
+    may it open an app, read the clipboard, take a screenshot, change the volume, query the battery.
+    Those are real capabilities a person wants an assistant to have, and they are also the point at
+    which "an agent in a folder" becomes "an agent on my account".
+
+    So the model is **scoped grants, never one switch**:
+
+    - ``enabled`` is off by default, and a grant is still required after it is on. Turning this on
+      grants nothing; it only makes the tools *offerable*.
+    - Each capability below is its own grant an agent must hold, so a reviewer can be given nothing
+      while an assistant gets exactly what it needs. There is deliberately no "all of it" grant that
+      covers destructive actions.
+    - **A destructive or irreversible action asks once**, through the engine's existing gate machinery,
+      and the decision is recorded in the ledger. Reading the battery is not a decision; deleting your
+      files, sending mail or changing a system setting is, and autonomy does not extend to it.
+
+    The allowlists are what make a grant a *scope* rather than a boolean, matching how `read:` and
+    `write:` already work.
+    """
+
+    #: Whether any system tool may be offered at all. Off means the registry advertises none, so a
+    #: model is never tempted by a tool it would only be refused.
+    enabled: bool = False
+    #: Applications an agent may launch, by bundle or display name. Empty means none: opening an app is
+    #: a state change on the person's desktop, so it starts closed like every other destructive thing.
+    allow_apps: list[str] = field(default_factory=list)
+    #: AppleScript/JXA handlers an agent may run, as `app:tell` style prefixes. Empty means none.
+    #: Kept separate from `allow_apps` because "may open Safari" is not "may script Safari".
+    allow_automation: list[str] = field(default_factory=list)
+    #: Where a screenshot may be written. Inside the workspace by default, since a screenshot of the
+    #: person's whole desktop is not project content.
+    screenshot_dir: str = ""
+    #: Shortcuts an agent may run, by name. Empty means none.
+    #:
+    #: Shortcuts are how a person wires up their *own* automation — the thing only they can build,
+    #: because it touches their apps and their data. An agent running one is not scripting the machine;
+    #: it is pulling a lever the person already installed, which is why this is a separate grant from
+    #: `system:automation` and a much narrower one.
+    allow_shortcuts: list[str] = field(default_factory=list)
+    #: Wall-clock ceiling for one system call, and the output cap. Bounded because an unattended run
+    #: must not hang on a dialog nobody is there to dismiss.
+    max_seconds: int = 20
+    max_output_bytes: int = 40_000
+    #: Whether an agent holding `system:*` may act **without the per-action allowlists**.
+    #:
+    #: Both reference agents ship this and call it by name — Reasonix's `--permission-mode
+    #: bypassPermissions` with `sandbox = false`, Kimi's `--auto` ("never interrupts you; everything
+    #: runs and is decided automatically"). It is the mode for a machine you have handed to the agent:
+    #: a build box, a scratch VM, a laptop you are not using.
+    #:
+    #: It is deliberately a *second* switch rather than the default, because the two answer different
+    #: questions. `allow_apps` answers "which applications may this agent start"; this answers "do I
+    #: still want to be consulted at all". A person who wants the first does not thereby want the
+    #: second, and a single switch for both would give them no way to say so.
+    #:
+    #: What it changes, exactly — and nothing more:
+    #:   - `open_app` may launch any installed application, not only those in `allow_apps`.
+    #:   - `run_automation` may run any AppleScript, not only handlers matching `allow_automation`.
+    #:   - a state-changing action no longer requires a one-off Owner consent.
+    #:
+    #: What it does **not** change: `system.enabled` is still required, an agent still needs the
+    #: relevant `system:*` grant, every call is still bounded by `max_seconds` and
+    #: `max_output_bytes`, and every action is still recorded. Full access is permission to *act*,
+    #: never permission to stop being audited — a mode that also silenced the record would make the
+    #: ledger useless precisely where it matters most.
+    allow_full_access: bool = False
+
+    #: The capabilities this section can grant, as `<name>:<scope>` pairs an agent holds. Named here so
+    #: the console, the roster and the tool registry cannot disagree about the vocabulary.
+    CAPABILITIES: tuple[str, ...] = (
+        "system:state",       # read battery, disk, network, uptime, running apps
+        "system:clipboard",   # read and write the clipboard
+        "system:screenshot",  # capture the screen into the workspace
+        "system:media",       # volume, mute, play/pause
+        "system:open",        # launch an application named in allow_apps
+        "system:automation",  # run an allowlisted AppleScript/JXA handler
+        "system:notify",      # speak a message, post a notification
+        "system:search",      # Spotlight metadata queries (read-only index)
+        "system:power",       # keep the Mac awake, sleep it
+        "system:network",     # read connectivity and run a throughput measurement
+        "system:shortcuts",   # run a Shortcut the person has already created
+        "system:softwareupdate",  # list and install OS updates — the heaviest grant here
+    )
+
+    def __post_init__(self) -> None:
+        if int(self.max_seconds) < 1:
+            raise ConfigError("system.max_seconds must be >= 1")
+        if int(self.max_output_bytes) < 1:
+            raise ConfigError("system.max_output_bytes must be >= 1")
+
+
+@dataclass
+class McpConfig:
+    """Model Context Protocol servers this org may draw tools from.
+
+    Keyed by server name, each entry a command (`stdio`) or a URL (`http`). Config-shaped rather than
+    code-shaped so adding a server is an edit to `credentials.json`, not to the engine.
+    """
+
+    enabled: bool = True
+    servers: dict[str, Any] = field(default_factory=dict)
+    #: How long to wait for a server to answer during a handshake, and per call.
+    timeout_s: int = 30
+
+    def __post_init__(self) -> None:
+        if int(self.timeout_s) < 1:
+            raise ConfigError("mcp.timeout_s must be >= 1")
+        for name, spec in (self.servers or {}).items():
+            if not isinstance(spec, dict):
+                raise ConfigError(f"mcp.servers[{name!r}] must be an object")
+
+
+@dataclass
+class HooksConfig:
+    """Shell commands a person wants run at named points in a run's life.
+
+    The escape hatch for "when a run finishes, do X" that does not require the engine to grow a
+    feature per X — the same idea as the reference agents' lifecycle hooks. A hook is *told* what
+    happened; it cannot change the run, which is what keeps it an observation rather than a second
+    control plane.
+    """
+
+    enabled: bool = True
+    #: Event name -> a command, or a list of commands. Matched exactly, plus `*` for all.
+    events: dict[str, Any] = field(default_factory=dict)
+    timeout_s: int = 30
+
+    def __post_init__(self) -> None:
+        if int(self.timeout_s) < 1:
+            raise ConfigError("hooks.timeout_s must be >= 1")
+
+
+@dataclass
+class NotifyConfig:
+    """How an unattended run tells you it needs attention.
+
+    A run you leave alone has a failure mode a supervised run does not: it stops and nobody is looking.
+    A desktop notification covers the case where you are at the machine; a webhook covers the case
+    where you are not.
+    """
+
+    enabled: bool = True
+    #: Events worth interrupting a person for. Deliberately not every event: a notification nobody
+    #: reads is worse than none, because it trains you to ignore the channel.
+    on: list[str] = field(default_factory=lambda: [
+        "run.end", "goal.completed", "goal.blocked", "goal.paused", "human.gate"])
+    #: A shell command to run, and/or a URL to POST the event to. Empty means that channel is off.
+    command: str = ""
+    url: str = ""
+    timeout_s: int = 15
+
+    def __post_init__(self) -> None:
+        if int(self.timeout_s) < 1:
+            raise ConfigError("notify.timeout_s must be >= 1")
+
+
 # ── top-level config ─────────────────────────────────────────────────────────
 
 
@@ -707,6 +956,11 @@ class Config:
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     goal: GoalConfig = field(default_factory=GoalConfig)
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    system: SystemConfig = field(default_factory=SystemConfig)
+    mcp: McpConfig = field(default_factory=McpConfig)
+    hooks: HooksConfig = field(default_factory=HooksConfig)
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
     schemas: dict[str, str] = field(default_factory=dict)
     idempotency: dict[str, Any] = field(default_factory=dict)
     library: dict[str, Any] = field(default_factory=dict)
@@ -913,15 +1167,25 @@ def _check_permissions(path: Path) -> list[str]:
 def _remove_provider_references(document: dict[str, Any], provider_id: str) -> None:
     """Drop every reference to a provider that has just been removed.
 
-    Two places name a provider: `concurrency.per_provider_limits[pid]` and `defaults.provider`. Leaving
-    either behind produced a config the loader had to repair — and before the loader learned to repair,
-    it refused to load at all, which made removing a provider from the console a way to brick the whole
-    engine. Both are pruned here so the state is never written in the first place.
+    Three places name a provider: `concurrency.per_provider_limits[pid]`, `defaults.provider` and
+    `defaults.reviewer.provider`. Leaving any of them behind produced a config the loader had to
+    repair — and before the loader learned to repair, it refused to load at all, which made removing a
+    provider from the console a way to brick the whole engine. All three are pruned here so the state
+    is never written in the first place.
 
     Removing the default is deliberately *not* replaced with a guess at another provider: a default
     chosen silently by this function would be a routing decision the user did not make. The absence is
     resolved by the loader (`defaults.provider` is dropped, a configured provider is used), and the
     console shows the remaining providers so a new default is one click away.
+
+    The reviewer reference is pruned the same way and the sub-object is otherwise left alone, because
+    the loader tolerates what is left: `_build_defaults` copies `reviewer.model` into
+    `DefaultsConfig.reviewer_model` while a missing `reviewer.provider` leaves `reviewer_provider`
+    empty, and review resolution reads an empty reviewer provider as "the builders' provider"
+    (`default_company`: `use_provider = reviewer_provider if (is_reviewer and reviewer_provider) else
+    provider`). So a reviewer left with a model and no provider resolves to the default pair rather
+    than refusing to load. The sub-object is dropped only when pruning emptied it, which is what
+    `set_defaults` does with an empty reviewer.
     """
     concurrency = document.get("concurrency")
     if isinstance(concurrency, dict):
@@ -929,8 +1193,16 @@ def _remove_provider_references(document: dict[str, Any], provider_id: str) -> N
         if isinstance(limits, dict):
             limits.pop(provider_id, None)
     defaults = document.get("defaults")
-    if isinstance(defaults, dict) and str(defaults.get("provider") or "") == provider_id:
+    if not isinstance(defaults, dict):
+        return
+    if str(defaults.get("provider") or "") == provider_id:
         defaults.pop("provider", None)
+    reviewer = defaults.get("reviewer")
+    if isinstance(reviewer, dict):
+        if str(reviewer.get("provider") or "") == provider_id:
+            reviewer.pop("provider", None)
+        if not reviewer:
+            defaults.pop("reviewer", None)
 
 
 def write_provider(path: os.PathLike | str, entry: dict[str, Any], *,
@@ -966,10 +1238,10 @@ def write_provider(path: os.PathLike | str, entry: dict[str, Any], *,
     if remove:
         providers.pop(pid, None)
         # Prune the references to the provider that has just gone, in the same write, so the console
-        # cannot leave a config the loader must repair. A dangling `per_provider_limits` entry or a
-        # `defaults.provider` naming the removed provider is exactly what made "remove a provider"
-        # brick the engine (the loader refuses-or-prunes it), so the fix belongs at the writer too:
-        # the state is never created, rather than cleaned up afterwards.
+        # cannot leave a config the loader must repair. A dangling `per_provider_limits` entry, a
+        # `defaults.provider` or a `defaults.reviewer.provider` naming the removed provider is exactly
+        # what made "remove a provider" brick the engine (the loader refuses-or-prunes it), so the fix
+        # belongs at the writer too: the state is never created, rather than cleaned up afterwards.
         _remove_provider_references(document, pid)
     else:
         payload = dict(entry)
@@ -1025,6 +1297,20 @@ def _read_document(path: os.PathLike | str) -> tuple[Path, dict[str, Any]]:
     if not isinstance(document, dict):
         raise ConfigError(f"{target} is not a JSON object")
     return target, document
+
+
+def provider_ids(path: os.PathLike | str) -> list[str]:
+    """The provider ids a credentials document actually holds, read from the file.
+
+    The file rather than a loaded `Config`, because the question this answers is *"what would be left
+    after a write"* — and the one document the loader cannot turn into a `Config` is the empty one an
+    over-eager removal would produce. A caller can therefore ask before writing rather than repairing
+    after. Raises `ConfigError` for a file that cannot be read, the contract `write_provider` has too,
+    so the reason travels instead of being flattened into "nothing is left".
+    """
+    _target, document = _read_document(path)
+    providers = document.get("providers")
+    return sorted(providers) if isinstance(providers, dict) else []
 
 
 def set_defaults(path: os.PathLike | str, *, provider: str = "", model: str = "",
@@ -1096,6 +1382,49 @@ def set_autonomy(path: os.PathLike | str, *, goal: dict[str, Any] | None = None)
     for key, value in goal.items():
         if str(key) in valid and value is not None:
             section[str(key)] = value
+    tmp = target.with_name(target.name + f".tmp.{os.getpid()}")
+    _write_document_atomic(target, document, tmp)
+    return target
+
+
+def set_system(path: os.PathLike | str, *, system: dict[str, Any] | None = None) -> Path:
+    """Merge a change into the `[system]` machine-access block, atomically.
+
+    The third deliberate write alongside `set_defaults` and `set_autonomy`, and separate for the same
+    reason: **"which model", "how much may it decide", and "what may it touch on this Mac" are three
+    different decisions**, and a person making one must not make another by accident. It is also the
+    write that was missing — `SystemConfig` was readable but had no writer, so every capability refused
+    with "the machine tools are off" and there was no supported way to say otherwise.
+
+    Only fields `SystemConfig` declares are stored, and only when the value is not `None`, so a panel
+    can send just the switch that changed. Booleans are coerced to `bool` and the allowlists to
+    `list[str]` with blanks dropped, because a list containing `""` would read as one allowlisted entry
+    that matches nothing — a grant that silently buys nothing, which is the failure this whole section
+    exists to avoid.
+    """
+    target, document = _read_document(path)
+    if not system:
+        return target
+    section = document.get("system")
+    if not isinstance(section, dict):
+        section = {}
+        document["system"] = section
+
+    valid = {f.name for f in fields(SystemConfig)}
+    list_fields = {"allow_apps", "allow_automation", "allow_shortcuts"}
+    for key, value in system.items():
+        name = str(key)
+        if name not in valid or value is None:
+            continue
+        if name in list_fields:
+            if not isinstance(value, (list, tuple)):
+                raise ConfigError(f"system.{name} must be a list of names")
+            section[name] = [str(v).strip() for v in value if str(v).strip()]
+        elif name in ("enabled", "allow_full_access"):
+            section[name] = bool(value)
+        else:
+            section[name] = value
+
     tmp = target.with_name(target.name + f".tmp.{os.getpid()}")
     _write_document_atomic(target, document, tmp)
     return target
@@ -1386,6 +1715,11 @@ def load(path: os.PathLike | str | None = None, *, warn: bool = True) -> Config:
         budget=_build_simple(BudgetConfig, raw.get("budget"), "budget"),
         policy=policy,
         goal=_build_simple(GoalConfig, raw.get("goal"), "goal"),
+        sandbox=_build_simple(SandboxConfig, raw.get("sandbox"), "sandbox"),
+        system=_build_simple(SystemConfig, raw.get("system"), "system"),
+        mcp=_build_simple(McpConfig, raw.get("mcp"), "mcp"),
+        hooks=_build_simple(HooksConfig, raw.get("hooks"), "hooks"),
+        notify=_build_simple(NotifyConfig, raw.get("notify"), "notify"),
         schemas={str(k): str(v) for k, v in schemas.items()},
         idempotency=raw.get("idempotency") or {},
         library=raw.get("library") or {},

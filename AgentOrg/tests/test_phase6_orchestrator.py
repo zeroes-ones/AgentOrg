@@ -664,3 +664,107 @@ def test_a_genuinely_ours_checkpoint_is_still_version_checked(stack):
 
     with pytest.raises(OrchestratorError, match="cannot open this run"):
         orch.load("gateprobe")
+
+
+# ── the goal loop's round spend comes from the cost ledger ────────────────────
+#
+# `_round_spend` used to ask the *decision* ledger (`self.ledger`, an `org.ledger.Ledger`) for a
+# `snapshot()` it does not define, and for keys (`nodes`, `runs`, `tokens`, `cost_usd`) it does not
+# write. Every round therefore took the exception branch and reported `0, 0, 0.0` — the exact
+# fabricated accounting figure its own docstring forbids. The cost ledger lives in the runner
+# subprocess, so these tests drive a real `Gateway` to write its own snapshot into the run's trace,
+# which is the durable record the orchestrator can actually read.
+
+
+def _gateway_into_trace(orch, ws, run, *, prompt_tokens, completion_tokens, model="gpt-4o-mini",
+                        locality="cloud"):
+    """Run one real completion whose ledger snapshot lands in the run's trace.jsonl."""
+    from engine.bus import EventBus
+    from engine.gateway import Gateway
+    from engine.providers.base import ChatRequest, Message, Role
+    from engine.providers.fake import FakeProvider, ScriptedReply
+    from engine.tokens import TokenEstimator
+
+    bus = EventBus(run_id=run.run_id, trace_path=ws.trace_path)
+    provider = FakeProvider(provider_id="fake", locality=locality,
+                            script=[ScriptedReply(text="ok", prompt_tokens=prompt_tokens,
+                                                  completion_tokens=completion_tokens, model=model)])
+    gateway = Gateway(orch.config, {"fake": provider}, estimator=TokenEstimator(),
+                      bus=bus, run_id=run.run_id)
+    gateway.complete(
+        ChatRequest(model=model, messages=[Message.text_message(Role.USER, "hi")]),
+        provider_id="fake", agent_id="ag_1", node_id="dev",
+    )
+    bus.close()
+    return gateway
+
+
+def _adopted_run(orch, ws):
+    from engine.goal import Goal
+
+    run = orch.adopt(ws.path / "gateprobe.yaml", slug="gateprobe")
+    orch._goal = Goal.new("keep going")
+    orch._goal.arm()
+    return run
+
+
+def test_round_spend_reports_the_amount_the_ledger_charged(stack):
+    """A run that spent a known amount reports that amount — not the zero the exception branch gave."""
+    orch, ws, _ = stack
+    run = _adopted_run(orch, ws)
+    gateway = _gateway_into_trace(orch, ws, run, prompt_tokens=1000, completion_tokens=500)
+
+    tokens, requests, cost, unknown = orch._round_spend(run)
+    assert (tokens, requests, unknown) == (1500, 1, 0)
+    assert cost == pytest.approx(gateway.ledger.total_usd)
+    assert cost > 0, "a run that spent money must not report zero"
+
+
+def test_round_spend_is_a_delta_against_what_the_goal_already_recorded(stack):
+    """`Goal.record_round` accumulates, so a round reports only its own share."""
+    orch, ws, _ = stack
+    run = _adopted_run(orch, ws)
+    _gateway_into_trace(orch, ws, run, prompt_tokens=1000, completion_tokens=500)
+    first = orch._round_spend(run)
+    orch._goal.record_round(tokens=first[0], requests=first[1], cost_usd=first[2])
+    assert orch._round_spend(run) == (0, 0, 0.0, 0), "already-accounted spend must not be counted twice"
+
+
+def test_round_spend_distinguishes_unreported_from_zero(stack):
+    """No readable trace is "unknown"; a readable run that made no call is a genuine zero."""
+    orch, ws, _ = stack
+    run = _adopted_run(orch, ws)
+    ws.trace_path.unlink(missing_ok=True)
+    assert orch._round_spend(run) == (0, 0, None, 0)
+
+    ws.trace_path.parent.mkdir(parents=True, exist_ok=True)
+    ws.trace_path.write_text("", encoding="utf-8")
+    assert orch._round_spend(run) == (0, 0, 0.0, 0)
+
+
+def test_an_unmeasured_call_makes_the_round_cost_a_floor_not_a_total(stack):
+    """The provider reported nothing, so the figure is unknown — and the goal must carry that."""
+    orch, ws, _ = stack
+    run = _adopted_run(orch, ws)
+    _gateway_into_trace(orch, ws, run, prompt_tokens=None, completion_tokens=None)
+
+    tokens, requests, cost, unknown = orch._round_spend(run)
+    assert (tokens, requests, cost, unknown) == (0, 1, 0.0, 1)
+    orch._goal.record_round(tokens=tokens, requests=requests, cost_usd=cost,
+                            unknown_cost_calls=unknown)
+    assert orch._goal.spend.cost_complete is False, "an unreported cost is not a complete total"
+    assert orch._goal.spend.as_dict()["cost_complete"] is False
+
+
+def test_a_genuine_no_spend_round_stays_complete(stack):
+    """The counterpart: nothing spent is a known total, not a reporting gap."""
+    orch, ws, _ = stack
+    run = _adopted_run(orch, ws)
+    ws.trace_path.unlink(missing_ok=True)
+    ws.trace_path.parent.mkdir(parents=True, exist_ok=True)
+    ws.trace_path.write_text("", encoding="utf-8")
+    tokens, requests, cost, unknown = orch._round_spend(run)
+    orch._goal.record_round(tokens=tokens, requests=requests, cost_usd=cost,
+                            unknown_cost_calls=unknown)
+    assert orch._goal.spend.cost_complete is True
+    assert orch._goal.spend.cost_usd == 0.0

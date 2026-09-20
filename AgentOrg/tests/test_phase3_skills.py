@@ -15,7 +15,12 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from engine.library import resolve
+from engine.library import (
+    PIN_ENV,
+    LibraryError,
+    _RUNNER_CAPABILITIES,  # noqa: PLC2701 - the stub must satisfy the same list the engine asserts
+    resolve,
+)
 from engine.skills import (
     FilesystemSkillSource,
     FrontmatterError,
@@ -616,3 +621,162 @@ def test_bundle_as_dict_is_compact(source):
     assert payload["checklist_ids"][0] == "CR1"
     assert "body" not in payload, "the full body must not be serialised into events"
     assert payload["content_hash"]
+
+
+# ── library pinning: the two integrity facts ─────────────────────────────────
+#
+# `resolve()` used to set a single `verified` flag on every success path, including the one where
+# no commit and no manifest were supplied — so a run that had compared nothing reported itself as
+# verified. These tests keep the capabilities fact and the content-pin fact apart, and prove the
+# pin has a path from a recorded document to a refusal.
+
+
+def _mini_library(root: pathlib.Path) -> pathlib.Path:
+    """A library that satisfies `resolve()` without the 327-skill checkout.
+
+    Hand-built so these tests stay fast and hermetic — a change to the real library's contents must
+    not be able to turn a pinning test red. The stub runner carries every capability the engine
+    asserts, imported rather than copied so adding a flag the engine calls is not silently missed.
+    """
+    runner = root / "scripts" / "workflow-runner.py"
+    runner.parent.mkdir(parents=True, exist_ok=True)
+    runner.write_text(
+        "execute_node(node_id, state, ctx)\n" + "\n".join(_RUNNER_CAPABILITIES) + "\n",
+        encoding="utf-8",
+    )
+    for rel in ("scripts/validate-workflows.py", "scripts/skill-sli-report.py",
+                "scripts/export-traces.py", "scripts/lib/safe_yaml.py",
+                "scripts/lib/lint-workflow.py"):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# stub\n", encoding="utf-8")
+    for rel in ("workflow/schema", "skills-flat", "skills"):
+        (root / rel).mkdir(parents=True, exist_ok=True)
+    skill = root / "skills-flat" / "code-reviewer"
+    skill.mkdir(parents=True, exist_ok=True)
+    (skill / "SKILL.md").write_text("---\nname: code-reviewer\n---\nbody\n", encoding="utf-8")
+    return root
+
+
+def test_resolve_without_a_pin_does_not_report_the_content_as_pinned():
+    """The one real check on this path is the runner's capability surface. Nothing was hashed, so
+    no pin fact may be true — and the summary a diagnostic prints has to say so."""
+    lib = resolve()
+    assert lib.capabilities_verified
+    assert not lib.commit_pinned
+    assert not lib.manifest_pinned
+    assert not lib.pinned
+    assert "content unpinned" in lib.verification_summary()
+    assert lib.verification_report()["pinned"] is False
+
+
+def test_a_library_without_the_directories_this_engine_never_reads_still_resolves(tmp_path):
+    """The other half of de-registering them. `workflow/templates` was *required* while nothing in
+    `engine/` opened it, so a checkout without it refused to start over a directory no line of code
+    would have touched; `_mini_library` deliberately does not create it, and neither does the real
+    library's `.skills-compiled`, `evals/golden` or `evals/tier3-behavioral`."""
+    root = _mini_library(tmp_path / "Skills")
+    for unread in ("workflow/templates", ".skills-compiled", "evals/golden",
+                   "evals/tier3-behavioral"):
+        assert not (root / unread).exists()
+    lib = resolve(root)
+    assert lib.capabilities_verified
+    assert lib.files.flat_skills.is_dir()
+
+
+def test_a_supplied_commit_mismatch_is_refused():
+    lib = resolve()
+    if lib.commit is None:
+        pytest.skip("the library is not a git checkout, so no commit can be pinned")
+    with pytest.raises(LibraryError, match="commit mismatch"):
+        resolve(expected_commit="0" * 40)
+
+
+def test_a_matching_commit_pin_is_recorded_as_a_commit_pin_not_a_content_pin():
+    lib = resolve()
+    if lib.commit is None:
+        pytest.skip("the library is not a git checkout, so no commit can be pinned")
+    pinned = resolve(expected_commit=lib.commit)
+    assert pinned.commit_pinned and pinned.pinned
+    # A commit says nothing about file hashes, and the flag must not imply it did.
+    assert not pinned.manifest_pinned
+    assert "content not hash-checked" in pinned.verification_summary()
+
+
+def test_a_manifest_mismatch_names_the_offending_path(tmp_path):
+    root = _mini_library(tmp_path / "Skills")
+    recorded = resolve(root).build_manifest()
+    assert recorded, "a manifest that hashes nothing would verify anything"
+
+    matched = resolve(root, expected_manifest=recorded)
+    assert matched.manifest_pinned and matched.pinned
+
+    key = "skills-flat/code-reviewer/SKILL.md"
+    (root / key).write_text("---\nname: code-reviewer\n---\ntampered\n", encoding="utf-8")
+    with pytest.raises(LibraryError) as excinfo:
+        resolve(root, expected_manifest=recorded)
+    assert key in str(excinfo.value), "a mismatch must name the path, or the report is not actionable"
+
+    # A file the pin records and the tree no longer has is named as missing, not ignored.
+    (root / key).unlink()
+    with pytest.raises(LibraryError, match="missing") as excinfo:
+        resolve(root, expected_manifest=recorded)
+    assert key in str(excinfo.value)
+
+
+def test_a_recorded_pin_is_discovered_from_the_environment_and_enforced(tmp_path, monkeypatch):
+    """The wiring that was missing: `write_manifest` existed with no caller, so no run could ever
+    compare content against anything. A recorded pin now reaches `resolve()` and refuses a change."""
+    root = _mini_library(tmp_path / "Skills")
+    pin = tmp_path / "recorded-pin.json"
+    resolve(root, verify=False).write_manifest(pin)
+    monkeypatch.setenv(PIN_ENV, str(pin))
+
+    pinned = resolve(root)
+    assert pinned.manifest_pinned and pinned.pinned
+    assert pinned.pin_source == str(pin)
+    assert pinned.verification_summary().startswith("content pin matched")
+
+    (root / "skills-flat" / "code-reviewer" / "SKILL.md").write_text("changed\n", encoding="utf-8")
+    with pytest.raises(LibraryError, match="manifest mismatch"):
+        resolve(root)
+
+
+def test_a_pin_recorded_for_another_checkout_is_reported_but_not_enforced(tmp_path):
+    """A pin names the root it was recorded from. Enforcing it against a second machine's checkout
+    would refuse every run over content the pin never described — but a silent skip would quietly
+    turn the pin off, so the reason travels on the handle."""
+    first = _mini_library(tmp_path / "first" / "Skills")
+    second = _mini_library(tmp_path / "second" / "Skills")
+    pin = tmp_path / "pin.json"
+    resolve(first, verify=False).write_manifest(pin)
+    (second / "skills-flat" / "code-reviewer" / "SKILL.md").write_text("other\n", encoding="utf-8")
+
+    lib = resolve(second, pin_path=pin)
+    assert not lib.pinned
+    assert lib.pin_source == str(pin)
+    assert "not applied" in lib.verification_summary()
+    assert str(first) in (lib.pin_note or "")
+
+
+def test_the_path_that_builds_a_manifest_is_not_refused_by_the_pin_it_is_about_to_write(tmp_path):
+    """`verify=False` is how a fresh checkout records its first pin. If that path loaded and enforced
+    a pin, the very command that creates one could never run on a tree that had drifted."""
+    root = _mini_library(tmp_path / "Skills")
+    pin = tmp_path / "pin.json"
+    resolve(root, verify=False).write_manifest(pin)
+    (root / "workflow" / "schema" / "changed.yaml").write_text("x\n", encoding="utf-8")
+
+    fresh = resolve(root, verify=False, pin_path=pin)
+    assert fresh.capabilities_verified
+    assert not fresh.pinned, "building a manifest must not check against one"
+
+
+def test_a_pin_that_records_no_hashes_is_refused_rather_than_accepted(tmp_path):
+    """An empty manifest compares nothing and would then report a match — the same overstatement a
+    boolean `verified` made."""
+    root = _mini_library(tmp_path / "Skills")
+    pin = tmp_path / "empty-pin.json"
+    pin.write_text('{"commit": null, "files": {}}', encoding="utf-8")
+    with pytest.raises(LibraryError, match="no file hashes"):
+        resolve(root, pin_path=pin)

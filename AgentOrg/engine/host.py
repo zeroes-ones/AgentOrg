@@ -17,9 +17,17 @@ DESIGN
 - **A heartbeat proves liveness, not activity.** A runner that is thinking and a runner that is wedged
   look identical from outside, so the host watches the *state file's* mtime and the process's own
   liveness rather than guessing from silence.
-- **Preemption is cooperative, then forceful.** SIGTERM lets the runner reach a checkpoint; SIGKILL
-  after a grace period is the fallback. A mid-node kill loses at most the current node, because the
-  runner checkpoints per node.
+- **Preemption is forceful, in two steps.** SIGTERM, then SIGKILL after the grace period. The runner
+  is deliberately *not* modified, and it installs no SIGTERM handler of its own, so SIGTERM ends it —
+  it does not checkpoint. What makes that safe is the runner's per-node checkpoint file, so a
+  continuation resumes at the node boundary; what a mid-node kill loses is the current node.
+- **A runner never outlives the engine.** Two halves, because neither covers the other. The engine
+  reaps what it started on its own way out (:func:`shutdown_runners`, installed as an `atexit`
+  handler), which covers a clean stop and anything that runs interpreter shutdown — but not
+  `os._exit`, which skips `atexit` by definition, and not a SIGKILL. So the executor plugin the host
+  generates also watches the parent from *inside* the child and takes the child's whole process group
+  down if the engine disappears. A runner left behind keeps executing and keeps spending against the
+  same checkpoint while the app believes it stopped, which is the failure both halves exist to stop.
 - **A crash is resumed, not restarted.** The runner's `--state` file is a checkpoint, so a restart
   continues rather than redoing work — and the effect journal means the resumed node does not
   re-apply a side effect.
@@ -34,6 +42,7 @@ Usage:
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import platform
@@ -47,11 +56,24 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-__all__ = ["HostError", "RunHandle", "RunOutcome", "RunnerHost", "RunnerState"]
+__all__ = ["HostError", "RunHandle", "RunOutcome", "RunnerHost", "RunnerState",
+           "shutdown_runners"]
 
 
 class HostError(RuntimeError):
     """Raised when the runner cannot be started or supervised."""
+
+
+# ── the live-runner registry ─────────────────────────────────────────────────
+#
+# Every runner this process has started and not yet reaped, keyed by the *process group* the host
+# signals. Module-level rather than per-`RunnerHost`, because the thing that leaks is the process and
+# the thing that has to find it at shutdown is whatever is running when the interpreter exits — which
+# is not necessarily the object that spawned it.
+
+_live_runners: dict[int, subprocess.Popen] = {}
+_live_lock = threading.Lock()
+_reaper_installed = False
 
 
 class RunnerState(str, Enum):
@@ -135,6 +157,11 @@ class RunHandle:
     killed: bool = False
     stderr_lines: list[str] = field(default_factory=list)
     stdout_lines: list[str] = field(default_factory=list)
+    #: The two pipe readers. Held here so the supervisor can wait for them *before* it reads the
+    #: stderr tail it reports: the thread that explains a crash is the *last* line the runner printed,
+    #: and it is written to this list by another thread, so reading the tail without joining is a race
+    #: that reports "the runner exited 1" instead of the reason.
+    drains: list[threading.Thread] = field(default_factory=list)
 
     @property
     def pid(self) -> int:
@@ -192,6 +219,108 @@ class RunHandle:
             pass
 
 
+def _last_stderr_cause(tail: str) -> str:
+    """The runner's own last diagnostic line, when a non-zero exit left no reason in the state file.
+
+    A runner that refuses its own manifest — an invalid node, a skill its validator cannot resolve —
+    prints why to stderr and exits 1 *before* writing a checkpoint, so the summary has nothing to
+    report and the outcome says only "the runner exited 1". That hides the one line that says what to
+    fix, in a run whose whole failure was that line.
+    """
+    for line in reversed((tail or "").splitlines()):
+        text = line.strip().lstrip("- ").strip()
+        if text:
+            return text[:300]
+    return ""
+
+
+def _register_runner(process: subprocess.Popen) -> None:
+    """Record a live runner so the engine's own exit can reap it. Idempotent per pid."""
+    global _reaper_installed
+    with _live_lock:
+        _live_runners[process.pid] = process
+        if _reaper_installed:
+            return
+        atexit.register(_reap_at_exit)
+        _reaper_installed = True
+
+
+def _unregister_runner(process: subprocess.Popen) -> None:
+    """Forget a runner that has been reaped by the thread that was supervising it."""
+    with _live_lock:
+        _live_runners.pop(process.pid, None)
+
+
+def _kill_group(process: subprocess.Popen, sig: int) -> None:
+    """Signal the runner's whole process group, falling back to the process alone.
+
+    The group, not the process: the child led its own session (`start_new_session`), so the group
+    holds whatever it spawned — a provider subprocess, a tool — and signalling only the leader would
+    leave those running with no parent to report to.
+    """
+    if platform.system() == "Windows":  # pragma: no cover - not a target platform
+        try:
+            process.send_signal(sig)
+        except (OSError, ProcessLookupError):
+            pass
+        return
+    try:
+        os.killpg(os.getpgid(process.pid), sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.send_signal(sig)
+        except (OSError, ProcessLookupError):
+            pass
+
+
+def shutdown_runners(*, grace_s: float = 2.0) -> list[int]:
+    """Abort every runner this process started, and reap it. Returns the pids it acted on.
+
+    Called by the engine's shutdown paths, and registered as an `atexit` handler so that the ordinary
+    way out is covered without anyone having to remember. Both matter, because the failure is silent:
+    a runner that outlives the engine keeps executing and keeps spending against the same checkpoint
+    while the app shows the run as stopped.
+
+    `atexit` is not sufficient on its own and this is worth being exact about — a path that calls
+    `os._exit` skips it entirely, and so does SIGKILL. `engine/serve.py` ends its force-stop path at
+    `os._exit(0)` (`_stop_now`, which the parent-watch and every signal handler it installs call), so
+    the orderly half here cannot be the only half; that is why the child-side guard lives inside the
+    generated executor plugin. This function is the fast half: SIGTERM, a short grace period, then
+    SIGKILL, then `wait` so the dead child is not left as a zombie of a dying process.
+    """
+    with _live_lock:
+        live = list(_live_runners.values())
+    pids: list[int] = []
+    for process in live:
+        if process.poll() is not None:
+            _unregister_runner(process)
+            continue
+        pids.append(process.pid)
+        _kill_group(process, signal.SIGTERM)
+    deadline = time.time() + grace_s
+    for process in live:
+        if process.pid not in pids:
+            continue
+        while process.poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+        if process.poll() is None:
+            _kill_group(process, signal.SIGKILL)
+        try:
+            process.wait(timeout=1.0)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        _unregister_runner(process)
+    return pids
+
+
+def _reap_at_exit() -> None:
+    """The `atexit` handler. Never raises: an error here would mask the process's real exit status."""
+    try:
+        shutdown_runners()
+    except Exception:  # noqa: BLE001 - a failed reap must not become the reason the engine died
+        pass
+
+
 class RunnerHost:
     """Supervises one runner subprocess per run.
 
@@ -229,6 +358,9 @@ class RunnerHost:
         self.heartbeat_s = heartbeat_s
         self.grace_s = grace_s
         self.stall_timeout_s = stall_timeout_s
+        #: The explicit rework width, when the caller set one. `None` means "ask the config", which
+        #: `contract_rework()` resolves — so an unconfigured host gets the conservative default.
+        self._contract_rework: int | None = None
         self._handle: RunHandle | None = None
         self._lock = threading.RLock()
         self._pause_flag = threading.Event()
@@ -241,21 +373,82 @@ class RunnerHost:
 
         Written per run rather than shared, because each run has its own workspace, roster pins and run
         id — and a plugin that read a global would make two concurrent runs interfere.
+
+        Each file is written to a temporary name and `os.replace`d into position. The runner *imports*
+        these, so a half-written one is not a stale plugin but a syntax error that kills the run before
+        its first node — and the two calls that write the same path (a run and a `resume_run` of the
+        same run id) come from different threads.
         """
         directory = Path(self.workspace)
         directory.mkdir(parents=True, exist_ok=True)
         engine_root = Path(__file__).resolve().parent.parent
 
         executor = directory / f"executor_{run_id}.py"
-        executor.write_text(f'''#!/usr/bin/env python3
+        self._write_plugin(executor, f'''#!/usr/bin/env python3
 """Generated per run. The runner loads this as its executor plugin."""
 import json
+import os
 import pathlib
+import signal
 import sys
+import threading
+import time
 
 sys.path.insert(0, {str(engine_root)!r})
 
+# ── do not outlive the engine ────────────────────────────────────────────────
+# The runner is a child of the engine, in a session of its own, so nothing reaps it if the engine
+# dies: it keeps executing and keeps spending against the same checkpoint while the app believes the
+# run stopped. The engine aborts what it started on its own way out (see `shutdown_runners`), but that
+# cannot cover the paths that skip interpreter shutdown entirely — `os._exit` in the engine's own
+# `_stop_now`, and SIGKILL — so the guard is here, inside the child, where it survives those.
+#
+# `getppid()` changing is the signal. The engine is the parent; when it goes away this process is
+# reparented to launchd or init and the number changes. It is polled rather than waited on because
+# there is no portable way to be told, and a second of latency is nothing against a run that would
+# otherwise keep spending for hours. Measured: 0.56-0.59s from the engine's death to this process's.
+#
+# The whole process *group* is signalled rather than just this process, because the group holds
+# whatever the run spawned — a provider subprocess, a tool — and those are the other things that keep
+# spending. Only when this process *is* the group leader, which it is because the host spawns the
+# runner with `start_new_session=True`; without that check a child sharing the engine's own group
+# would signal the engine and everything beside it, which is the opposite of the intent.
+_PARENT_PID = os.getppid()
+
+
+def _take_down(process_group):
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+        time.sleep(1.0)
+        os.killpg(process_group, signal.SIGKILL)
+    except Exception:
+        pass
+
+
+def _watch_parent():
+    while True:
+        time.sleep(1.0)
+        if os.getppid() == _PARENT_PID:
+            continue
+        group = os.getpgrp()
+        try:
+            if group == os.getpid():
+                _take_down(group)
+            else:
+                os.kill(os.getpid(), signal.SIGKILL)
+        except Exception:
+            pass
+        # `_exit`, not `sys.exit`: this thread is a daemon and the engine is already gone, so there is
+        # nothing here worth unwinding and no one left to unwind for.
+        os._exit(1)
+
+
+if _PARENT_PID > 1:
+    threading.Thread(target=_watch_parent, name="agentorg-runner-parent-death",
+                     daemon=True).start()
+
 from engine.artifacts import ArtifactStore
+from engine.cachestore import CacheStore
 from engine.config import load
 from engine.diagnostics import Diagnostics
 from engine.executor import ExecutorContext, NodeExecutor
@@ -302,12 +495,19 @@ else:
     )
 
 # The Owner's own skill roots, layered over the pinned library, so an authored skill executes.
-# `skill_roots` is highest-priority-first; the first entry's parent is the project root the overlay
-# should resolve against, which is what makes a project skill beat a global one.
+# They are taken verbatim from the run context — the *same* roots the planner planned against and
+# the hire was validated against — rather than re-derived here. Re-deriving them was a silent
+# defect: the overlay was rebuilt from the project root alone, so a global skill (or a global
+# override) planned and hired successfully and then did not exist in the process that ran the node.
+# Parent and child disagreeing about which skills exist is the worst version of this, because the
+# node runs with a prompt that quietly lost the skill.
 _skill_roots = list(_context_doc.skill_roots) if _context_doc is not None else []
-_skill_project = pathlib.Path(_skill_roots[0]).parent if _skill_roots else None
-_skills = OverlaySkillSource(FilesystemSkillSource(resolve()), project=_skill_project,
-                             include_global=not _skill_project)
+if _skill_roots:
+    _skills = OverlaySkillSource(FilesystemSkillSource(resolve()), skill_roots=_skill_roots)
+else:
+    # No recorded roots — a workspace written before this handoff existed. Fall back to the roots
+    # this process can find for itself, which is the old behaviour and still runs.
+    _skills = OverlaySkillSource(FilesystemSkillSource(resolve()))
 
 # The binding the orchestrator decided, so a node runs as the agent it was bound to rather than being
 # re-bound here from the built-in company.
@@ -335,9 +535,19 @@ try:
 except Exception:
     _bus = None
 
+# The durable cache record for this workspace, shared by the gateway (which sees the provider's own
+# counters) and the pin store (which knows which prefixes this run actually sends). It is opened
+# best-effort: a workspace with an unwritable state directory must still run, with its cache
+# unrecorded, rather than refuse to start over bookkeeping.
+try:
+    _cache_store = CacheStore(state_dir / "cache")
+except Exception:
+    _cache_store = None
+
 _context = ExecutorContext(
     org=org,
-    gateway=Gateway(cfg, providers, estimator=TokenEstimator(), bus=_bus, run_id=RUN_ID),
+    gateway=Gateway(cfg, providers, estimator=TokenEstimator(), bus=_bus, run_id=RUN_ID,
+                    cache_store=_cache_store),
     skills=_skills,
     workspace=WORKSPACE,
     store=ArtifactStore(workspace_root=WORKSPACE),
@@ -353,8 +563,9 @@ _context = ExecutorContext(
     pins=_pins,
     # One pin store per run: a skill edited mid-run must not silently change the bytes a running
     # session sends, and this is where that is held. A *new* run gets a new store, so an edited skill
-    # is picked up next time rather than fossilised.
-    pins_for_prefix=PrefixPins(run_id=RUN_ID),
+    # is picked up next time rather than fossilised. The durable store records the pins across runs,
+    # so a resumed run can still prove the prefix it sends is the one its predecessor pinned.
+    pins_for_prefix=PrefixPins(run_id=RUN_ID, store=_cache_store),
     policies=_policies,
     pool=TaskPool(state_dir / "pool.json"),
     # A goal armed by the orchestrator: the executing process advertises `update_goal` and writes its
@@ -368,10 +579,10 @@ def execute_node(node_id, state, ctx):
 
 def summary():
     return _EXECUTOR.summary()
-''', encoding="utf-8")
+''')
 
         guardrail = directory / f"guardrail_{run_id}.py"
-        guardrail.write_text(f'''#!/usr/bin/env python3
+        self._write_plugin(guardrail, f'''#!/usr/bin/env python3
 """Generated per run. The runner loads this as its guardrail plugin."""
 import sys
 
@@ -383,8 +594,45 @@ _GUARD = EdgeGuardrail()
 
 def classify(node_id, result, state):
     return _GUARD.classify(node_id, result, state)
-''', encoding="utf-8")
+''')
         return {"executor": executor, "guardrail": guardrail}
+
+    @staticmethod
+    def _write_plugin(path: Path, text: str) -> None:
+        """Write a plugin file atomically: temp in the same directory, then `os.replace`.
+
+        Same directory because a rename across filesystems is a copy, and a copy is not atomic. The
+        temp name carries the pid and the thread so two threads writing the same plugin — a run and a
+        resume of the same run id — cannot collide on the temporary either.
+        """
+        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except OSError as exc:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise HostError(f"cannot write the runner plugin {path}: {exc}") from exc
+
+    @staticmethod
+    def _remove_plugins(plugins: dict[str, Path]) -> None:
+        """Delete the per-run plugin files once the run that used them has ended.
+
+        They are written into the *project* directory, not a temp directory, so leaving them behind
+        leaks one pair per run for the life of the workspace — the projects in this repo carry a dozen
+        `executor_run_*.py` files that no code will ever read again. The runner imports them at
+        startup, so by the time a run has returned nothing holds them open.
+        """
+        for path in plugins.values():
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # ── running ─────────────────────────────────────────────────────────────
 
@@ -433,6 +681,8 @@ def classify(node_id, result, state):
             args += ["--memory", str(self.workspace_memory_dir())]
         if self.enforce_contracts():
             args += ["--enforce-contracts"]
+        if self.contract_rework():
+            args += ["--contract-rework", str(self.contract_rework())]
         args += list(extra_args)
 
         started = time.time()
@@ -449,6 +699,9 @@ def classify(node_id, result, state):
                 start_new_session=True,
             )
         except OSError as exc:
+            # The plugins are already on disk at this point, and a spawn that failed is never going to
+            # import them, so they are removed rather than left as litter in the project directory.
+            self._remove_plugins(plugins)
             raise HostError(f"cannot start the runner: {exc}") from exc
 
         handle = RunHandle(run_id=run_id, process=process, manifest_path=manifest_path,
@@ -456,6 +709,10 @@ def classify(node_id, result, state):
         handle.refresh()
         with self._lock:
             self._handle = handle
+        # From here on the runner is this process's responsibility, including on the way out. Registered
+        # before the first drain thread so there is no window in which the process exists and the
+        # shutdown path cannot see it.
+        _register_runner(process)
 
         self._emit("run.start", {"run_id": run_id, "workflow": workflow,
                                  "pid": process.pid, "args": args[1:6]})
@@ -468,12 +725,55 @@ def classify(node_id, result, state):
         # stdout tail rather than parsed, because the state file is the authoritative record.
         stdout_thread = threading.Thread(target=self._drain_stdout, args=(handle,), daemon=True)
         stdout_thread.start()
+        handle.drains = [stderr_thread, stdout_thread]
 
-        outcome = self._supervise(handle, started=started)
-        stderr_thread.join(timeout=2.0)
-        stdout_thread.join(timeout=2.0)
+        try:
+            outcome = self._supervise(handle, started=started)
+        finally:
+            # The supervisor joins these before it reports (see `_join_drains`); this is the guarantee
+            # for the paths where it did not get that far — a raise out of the loop. A runner still
+            # alive here is one nothing is supervising any more, so it is terminated rather than left.
+            self._join_drains(handle)
+            if handle.alive:
+                self._terminate(handle, force=True)
+                try:
+                    handle.process.wait(timeout=1.0)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+            _unregister_runner(process)
+            RunnerHost._remove_plugins(plugins)
+            with self._lock:
+                if self._handle is handle:
+                    self._handle = None
         self._emit("run.end", outcome.as_dict())
         return outcome
+
+    def _join_drains(self, handle: RunHandle, timeout_s: float = 2.0) -> bool:
+        """Wait for the two pipe readers to finish. Returns whether they all did.
+
+        Load-bearing, not tidiness. The stderr tail is the *last* thing the runner printed — for a
+        runner that dies on startup it is the only explanation of why, and `_last_stderr_cause` reads
+        exactly that from it — but it is put there by another thread. Reporting the tail without
+        joining is a race the reader usually loses: the outcome says "the runner exited 1" while the
+        line naming the cause is still in the pipe. The old code joined *after* `_supervise` had
+        already sliced the list, which is why the join looked present and did nothing.
+
+        Bounded, because the write end of a pipe is inherited by anything the run spawned: a grandchild
+        that outlives the runner keeps the pipe open, so an unbounded join would hang the supervisor on
+        a process that is already dead. When the bound is hit the caller is told, rather than left to
+        wonder why the tail looks short.
+        """
+        for thread in handle.drains:
+            thread.join(timeout=timeout_s)
+        still_running = [t.name for t in handle.drains if t.is_alive()]
+        if still_running:
+            self._emit("run.drain_incomplete", {"run_id": handle.run_id,
+                                                "threads": still_running,
+                                                "detail": ("the runner's pipes were still held open "
+                                                           "after it exited; the reported tail may "
+                                                           "be short")})
+            return False
+        return True
 
     def _supervise(self, handle: RunHandle, *, started: float) -> RunOutcome:
         """Watch a running process, enforcing the stall and pause policies.
@@ -505,6 +805,10 @@ def classify(node_id, result, state):
                 break
 
         exit_code = handle.process.wait()
+        # Join the pipe readers *before* reading what they collected. The exit code arrives when the
+        # process dies; the last lines of its stderr are in a pipe that may not have been read yet, and
+        # those lines are the whole explanation for a startup failure.
+        self._join_drains(handle)
         outcome.exit_code = exit_code
         outcome.restarts = handle.restarts
         outcome.killed = handle.killed
@@ -526,6 +830,7 @@ def classify(node_id, result, state):
             gated = phase in ("escalated", "awaiting_human", "awaiting_gate")
             outcome.state = RunnerState.GATED if gated else RunnerState.FAILED
             outcome.error = "" if gated else (outcome.summary.get("outcome")
+                                              or _last_stderr_cause(outcome.stderr_tail)
                                               or f"the runner exited {exit_code}")
         with self._lock:
             self._handle = None
@@ -611,10 +916,13 @@ def classify(node_id, result, state):
             return True
 
     def abort(self) -> bool:
-        """Terminate the run, checkpoint-first.
+        """Terminate the run.
 
-        SIGTERM lets the runner reach its per-node checkpoint; SIGKILL follows after the grace period.
-        Returns whether there was a run to abort.
+        SIGTERM, then SIGKILL after the grace period. The runner installs no SIGTERM handler of its
+        own — it is a pinned program this engine does not modify — so the grace period buys the
+        *process group* a chance to shut down in its own order (a provider call, a temp file), not a
+        cooperative checkpoint. What survives an abort is the per-node checkpoint the runner already
+        wrote, so a continuation resumes at the node boundary. Returns whether there was a run to abort.
         """
         with self._lock:
             handle = self._handle
@@ -718,16 +1026,48 @@ def classify(node_id, result, state):
         """
         return True
 
+    def contract_rework(self) -> int:
+        """Whether to pass `--contract-rework`, and how wide the window is.
+
+        A property of the *host* like `enforce_contracts`, so the flag is supplied in exactly one
+        place rather than at each spawn. Off by default: the window changes who recovers from a
+        refusal, which is an autonomy decision, and a caller that has not made that decision should
+        get the conservative answer. `Orchestrator._host` sets it from the goal's posture.
+
+        The width comes from the config (`executor.contract_rework`), matching every other
+        node-execution knob, so the number a person tunes is one they can find.
+        """
+        if self._contract_rework is None:
+            section = getattr(self.config, "executor", None) if self.config is not None else None
+            return max(0, int(getattr(section, "contract_rework", 0) or 0))
+        return max(0, int(self._contract_rework))
+
+    def with_contract_rework(self, attempts: int | None) -> "RunnerHost":
+        """Return this host with the rework window set explicitly.
+
+        A setter that returns the host rather than mutating in place, because the decision belongs to
+        the caller that knows the posture — mutating a shared host would let one run's posture change
+        the next round's behaviour.
+        """
+        self._contract_rework = attempts
+        return self
+
     def resume_run(self, *, manifest_path: Path, run_id: str, workflow: str = "",
-                   project: str = "", goal_active: bool = False) -> RunOutcome:
+                   project: str = "", goal_active: bool = False,
+                   extra_args: Iterable[str] = ()) -> RunOutcome:
         """Relaunch a run from its checkpoint.
 
         The runner reads `--state`, so this continues rather than restarting — and the effect journal
         means the node it resumes into does not re-apply a side effect it already applied.
+
+        `extra_args` must be threaded through exactly as the first spawn received them. Without it a
+        continuation lost its executor override and spawned the *generated* plugin instead of the one
+        the caller named, so a run under test (or under a stub executor) silently switched executor
+        mid-flight — the first round proving one thing and every later round another.
         """
         self._emit("run.resume", {"run_id": run_id, "from_checkpoint": True})
         return self.run(manifest_path=manifest_path, run_id=run_id, workflow=workflow,
-                        project=project, goal_active=goal_active)
+                        project=project, goal_active=goal_active, extra_args=extra_args)
 
     # ── reporting ───────────────────────────────────────────────────────────
 

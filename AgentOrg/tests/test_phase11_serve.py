@@ -8,6 +8,8 @@ which is narrow and worth stating exactly:
 - one JSON command per line on stdin, one JSON event per line on stdout;
 - **stdout carries the protocol and nothing else** — a stray print corrupts the stream the app parses;
 - every command is acknowledged, correlated by `cmd_id`, *including* commands that fail;
+- **a run belongs to its own thread** — the command worker stays free, so `status` and `pause`/`abort`
+  are answered while a graph is in flight rather than queued behind the run they act on;
 - a malformed line is survived rather than fatal;
 - closing stdin ends the server cleanly, after its queued commands have been answered.
 
@@ -21,9 +23,13 @@ import io
 import json
 import os
 import pathlib
+import queue
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 import pytest
 
@@ -37,13 +43,32 @@ from engine.state import Workspace
 
 
 class CapturedOut:
-    """A stdout stand-in that records whole lines."""
+    """A stdout stand-in that records whole lines.
 
-    def __init__(self) -> None:
+    Optionally records an interleaved *timeline* of acks and events, and calls back on every ack: the
+    order of arrival is what distinguishes "answered while the graph was in flight" from "answered once
+    it had ended", and a list of lines alone cannot say that.
+    """
+
+    def __init__(self, timeline: list[str] | None = None, on_ack=None) -> None:
         self.lines: list[str] = []
+        self.timeline = timeline
+        self.on_ack = on_ack
 
     def write(self, text: str) -> None:
         self.lines.append(text)
+        if self.timeline is None and self.on_ack is None:
+            return
+        try:
+            event = json.loads(text.strip() or "{}")
+        except json.JSONDecodeError:
+            return
+        payload = event.get("payload") or {}
+        if self.timeline is not None:
+            self.timeline.append(f"ack:{payload.get('cmd_id')}" if event.get("type") == "command.ack"
+                                 else f"event:{event.get('type')}")
+        if self.on_ack is not None and event.get("type") == "command.ack":
+            self.on_ack(payload)
 
     def flush(self) -> None:  # noqa: D401 - the protocol requires a flush
         return None
@@ -58,6 +83,31 @@ class CapturedOut:
         return out
 
 
+class QueuedStdin:
+    """A stdin the test feeds one line at a time.
+
+    `drive` below hands the loop every command at once, which cannot express "a command sent *while* a
+    run is in flight" — the whole point of these tests. Iteration blocks on the queue, so a command's
+    place in time is the test's decision, and the loop is still the real one.
+    """
+
+    def __init__(self) -> None:
+        self._queue: "queue.Queue[str | None]" = queue.Queue()
+
+    def send(self, command: dict) -> None:
+        self._queue.put(json.dumps(command) + "\n")
+
+    def close(self) -> None:
+        self._queue.put(None)
+
+    def __iter__(self):
+        while True:
+            line = self._queue.get()
+            if line is None:
+                return
+            yield line
+
+
 @pytest.fixture(scope="module")
 def config():
     return load()
@@ -68,11 +118,11 @@ def library():
     return resolve()
 
 
-def drive(config, library, commands: list[dict | str], *, slug: str = "servetest"):
+def drive(config, library, commands: list[dict | str], *, slug: str = "servetest", out=None):
     """Run the loop over in-memory streams and return the events it emitted."""
     stdin = io.StringIO("\n".join(
         c if isinstance(c, str) else json.dumps(c) for c in commands) + "\n")
-    out = CapturedOut()
+    out = out if out is not None else CapturedOut()
     workspace = Workspace.for_project(slug, root=pathlib.Path(tempfile.mkdtemp()))
     workspace.ensure()
     server = Server(config=config, library=library, workspace=workspace, slug=slug,
@@ -222,6 +272,185 @@ def test_pause_and_abort_are_harmless_with_nothing_running(config, library):
     for cmd_id in ("c1", "c2"):
         payload = ack_for(events, cmd_id)
         assert payload is not None and payload["ok"] is True
+
+
+# ── a run belongs to its own thread, not to the command worker ────────────────
+#
+# The defect these protect, in one line: a run executing on the command worker queued the app's
+# `status` poll and its `pause`/`abort` behind the very run they describe, so the panels froze and Pause
+# did nothing until the graph had already ended. The graph here is stubbed to stay in flight until the
+# pause *acknowledgement* is on the wire, which makes the ordering a property of the code rather than of
+# the machine's timing — and means the old topology fails this deterministically in ~5s, not flakily.
+
+
+class _RecordingHost:
+    """The slice of `RunnerHost` a stubbed run needs, with pause and abort observable."""
+
+    def __init__(self) -> None:
+        self.running = True
+        self.aborted = False
+        self.paused = False
+
+    def pause(self) -> bool:
+        self.paused = True
+        return True
+
+    def resume(self) -> bool:
+        self.paused = False
+        return True
+
+    def abort(self) -> bool:
+        self.aborted = True
+        return True
+
+    def wedged(self):
+        return None
+
+    def with_contract_rework(self, attempts):
+        return None
+
+
+class _Outcome:
+    """Stands in for `RunOutcome`: the three attributes `_run_graph` reads off it."""
+
+    def __init__(self, aborted: bool) -> None:
+        self.summary = {"outcome": "aborted by the Owner" if aborted else "done"}
+        self.state = type("_State", (), {"value": "aborted" if aborted else "done"})()
+        self.gated = False
+
+
+def _in_flight_execute(*, release: threading.Event, timeline: list[str],
+                       seconds: float = 5.0, fail: Exception | None = None):
+    """An `Orchestrator.execute` that stays in flight until `release` is set.
+
+    Only the model calls are replaced — the run thread, the ack and the event stream are the real ones.
+    `release` is set by the test when the pause ack is on the wire, so a graph can never settle before
+    the ack it is compared against. The bounded wait means a broken implementation fails the assertion
+    instead of hanging the suite.
+    """
+
+    def execute(self, run=None, **_kwargs):
+        from engine.orchestrator import RunPhase
+
+        run = self._resolve(run)
+        if fail is not None:
+            raise fail
+        host = _RecordingHost()
+        with self._lock:
+            self._host = host
+        run.phase = RunPhase.RUNNING
+        self._persist(run)
+        timeline.append("run-live")
+        try:
+            release.wait(seconds)
+        finally:
+            with self._lock:
+                self._host = None
+        run.phase = RunPhase.ABORTED if host.aborted else RunPhase.DONE
+        run.touch()
+        self._persist(run)
+        timeline.append("run-finished")
+        return _Outcome(host.aborted)
+
+    return execute
+
+
+def _live_server(config, library, *, slug: str, out):
+    """A server whose read loop runs in a thread, so a test can send commands as time passes."""
+    stdin = QueuedStdin()
+    workspace = Workspace.for_project(slug, root=pathlib.Path(tempfile.mkdtemp()))
+    workspace.ensure()
+    server = Server(config=config, library=library, workspace=workspace, slug=slug,
+                    stdin=stdin, stdout=out)
+    thread = threading.Thread(target=server.serve_forever, name="test-serve", daemon=True)
+    thread.start()
+    return server, stdin, thread
+
+
+def _wait_for(predicate, seconds: float, what: str) -> None:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+def test_a_command_is_answered_while_a_graph_is_in_flight(config, library, monkeypatch):
+    """`status` and `pause` must be answered *during* the run, not after it has ended."""
+    from engine.orchestrator import Orchestrator
+
+    timeline: list[str] = []
+    pause_on_the_wire = threading.Event()
+    out = CapturedOut(timeline=timeline,
+                      on_ack=lambda payload: pause_on_the_wire.set()
+                      if payload.get("cmd_id") == "p2" else None)
+    monkeypatch.setattr(Orchestrator, "execute",
+                        _in_flight_execute(release=pause_on_the_wire, timeline=timeline))
+
+    server, stdin, thread = _live_server(config, library, slug="threadtest", out=out)
+    try:
+        _wait_for(lambda: "event:engine.ready" in timeline, 20, "the engine to be ready")
+        stdin.send({"cmd_id": "s1", "type": "start", "payload": {"goal": "ship a landing page"}})
+        _wait_for(lambda: "run-live" in timeline, 60, "the graph to be in flight")
+
+        stdin.send({"cmd_id": "p1", "type": "status"})
+        stdin.send({"cmd_id": "p2", "type": "pause"})
+        stdin.send({"cmd_id": "p4", "type": "start",
+                    "payload": {"goal": "a second goal while the first is running"}})
+        _wait_for(pause_on_the_wire.is_set, 10, "the pause to be acknowledged")
+        _wait_for(lambda: "run-finished" in timeline, 10, "the graph to settle")
+    finally:
+        stdin.close()
+        thread.join(timeout=15)
+
+    events = out.events()
+    assert timeline.index("ack:p2") < timeline.index("run-finished"), (
+        "the pause was answered after the graph had ended — it was queued behind the run it pauses")
+    assert ack_for(events, "p2")["detail"]["paused"] is True
+
+    assert timeline.index("ack:p1") < timeline.index("run-finished"), (
+        "the status poll was answered after the graph had ended — no panel could have updated")
+    status = ack_for(events, "p1")["detail"]
+    assert status["running"] is True, "status must describe the run that is in flight, not a stale one"
+    assert status["phase"] == "running"
+
+    # One run at a time: the second `start` is refused, because the worker no longer serialises it by
+    # accident now that the graph is off the worker.
+    second = ack_for(events, "p4")
+    assert second["ok"] is False and "already in flight" in second["error"]
+
+    # The ack contract is unchanged: `start` is still answered, by the run thread, when it settles.
+    started = ack_for(events, "s1")
+    assert started is not None, "an unacknowledged start is indistinguishable from a lost one"
+    assert started["ok"] is True and started["detail"]["phase"] == "done"
+    assert started["detail"]["outcome"] == "done"
+    assert server._in_flight == 0, "the run's in-flight token must be released when it settles"
+
+
+def test_a_run_that_cannot_execute_acks_start_with_the_reason(config, library, monkeypatch):
+    """A graph that fails is a failed `start`: `ok=false` **with the reason**, never silence."""
+    from engine.orchestrator import Orchestrator
+
+    timeline: list[str] = []
+    refused = threading.Event()
+    monkeypatch.setattr(Orchestrator, "execute", _in_flight_execute(
+        release=refused, timeline=timeline, fail=RuntimeError("no executor available")))
+    out = CapturedOut(timeline=timeline)
+
+    server, stdin, thread = _live_server(config, library, slug="failrun", out=out)
+    try:
+        _wait_for(lambda: "event:engine.ready" in timeline, 20, "the engine to be ready")
+        stdin.send({"cmd_id": "s1", "type": "start", "payload": {"goal": "ship a landing page"}})
+        _wait_for(lambda: ack_for(out.events(), "s1") is not None, 60, "the start to be answered")
+    finally:
+        stdin.close()
+        thread.join(timeout=15)
+
+    payload = ack_for(out.events(), "s1")
+    assert payload["ok"] is False
+    assert "no executor available" in payload["error"]
+    assert server._in_flight == 0, "a failed run must not leave the in-flight counter stuck"
 
 
 # ── the app's real path: a subprocess ────────────────────────────────────────
@@ -491,10 +720,73 @@ def test_provider_add_rejects_an_unknown_kind(tmp_path):
         server._cmd_provider_add({"provider_id": "x", "kind": "banana", "base_url": "https://x/v1"})
 
 
+def test_the_local_ollama_kind_refuses_ollamas_cloud_endpoint(tmp_path):
+    """The two are different protocols, and picking the wrong one looked like a bad key.
+
+    `ollama` targets a *local server's* `/api/chat`; Ollama's cloud speaks the OpenAI dialect at
+    `/v1`. Choosing the "Ollama" kind for `ollama.com` produced `…/chat/completions/api/chat`, whose
+    404 is indistinguishable from an authentication failure — so the natural response was to re-paste
+    a key and edit the URL, neither of which was wrong.
+
+    Refused with the correction rather than silently rewritten: quietly swapping one protocol for the
+    other would store a config describing something the person did not choose.
+    """
+    server, creds = _server_with_creds(tmp_path)
+    with pytest.raises(Exception, match="OpenAI-compatible"):
+        server._cmd_provider_add({"provider_id": "cloud", "kind": "ollama",
+                                  "base_url": "https://ollama.com/v1/chat/completions",
+                                  "api_key": "k" * 12})
+    # The right pair is accepted, and the pasted endpoint is reduced to the base.
+    server._cmd_provider_add({"provider_id": "cloud", "kind": "openai",
+                              "base_url": "https://ollama.com/v1/chat/completions",
+                              "api_key": "k" * 12})
+    assert json.loads(creds.read_text())["providers"]["cloud"]["base_url"] == "https://ollama.com/v1"
+
+
 def test_provider_add_requires_a_base_url(tmp_path):
     server, creds = _server_with_creds(tmp_path)
     with pytest.raises(Exception):
         server._cmd_provider_add({"provider_id": "x", "kind": "openai"})
+
+
+def test_provider_add_keeps_a_pasted_key_even_when_a_variable_is_also_named(tmp_path):
+    """Filling in both key fields must not discard the key.
+
+    A person adding a cloud endpoint pastes the key they were given and may also name the variable
+    they intend to use later. The save used to write *one* of the two (env `elif` literal), so the
+    pasted key vanished; the next call then reported "has no API key" to someone who had just supplied
+    one, and the variable was unset on the machine. Both are now kept, and `resolve_key` reads the
+    variable first — the safer source still wins, and the key is there when it is not.
+    """
+    server, creds = _server_with_creds(tmp_path)
+    server._cmd_provider_add({"provider_id": "ollamacloud", "kind": "openai",
+                              "base_url": "https://ollama.com/v1/chat/completions",
+                              "api_key": "pasted-" + "x" * 20,
+                              "api_key_env": "OLLAMA_API_KEY"})
+    entry = json.loads(creds.read_text())["providers"]["ollamacloud"]
+    assert entry["api_key_env"] == "OLLAMA_API_KEY"
+    assert entry.get("api_key"), "the pasted key must survive a save that also names a variable"
+    # And the pasted endpoint is reduced to the base a provider can append an operation to.
+    assert entry["base_url"] == "https://ollama.com/v1"
+
+
+def test_a_full_endpoint_is_accepted_as_a_base_url(tmp_path):
+    """People are handed `…/v1/chat/completions` and type it into the base field.
+
+    Appending `/models` to it probes a path that does not exist, so a correct key and a correct URL
+    were reported as an unreachable provider. The operation is stripped on the way in.
+    """
+    from engine.config import normalize_base_url
+
+    base, note = normalize_base_url("https://ollama.com/v1/chat/completions", "openai")
+    assert base == "https://ollama.com/v1"
+    assert "chat/completions" in note, "the correction must be reported, not silent"
+
+    server, creds = _server_with_creds(tmp_path)
+    server._cmd_provider_add({"provider_id": "shortened", "kind": "openai",
+                              "base_url": "https://ollama.com/v1/chat/completions",
+                              "api_key": "k" * 12})
+    assert json.loads(creds.read_text())["providers"]["shortened"]["base_url"] == "https://ollama.com/v1"
 
 
 def test_provider_remove_deletes_only_the_named_one(tmp_path):
@@ -505,6 +797,58 @@ def test_provider_remove_deletes_only_the_named_one(tmp_path):
     document = json.loads(creds.read_text())
     assert "groq" not in document["providers"]
     assert "ollama" in document["providers"]
+
+
+def test_provider_remove_refuses_the_last_provider(tmp_path):
+    """Removing the only provider would write a config no launch can read.
+
+    `load` raises "config defines no providers", and the running server *hides* the breakage — it
+    swallows the reload failure and keeps serving the stale object — so the damage would surface only
+    on the next start. Refusing names the way forward instead of quietly keeping or inventing a
+    replacement, which would be a routing decision the person did not make.
+    """
+    server, creds = _server_with_creds(tmp_path)
+    before = creds.read_text()
+    with pytest.raises(Exception, match="only provider"):
+        server._cmd_provider_remove({"provider_id": "ollama"})
+    assert creds.read_text() == before, "a refused removal must not write anything"
+    assert "ollama" in load(str(creds), warn=False).providers
+
+
+def test_provider_remove_reports_the_agents_left_bound_to_it(tmp_path):
+    """A removal re-points nobody: the roster keeps the binding, so those agents stop being callable.
+
+    `people.save` writes an agent's `provider` back verbatim, so an agent hired onto an endpoint keeps
+    that provider after the endpoint is gone. The engine names those agents in its reply, which is what
+    lets the console report the blast radius with names instead of asserting it in prose of its own.
+    """
+    server, creds = _server_with_creds(tmp_path)
+    server._cmd_provider_add({"provider_id": "groq", "kind": "openai",
+                              "base_url": "https://api.groq.com/openai/v1"})
+    hired = server._cmd_hire({"name": "Bound", "skill": "code-reviewer", "provider": "groq",
+                              "model": "qwen2.5-coder:7b", "context_window": 32768})["agent"]
+    reply = server._cmd_provider_remove({"provider_id": "groq"})
+    assert reply["agent_count"] == 1
+    assert reply["agents"] == [{"id": hired["id"], "name": "Bound"}]
+
+
+def test_a_removal_does_not_blame_the_built_in_company(tmp_path):
+    """The built-ins are re-derived from the resolved default, so a removed default re-points them.
+
+    Reporting them would be a false "these agents broke": the next load binds them to whatever the
+    engine now resolves. Only a *persisted* binding cannot move, and only those are reported.
+    """
+    from engine.config import set_defaults
+
+    server, creds = _server_with_creds(tmp_path)
+    server._cmd_provider_add({"provider_id": "groq", "kind": "openai",
+                              "base_url": "https://api.groq.com/openai/v1"})
+    # Make groq the declared default, so the built-in company is bound to it right now.
+    set_defaults(creds, provider="groq", model="qwen2.5-coder:7b")
+    server._reload_config()
+    reply = server._cmd_provider_remove({"provider_id": "groq"})
+    assert reply["agents"] == []
+    assert reply["agent_count"] == 0
 
 
 def test_provider_test_reports_an_unreachable_endpoint_without_raising(tmp_path):
@@ -838,3 +1182,456 @@ def test_the_status_snapshot_carries_the_new_panels(tmp_path):
     # The window the system will actually bind with — not the declared table alone.
     assert defaults["context_window"] == 32768
     assert defaults["autonomy"]["auto_pass_auto_gates"] is True
+
+
+# ── stopping, refusing and the writes that used to kill the worker ───────────
+#
+# Found by an audit of this file, each with a reproduction against the real server. They share one
+# shape, which is the shape that matters here: a command the app had already sent going unanswered.
+# An unacknowledged command is indistinguishable from a lost one, so the app waits its full 600s budget
+# per command on a reply that was never going to come — against an engine that looked healthy.
+
+
+class _AckBreakingOut(CapturedOut):
+    """stdout whose acknowledgements cannot be written, recording every line it was asked for.
+
+    The reproduction of the worst of them: `emit` guarded `json.dumps` and not the write. A
+    `BrokenPipeError` from an ack was caught by `_work`'s `except`, whose *failure* ack raised in turn —
+    and that one escaped, so the worker thread died inside an acknowledgement while the queue still held
+    every command behind it. Recording what was *attempted* is what distinguishes "answered" from
+    "never reached": the old worker died on the first command and never attempted the other two.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempted: list[str] = []
+
+    def write(self, text: str) -> None:
+        self.attempted.append(text)
+        if '"command.ack"' in text:
+            raise BrokenPipeError(32, "Broken pipe")
+        super().write(text)
+
+    def attempted_acks(self) -> list[str]:
+        ids = []
+        for line in self.attempted:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "command.ack":
+                ids.append(event["payload"]["cmd_id"])
+        return ids
+
+
+def _plain_server(config, library, slug, *, out, stdin=None):
+    """A server over in-memory streams, returned so a test can inspect its own state."""
+    workspace = Workspace.for_project(slug, root=pathlib.Path(tempfile.mkdtemp()))
+    workspace.ensure()
+    return Server(config=config, library=library, workspace=workspace, slug=slug,
+                  stdin=stdin if stdin is not None else io.StringIO(""), stdout=out)
+
+
+def test_a_failed_write_during_an_ack_cannot_kill_the_worker(config, library):
+    """A write failure must not propagate, and must not cost the queue its answers.
+
+    Measured before the fix, with a stdout that raised on every ack: `serve_forever` returned 0 after
+    10.01s, the worker thread was dead from an unhandled `BrokenPipeError`, zero acks were written and
+    the queue still held all three commands. The app then waits 600s per command against an engine that
+    looks healthy. `_log`'s own doctrine says a diagnostic that can break the code path it describes is
+    worse than none — `emit` is on the *ack* path, so the same rule has to hold there.
+    """
+    raised: list[BaseException] = []
+    previous = threading.excepthook
+    threading.excepthook = lambda args: raised.append(args.exc_value)
+    out = _AckBreakingOut()
+    stdin = io.StringIO("\n".join(json.dumps(c) for c in [
+        {"cmd_id": "c1", "type": "status"},
+        {"cmd_id": "c2", "type": "org"},
+        {"cmd_id": "c3", "type": "pool"}]) + "\n")
+    server = _plain_server(config, library, "writefail", out=out, stdin=stdin)
+    try:
+        started = time.time()
+        code = server.serve_forever()
+        elapsed = time.time() - started
+    finally:
+        threading.excepthook = previous
+
+    assert code == 0
+    assert not raised, f"the worker died instead of stopping: {raised}"
+    assert server._output_dead.is_set(), "a failed write must be recorded as dead output"
+    # Every command that was sent got an answer *attempted* — c1 ran, c2 and c3 were refused.
+    assert set(out.attempted_acks()) == {"c1", "c2", "c3"}, (
+        f"a command was left unanswered: attempted {out.attempted_acks()}")
+    assert server._commands.qsize() == 0, "a queued command was dropped without an answer"
+    # Not the old 10s drain that waited for a queue nobody would empty any more.
+    assert elapsed < 5.0, f"the dead output should stop the engine at once, took {elapsed:.1f}s"
+
+
+def test_a_command_past_the_old_twelve_second_bound_is_still_acknowledged(config, library):
+    """A command that ran is answered, even when it outruns the old drain-and-join budget.
+
+    `_drain` waited 10s and `_shutdown` joined the worker for 2s, so a handler longer than ~12s had its
+    ack written after `serve_forever` had already returned. Measured against the real server: 11.5s kept
+    its ack, 13.0s lost it. The bound is now `engine.serve._DRAIN_TIMEOUT_S` (60s), and this test is the
+    slow end of that: it fails if the bound is ever quietly lowered again.
+    """
+    from engine import serve as serve_module
+
+    slept = 13.0
+    assert serve_module._DRAIN_TIMEOUT_S > slept, (
+        "the drain bound must exceed the window that was measured losing acks")
+
+    class Slow(Server):
+        def _cmd_status(self, payload):
+            time.sleep(slept)
+            return {"slow": True}
+
+    out = CapturedOut()
+    stdin = io.StringIO(json.dumps({"cmd_id": "slow1", "type": "status"}) + "\n")
+    workspace = Workspace.for_project("boundtest", root=pathlib.Path(tempfile.mkdtemp()))
+    workspace.ensure()
+    server = Slow(config=config, library=library, workspace=workspace, slug="boundtest",
+                  stdin=stdin, stdout=out)
+    started = time.time()
+    code = server.serve_forever()
+    elapsed = time.time() - started
+
+    assert code == 0
+    payload = ack_for(out.events(), "slow1")
+    assert payload is not None, f"the {slept}s command ran but was never acknowledged"
+    assert payload["ok"] is True
+    assert elapsed >= slept, "the ack cannot have preceded the command"
+
+
+def test_commands_left_in_the_queue_when_the_engine_stops_are_refused(config, library):
+    """A `shutdown` ends the worker, so everything behind it is answered as a refusal.
+
+    Measured before the fix: three commands, one ack, `serve_forever` returned 0 after 10.03s with
+    `qsize == 3`. The stopped server had silently dropped two commands the app was waiting on. A command
+    that will not run is still an answerable command — "never ran, and why" is the answer.
+    """
+    class Slow(Server):
+        def _cmd_status(self, payload):
+            time.sleep(1.0)      # long enough for the read loop to queue every line behind it
+            return {"slow": True}
+
+    out = CapturedOut()
+    stdin = io.StringIO("\n".join(json.dumps(c) for c in [
+        {"cmd_id": "c1", "type": "status"},
+        {"cmd_id": "c2", "type": "shutdown"},
+        {"cmd_id": "c3", "type": "status"},
+        {"cmd_id": "c4", "type": "org"}]) + "\n")
+    workspace = Workspace.for_project("shutqueue", root=pathlib.Path(tempfile.mkdtemp()))
+    workspace.ensure()
+    server = Slow(config=config, library=library, workspace=workspace, slug="shutqueue",
+                  stdin=stdin, stdout=out)
+    started = time.time()
+    code = server.serve_forever()
+    elapsed = time.time() - started
+    events = out.events()
+
+    assert code == 0
+    assert ack_for(events, "c1")["ok"] is True
+    assert ack_for(events, "c2")["ok"] is True, "the shutdown itself must be acknowledged"
+    for cmd_id in ("c3", "c4"):
+        payload = ack_for(events, cmd_id)
+        assert payload is not None, f"{cmd_id} was left unanswered by the stop"
+        assert payload["ok"] is False
+        assert "never ran" in payload["error"], payload["error"]
+    assert server._commands.qsize() == 0, "the queue must be emptied by answering it"
+    assert elapsed < 5.0, f"a stopped engine should not wait out the drain, took {elapsed:.1f}s"
+
+
+def test_a_command_arriving_after_the_stop_is_refused_not_ignored(config, library):
+    """A line read *after* the stop is refused, because `break`ing on it was silence.
+
+    The read loop checked the stop flag before parsing the line it had just read, so a command sent
+    while the engine was stopping was dropped without a word — the app cannot tell that from a lost
+    command, and it has a 600s budget to sit through.
+    """
+    out = CapturedOut()
+    server, stdin, thread = _live_server(config, library, slug="afterstop", out=out)
+    try:
+        _wait_for(lambda: any(e.get("type") == "engine.ready" for e in out.events()), 20,
+                  "the engine to be ready")
+        stdin.send({"cmd_id": "c1", "type": "shutdown"})
+        _wait_for(lambda: ack_for(out.events(), "c1") is not None, 10, "the shutdown to be answered")
+        stdin.send({"cmd_id": "c2", "type": "status"})
+        _wait_for(lambda: ack_for(out.events(), "c2") is not None, 10,
+                  "the late command to be answered")
+    finally:
+        stdin.close()
+        thread.join(timeout=15)
+
+    payload = ack_for(out.events(), "c2")
+    assert payload["ok"] is False
+    assert "stop" in payload["error"], payload["error"]
+
+
+def test_a_burst_beyond_the_queue_bound_is_refused_not_grown(config, library, monkeypatch):
+    """The queue is bounded, and the commands that do not fit are answered, not dropped.
+
+    It was unbounded: an app sending faster than the worker drains grew it without limit, which is an
+    engine that answers later and later while looking healthy. The bound is enforced by `put_nowait` on
+    a sized queue; the burst here is sized against a small bound so the test stays fast, but the real
+    bound is asserted to be finite too — a bound of none is the defect.
+    """
+    from engine import serve as serve_module
+
+    assert 0 < serve_module._COMMAND_QUEUE_MAX <= 10_000, "the command queue must stay bounded"
+    monkeypatch.setattr(serve_module, "_COMMAND_QUEUE_MAX", 8)
+
+    class Slow(Server):
+        def _cmd_status(self, payload):
+            time.sleep(0.05)
+            return {"slow": True}
+
+    total = 20
+    out = CapturedOut()
+    stdin = io.StringIO("\n".join(
+        json.dumps({"cmd_id": f"c{i}", "type": "status"}) for i in range(total)) + "\n")
+    workspace = Workspace.for_project("boundq", root=pathlib.Path(tempfile.mkdtemp()))
+    workspace.ensure()
+    server = Slow(config=config, library=library, workspace=workspace, slug="boundq",
+                  stdin=stdin, stdout=out)
+    assert server.serve_forever() == 0
+    events = out.events()
+
+    answered = {e["payload"]["cmd_id"] for e in acks(events)}
+    assert answered == {f"c{i}" for i in range(total)}, (
+        f"every command must be answered, missing: "
+        f"{ {f'c{i}' for i in range(total)} - answered }")
+    refused = [e["payload"] for e in acks(events) if not e["payload"]["ok"]]
+    assert refused, "a burst larger than the bound must produce at least one refusal"
+    assert "behind" in refused[0]["error"], refused[0]["error"]
+    assert server._commands.qsize() == 0
+
+
+def test_two_untagged_commands_get_distinct_ids(config, library, tmp_path):
+    """The fallback `cmd_id` is unique per command, not per millisecond.
+
+    The app correlates its answers on `cmd_id`. A millisecond timestamp gave two untagged commands in
+    the same millisecond one name, so the reply to one was a reply to the other — the app would resolve
+    the wrong command, or resolve one that was still running.
+    """
+    server, _ = _server_with_creds(tmp_path, slug="cmdid")
+    ids = [server._parse(json.dumps({"type": "status"})).cmd_id for _ in range(3)]
+    assert len(set(ids)) == 3, f"commands shared an id: {ids}"
+    assert all(cmd_id.startswith("cmd_") for cmd_id in ids)
+
+
+def test_resume_is_refused_while_a_run_is_in_flight(config, library, monkeypatch):
+    """`resume` under a live run would rewrite the run the run thread is executing.
+
+    `Orchestrator.resume` sets the phase to READY, clears the gate and persists — while the run thread
+    writes its own phases to the same run and the same checkpoint. The check is `_cmd_start`'s check, for
+    the same reason: the run thread is the only thing that can answer "is a graph executing right now".
+    """
+    from engine.orchestrator import Orchestrator
+
+    timeline: list[str] = []
+    release = threading.Event()
+    monkeypatch.setattr(Orchestrator, "execute",
+                        _in_flight_execute(release=release, timeline=timeline))
+    out = CapturedOut(timeline=timeline)
+    server, stdin, thread = _live_server(config, library, slug="resumeguard", out=out)
+    try:
+        _wait_for(lambda: "event:engine.ready" in timeline, 20, "the engine to be ready")
+        stdin.send({"cmd_id": "s1", "type": "start", "payload": {"goal": "ship a landing page"}})
+        _wait_for(lambda: "run-live" in timeline, 60, "the graph to be in flight")
+        stdin.send({"cmd_id": "r1", "type": "resume"})
+        _wait_for(lambda: ack_for(out.events(), "r1") is not None, 10,
+                  "the resume to be answered")
+
+        payload = ack_for(out.events(), "r1")
+        assert payload["ok"] is False, "a resume against a live graph must be refused"
+        assert "already in flight" in payload["error"], payload["error"]
+        live = getattr(server.orchestrator, "_run", None)
+        assert live is not None and live.phase.value == "running", (
+            "the refusal must leave the executing run's phase alone")
+    finally:
+        release.set()
+        stdin.close()
+        thread.join(timeout=15)
+
+
+def test_a_failed_portfolio_load_does_not_overwrite_the_register(tmp_path, monkeypatch):
+    """One bad read must not license `portfolio_add` to replace the register.
+
+    Measured before the fix: `_load_portfolio` marked itself loaded *before* the attempt and swallowed
+    the failure into `self._portfolio = None`; `_cmd_portfolio_add` read that as "no portfolio", built
+    `Portfolio.new()` and saved it — and `Portfolio.save` **replaces** the file. One transient read
+    failure and the user's orgs are a one-org file. A register that could not be read is not a register
+    that is absent.
+    """
+    from engine import serve as serve_module
+
+    home = tmp_path / "home"
+    home.mkdir()
+    register = home / "portfolio.json"
+    broken = "{ this is not a register"
+    register.write_text(broken)
+    monkeypatch.setenv("AGENTORG_HOME", str(home))
+
+    server = _plain_server(None, None, "portfail", out=CapturedOut())
+    with pytest.raises(serve_module.ServerError) as caught:
+        server._cmd_portfolio_add({"name": "Tesla"})
+    assert "could not be read" in str(caught.value), str(caught.value)
+    assert register.read_text() == broken, "the failed read must not have been written over"
+
+    # The snapshot says so rather than rendering as "no orgs", which is what invites the overwrite.
+    snapshot = server._cmd_portfolio({})
+    assert snapshot["orgs"] == [] and snapshot["error"], snapshot
+
+    # And the failure is not cached: the next read succeeds once the register is readable again.
+    from engine.portfolio import Portfolio
+
+    fixed = Portfolio.new()
+    fixed.add_org(name="SpaceX", slug="spacex")
+    fixed.save()
+    assert server._load_portfolio() is not None, "a read failure must be retried, not remembered"
+    assert [org["name"] for org in server._cmd_portfolio({})["orgs"]] == ["SpaceX"]
+    assert server._cmd_portfolio({})["error"] == ""
+
+    # Which is what lets an add merge into the real register instead of replacing it.
+    server._cmd_portfolio_add({"name": "Waymo", "slug": "waymo"})
+    assert sorted(org["name"] for org in server._cmd_portfolio({})["orgs"]) == ["SpaceX", "Waymo"]
+
+
+# ── the stop paths, against a real process ───────────────────────────────────
+
+_STAND_IN = '''\
+import json, sys
+
+sys.path.insert(0, {repo!r})
+from engine.serve import Server
+
+
+class Cfg:
+    providers = {{}}
+    path = None
+
+
+class WS:
+    path = {ws!r}
+    display_name = "stand-in"
+    slug = "stand-in"
+    root = "/tmp"
+
+
+class Probe(Server):
+    def _cmd_sleep(self, payload):
+        import time
+        time.sleep(float(payload.get("t") or 0))
+        return {{"slept": payload.get("t")}}
+
+
+server = Probe(config=Cfg(), library=None, workspace=WS(), slug="stand-in")
+{extra}
+server.serve_forever()
+'''
+
+
+def _spawn_stand_in(tmp_path, *, extra: str = ""):
+    """A real server process over real pipes, for the behaviour that only exists between processes."""
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    script = tmp_path / "stand_in_server.py"
+    script.write_text(_STAND_IN.format(repo=str(repo), ws=str(tmp_path), extra=extra))
+    proc = subprocess.Popen([sys.executable, str(script)], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    seen: list[str] = []
+    ready = threading.Event()
+
+    def _read() -> None:
+        for line in proc.stdout:
+            seen.append(line.strip())
+            if "engine.ready" in line:
+                ready.set()
+
+    threading.Thread(target=_read, name="stand-in-reader", daemon=True).start()
+    if not ready.wait(30):
+        proc.kill()
+        pytest.skip("the stand-in engine did not start in time")
+    return proc, seen
+
+
+def _send(proc, command: dict) -> None:
+    proc.stdin.write(json.dumps(command) + "\n")
+    proc.stdin.flush()
+
+
+def _acks_from(lines: list[str]) -> list[dict]:
+    out = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "command.ack":
+            out.append(event["payload"])
+    return out
+
+
+def test_sigterm_unwinds_the_engine_through_its_own_shutdown(tmp_path):
+    """The app's Stop path, against a real process: SIGTERM must not kill it where it stands.
+
+    `terminate()` closes the command pipe and then signals, and the Swift comment on it claims the
+    engine "finishes the command in flight, writes its checkpoint, and exits" — while `serve._drain`
+    was the wait it described and no SIGTERM handler existed, so Python's default action killed the
+    process in milliseconds and the wait never ran. This is the real thing: a real process, a real
+    SIGTERM, no pipe close at all (which is the harder case — a *parked* read, where a flag alone
+    cannot unwind the loop, only an exception can).
+    """
+    proc, seen = _spawn_stand_in(tmp_path)
+    try:
+        _send(proc, {"cmd_id": "c1", "type": "sleep", "payload": {"t": 30}})
+        time.sleep(0.5)                     # let the worker be inside the command
+        started = time.time()
+        proc.send_signal(signal.SIGTERM)
+        try:
+            code = proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise AssertionError("the engine ignored SIGTERM and had to be killed")
+        elapsed = time.time() - started
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    assert code == 0, f"a signalled engine should exit cleanly, got {code}"
+    # The command in flight cannot finish inside the app's 5s grace, and the engine says so rather than
+    # exiting quietly — that is the "where it is genuinely impossible" half of the ack contract.
+    payloads = _acks_from(seen)
+    assert payloads, "the in-flight command was never answered"
+    assert payloads[-1]["cmd_id"] == "c1" and payloads[-1]["ok"] is False
+    assert "gave up waiting" in payloads[-1]["error"], payloads[-1]["error"]
+    # Bounded by the signal's own cap, not by the 60s drain: the app SIGKILLs 5s after signalling.
+    assert elapsed < 5.0, f"the exit must fit inside the app's grace, took {elapsed:.1f}s"
+
+
+def test_stop_now_is_the_last_resort_it_claims_to_be(tmp_path):
+    """The parent watchdog's force-exit waits for the process to stop itself first.
+
+    `_stop_now` called `os._exit(0)` immediately from the watchdog thread: no drain, no shutdown, and it
+    could take the process down mid-write. It is still the last resort — the read loop may never see EOF,
+    which is why the watchdog exists — but "last" now means after the process had its chance.
+    """
+    extra = ("import threading, time\n"
+             "threading.Thread(target=lambda: (time.sleep(0.5), server._stop_now()), daemon=True).start()\n")
+    proc, seen = _spawn_stand_in(tmp_path, extra=extra)
+    try:
+        _send(proc, {"cmd_id": "c1", "type": "sleep", "payload": {"t": 2.0}})
+        try:
+            code = proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise AssertionError("the force-exit never happened — the watchdog would be useless")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    assert code == 0
+    payloads = _acks_from(seen)
+    assert payloads, "os._exit fired before the command in flight could be acknowledged"
+    assert payloads[-1]["cmd_id"] == "c1" and payloads[-1]["ok"] is True

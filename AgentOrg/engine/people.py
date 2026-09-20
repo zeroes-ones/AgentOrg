@@ -81,6 +81,12 @@ class HireRequest:
     max_concurrency: int = 1
     purpose: str = ""
     as_reviewer: bool = False
+    #: What this agent may reach, as `<kind>:<scope>` grants. Empty means "use the skill's default"
+    #: (`_capabilities_for`), which is least privilege — so a hire that says nothing is not silently
+    #: widened. Supplied explicitly, it *replaces* the default rather than adding to it: a person
+    #: granting `exec:` is stating the whole set, and merging would make "revoke write" impossible
+    #: to express.
+    capabilities: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -164,11 +170,15 @@ class People:
         return default_company(provider=provider, model=model, context_window=window)
 
     def _merge(self, target: Org, source: Org) -> None:
-        """Overlay `source` onto `target`, by agent name, and carry teams across.
+        """Overlay `source` onto `target`, by agent name, and carry teams and tombstones across.
 
         Replacement is by *name* but the incoming spec brings its own id, so the old id is removed and
         the new one installed. Doing it the other way — keeping the old id and copying fields — would
         silently re-point every log line and mailbox at a different agent identity.
+
+        `retired` is carried too, and deduplicated by record: a termination is history that belongs to
+        the roster it happened in, so a project that retires one agent must not lose the global
+        roster's records — and a record present in both must not be duplicated by the merge.
         """
         for spec in source.agents.values():
             if spec.is_human:
@@ -187,6 +197,9 @@ class People:
                                          and spec.title == "Code Reviewer"))
         for team in source.teams.values():
             target.teams.setdefault(team.name, team)
+        for record in source.retired:
+            if record not in target.retired:
+                target.retired.append(dict(record))
 
     # ── hiring ──────────────────────────────────────────────────────────────
 
@@ -237,7 +250,7 @@ class People:
             role="reviewer" if request.as_reviewer or _is_reviewer_skill(request.skill) else request.role,
             level=level,
             team=request.team,
-            capabilities=_capabilities_for(request.skill),
+            capabilities=list(request.capabilities) or _capabilities_for(request.skill),
             budget=Budget(),
             max_concurrency=max(1, int(request.max_concurrency)),
             origin="owner",
@@ -430,6 +443,10 @@ class People:
         a copy of the defaults into the project: a later change to the built-in roster would then be
         silently shadowed by a stale snapshot, and the project file that was meant to record one hire
         would contain eight agents nobody hired.
+
+        The `retired` tombstones are written unfiltered. They are not agents, so none of the reasoning
+        above applies, and a tombstone is the *only* record a terminated agent leaves — filtering it
+        would delete the record in the same write that was meant to keep it.
         """
         target = org or self.org
         if target is None:

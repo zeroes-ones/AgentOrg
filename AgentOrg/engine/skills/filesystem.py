@@ -172,6 +172,15 @@ class FilesystemSkillSource(SkillSource):
             self._cache[name] = (digest, bundle)
         return bundle
 
+    def bundle(self, name: str) -> SkillBundle:
+        """Load one skill, named the way a subagent binding asks for it.
+
+        An alias of :meth:`load` rather than a second lookup path: a child's procedure and the
+        procedure its node's contract was checked against must be the same parse, or the child
+        would follow a different SOP from the one that gated the work.
+        """
+        return self.load(name)
+
     def load_many(self, names: list[str]) -> dict[str, SkillBundle]:
         """Load several skills, reporting each failure rather than aborting.
 

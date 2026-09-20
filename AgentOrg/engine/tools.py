@@ -26,9 +26,18 @@ DESIGN
 - **Reading is cheap and writing is not.** Reads have a generous size cap (a truncated read is still
   useful, and says it was truncated); writes are capped far lower and always go through the
   workspace's atomic writer, so a reader never sees a half-written file.
-- **Nothing here shells out.** `run_command` is deliberately absent: an unconstrained shell inside a
-  real repository is a much larger risk than a file write, and it deserves its own decision rather
-  than being smuggled in beside `read_file`.
+- **Nothing here shells out unconfined.** `run_command` was deliberately absent for a long time: a
+  shell inside a real repository is a much larger risk than a file write, and it deserved its own
+  decision rather than being smuggled in beside `read_file`. That decision has now been made, and it
+  is *confinement*: the tool exists only when `sandbox.enabled` is set, needs an `exec:` capability of
+  its own, and runs the command inside a Seatbelt profile that grants the workspace and denies
+  everything else (`engine/sandbox.py`). Disabled, it is not advertised at all, so a model is never
+  tempted by a tool it would only be refused.
+- **A workspace grant is not a machine grant.** Read, write and exec all describe what an agent may do
+  *inside the project*. Acting on the person's own machine — the battery, the clipboard, the screen,
+  the volume, an application, a script — is a different question with a different confinement story, so
+  it is a different namespace (`system:`) with its own section (`system`), its own per-tool grants and
+  its own implementations (`engine/sysctl_tools.py`). Nothing about `read:*` confers any of it.
 
 Usage:
     registry = ToolRegistry(workspace_root=Path("~/code/my-app"), agent=alice)
@@ -48,13 +57,26 @@ from .state import ENGINE_STATE_DIRNAME
 
 __all__ = [
     "ToolError", "ToolResult", "Tool", "ToolRegistry",
-    "READ_CAPABILITY", "WRITE_CAPABILITY",
+    "READ_CAPABILITY", "WRITE_CAPABILITY", "EXEC_CAPABILITY", "SYSTEM_CAPABILITY",
 ]
 
 #: Capability namespaces. An agent's grant list is matched by prefix, so `read:src/` covers
 #: `read:src/app.py` — the least-privilege shape the delegation ladder already speaks.
 READ_CAPABILITY = "read"
 WRITE_CAPABILITY = "write"
+#: Running a command is its *own* grant, never folded into read or write. An agent trusted to edit
+#: `src/` has not thereby been trusted to run an arbitrary toolchain against the checkout, and
+#: collapsing the two would make the narrower grant meaningless the moment the wider one was given.
+#: The prefix is also what `delegation.elevated_markers()` already names (`exec:`), so a requisition
+#: asking for it lands in the Owner's tier rather than being auto-granted.
+EXEC_CAPABILITY = "exec"
+#: Acting on the machine itself — the battery, the clipboard, the screen, the volume, an application,
+#: a script. Deliberately its *own* namespace rather than a widening of `exec:`, because the two reach
+#: different things: `exec:` is confined to the workspace by a Seatbelt profile, and `system:` is not
+#: confined by anything but the per-tool scope in `system.allow_apps` / `system.allow_automation`.
+#: Folding them together would make granting one grant the other, which is the mistake the whole
+#: scoped-grant design exists to avoid.
+SYSTEM_CAPABILITY = "system"
 
 #: The largest file a read will return. A truncated read still tells the agent most of what it needs
 #: and the result says it was truncated, which is far more useful than refusing outright.
@@ -169,11 +191,16 @@ class ToolRegistry:
     read_only:
         Forbids every mutating tool regardless of capability. Set when a run is inspecting a project
         rather than changing it, so "nothing is written" is a property of the run and not a hope.
+    sandbox:
+        The `SandboxConfig` section. `enabled` is what decides whether `run_command` is advertised at
+        all — the registry is built per node, so the tool list a model sees *is* the answer to "may I
+        run things here", and a tool offered-then-refused teaches a model to distrust the list.
     """
 
     def __init__(self, *, workspace_root: Path | str, agent: Any = None,
                  writer: Any = None, read_only: bool = False,
-                 goal_workspace: Any = None, subagents: Any = None) -> None:
+                 goal_workspace: Any = None, subagents: Any = None,
+                 sandbox: Any = None, system: Any = None) -> None:
         self.root = Path(workspace_root).resolve()
         self.agent = agent
         self.writer = writer
@@ -185,8 +212,32 @@ class ToolRegistry:
         #: (see `subagents.SubagentRunner`). None means `task`/`fleet` are not advertised, so a node
         #: without a runner cannot dispatch children it has no way to collect.
         self.subagents = subagents
+        #: The `SandboxConfig`. None (or `enabled=False`) means `run_command` is not registered: the
+        #: default posture is the one the engine shipped with, and turning the shell on is a decision
+        #: an operator makes in configuration rather than one a node makes for itself.
+        self.sandbox = sandbox
+        #: The `SystemConfig`. None (or `enabled=False`) means no system tool is registered at all —
+        #: the machine is not reachable from a run unless an operator said so, and a grant is still
+        #: required on top of that.
+        self.system = system
         self._tools: dict[str, Tool] = {}
         self._register_defaults()
+
+    #: Tool name -> the capability it reaches, for the machine tools. A class attribute rather than a
+    #: mapping built at registration, because `call` consults it and `call` must not depend on whether
+    #: registration happened to run first. Declared here so a new system tool cannot be advertised
+    #: without a grant: the catalogue and this table are checked against each other by the tests.
+    SYSTEM_TOOL_CAPABILITY: dict[str, str] = {
+        "system_state": "system:state",
+        "read_clipboard": "system:clipboard",
+        "write_clipboard": "system:clipboard",
+        "take_screenshot": "system:screenshot",
+        "get_volume": "system:media",
+        "set_volume": "system:media",
+        "set_mute": "system:media",
+        "open_app": "system:open",
+        "run_automation": "system:automation",
+    }
 
     def __len__(self) -> int:
         return len(self._tools)
@@ -227,6 +278,39 @@ class ToolRegistry:
             if relative == stem or relative.startswith(stem + "/"):
                 return True
         return False
+
+    def _granted_scoped(self, kind: str, scope: str) -> bool:
+        """Whether the agent holds a machine capability, by name.
+
+        Matching is exact on the scope, plus the `*` wildcard every other namespace in this engine
+        already speaks: `system:open` grants launching an application, `system:*` grants every machine
+        capability there is. A wildcard is accepted because a caller who writes it has plainly asked
+        for all of them, and refusing it would only teach them to enumerate — but there is no *prefix*
+        rule, because that would let `system:state` match a hypothetical `system:stateful`, a widening
+        nobody asked for in the one namespace where widening is the whole risk. Read/write/exec keep
+        the path-prefix semantics in `_grants` above, and the two rules are kept apart so neither has
+        to be a conditional on the caller's argument.
+        """
+        held = set(self._capabilities())
+        return f"{kind}:*" in held or f"{kind}:{scope}" in held
+
+    def _denied_capability(self, tool: str, capability: str, reason: str) -> ToolResult:
+        """Explain a refusal of a machine capability, in the shape `_denied` established.
+
+        The same three lines a path refusal prints — the tool, what was required, what is held — plus
+        the caller's own sentence for *why* this grant exists, because "system:open is not granted" is
+        less useful than "so no application may be launched". The trailing instruction is identical to
+        `_denied`'s, so a model sees one refusal shape whatever it asked for.
+        """
+        held = ", ".join(self._capabilities()) or "(none)"
+        return ToolResult(
+            False,
+            f"{tool} refused: {reason}\n"
+            f"  required: {capability}\n"
+            f"  held    : {held}\n"
+            "Do not retry this call. Complete what you can within your permissions, and record what "
+            "you could not do as an open question."
+        )
 
     def _resolve(self, raw: Any, *, must_exist: bool = False) -> Path:
         """Resolve a workspace-relative path, refusing anything outside the workspace.
@@ -295,6 +379,17 @@ class ToolRegistry:
                 False,
                 f"{name} is not available: this run is read-only, so nothing in the project is "
                 "modified. Report what you would change instead.")
+        # A `system:` grant is enforced **here**, not in the handler. The catalogue declares which
+        # capability each machine tool reaches, and a declaration nothing consumes is a comment: the
+        # gate belongs at the one entry point every call passes through, so a handler cannot be written
+        # that forgets it. A tool whose name is not a machine tool has no entry and is untouched.
+        required = self.SYSTEM_TOOL_CAPABILITY.get(str(name), "")
+        if required and not self._granted_scoped(SYSTEM_CAPABILITY, required.split(":", 1)[1]):
+            return self._denied_capability(
+                str(name), required,
+                f"acting on this machine requires the {required} grant, which this agent does not "
+                "hold. The machine is not part of the project, so no read, write or exec grant "
+                "reaches it.")
         try:
             return tool.handler(dict(arguments or {}))
         except ToolError as exc:
@@ -366,6 +461,39 @@ class ToolRegistry:
             handler=self._write_file,
             mutates=True,
         ))
+        if bool(getattr(self.sandbox, "enabled", False)):
+            # Advertised only when the operator turned the sandbox on. Both guards matter and for
+            # different reasons: `enabled` is about whether confinement exists on this machine, and
+            # `read_only` is about whether this *run* may change anything at all. A model handed a
+            # command tool in a read-only run would learn the tool list is not a statement of policy.
+            self.register(Tool(
+                name="run_command",
+                description=(
+                    "Run a command in the project, e.g. the test suite you just wrote. This is how you "
+                    "check your own work instead of guessing whether it runs. The command is confined: "
+                    "it can read and write this project and nothing outside it, and it has no network. "
+                    "Pass an argv list, not a shell string — [\"python3\", \"run_tests.py\"] — so what "
+                    "runs is exactly what you wrote. Output is capped and a long command is stopped at "
+                    "a wall-clock ceiling."),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "argv": {
+                            "type": "array", "items": {"type": "string"},
+                            "description": ("the command as a list of arguments, e.g. "
+                                            "[\"python3\", \"run_tests.py\", \"-q\"]"),
+                        },
+                        "timeout_s": {
+                            "type": "integer",
+                            "description": "wall-clock ceiling in seconds (default: the configured max)",
+                        },
+                    },
+                    "required": ["argv"],
+                },
+                handler=self._run_command,
+                mutates=True,
+            ))
+        self._register_system_tools()
         if self.goal_workspace is not None:
             # Only advertised when a goal is armed. The same instinct as `read_only`: a capability not
             # in play should not be in the prompt, and because the tool block feeds the prefix hash,
@@ -452,6 +580,57 @@ class ToolRegistry:
                     "required": ["child_id"],
                 },
                 handler=self._read_subagent_result,
+            ))
+
+    def _register_system_tools(self) -> None:
+        """Register the scoped macOS actions, when the operator enabled them.
+
+        `system.enabled` is the one gate here, and it is the operator's. Off means nothing is
+        advertised at all, so a model is never tempted by a tool it would only be refused — the same
+        posture `sandbox.enabled` takes for `run_command`.
+
+        Two things are deliberately *not* gates at registration time:
+
+        - **The run's `read_only` posture.** It is enforced in `call`, which is where `write_file` and
+          `run_command` are refused, so a read-only run refuses a mutating system tool with the same
+          sentence it uses for every other mutating tool. Filtering here as well would give the two
+          paths two different messages for one rule.
+        - **The agent's own grant.** It is enforced in `call` too, through the declared capability
+          table, so a refusal can name what was required and what the agent holds. A tool hidden at
+          registration produces "no such tool", which a model reads as a typo rather than as a
+          permission it lacks.
+
+        The catalogue is the single source of both the advertisement and the parameters, and
+        `SYSTEM_TOOL_CAPABILITY` declares each tool's grant, so a tool cannot be offered without a
+        capability that reaches it — the tests check the two tables against each other.
+        """
+        config = getattr(self, "system", None)
+        if config is None or not bool(getattr(config, "enabled", False)):
+            return
+
+        from .sysctl_tools import CATALOGUE, SystemTools
+
+        tools = SystemTools(workspace_root=self.root, config=config,
+                            agent_id=str(getattr(self.agent, "id", "") or ""),
+                            state_dir=self.root / ENGINE_STATE_DIRNAME)
+        handlers = tools.handlers()
+        for entry in CATALOGUE:
+            handler = handlers.get(entry.name)
+            if handler is None or entry.name not in self.SYSTEM_TOOL_CAPABILITY:
+                # A catalogue entry with no declared grant would be a tool reachable without a
+                # capability, which is the one thing this namespace must not contain. Skipped rather
+                # than registered on the assumption that someone will add the grant later.
+                continue
+            self.register(Tool(
+                name=entry.name,
+                description=entry.description,
+                parameters=entry.parameters,
+                # Registered bare: `call` already turns any exception from a handler into a
+                # `ToolResult(ok=False, ...)`, so wrapping it again would be a second copy of one
+                # guarantee. The module returns refusals for everything it can foresee, and the
+                # registry covers what it cannot.
+                handler=handler,
+                mutates=entry.mutates,
             ))
 
     def register(self, tool: Tool) -> None:
@@ -596,6 +775,67 @@ class ToolRegistry:
             os.replace(tmp, path)
         return ToolResult(True, f"wrote {relative} ({len(text.splitlines())} lines)",
                           paths=[relative])
+
+    # -- running a command --------------------------------------------------
+
+    def _run_command(self, args: dict[str, Any]) -> ToolResult:
+        """Run a command in the confined sandbox, and report what it produced.
+
+        The capability gate is over the workspace as a whole, not over a path the command names: a
+        command's *reach* is not knowable from its argv, so pretending to grant it per-path would be a
+        specificity the check cannot honestly deliver. The real per-path limit is the Seatbelt profile,
+        and this gate is about *who* may run at all.
+
+        Failures are returned, never raised. A command exiting non-zero, being stopped at the ceiling,
+        or being refused by the preflight are all results a model can act on; an exception would end
+        the node and discard the work that led to the call.
+        """
+        from . import sandbox as sandbox_module
+
+        argv = args.get("argv")
+        if not isinstance(argv, list) or not argv:
+            return ToolResult(
+                False,
+                "argv is required and must be a non-empty list, e.g. "
+                "[\"python3\", \"run_tests.py\", \"-q\"]. A shell string is deliberately not accepted: "
+                "it would have to be handed to a shell, and the confinement cannot follow the command "
+                "through one.")
+        # The scope granted is the workspace as a whole, which `_grants` spells ".". Asking it about
+        # the root's own name would compare `exec:` against `/tmp/whatever` and refuse a grant that
+        # plainly covers it; an empty scope is what "the whole project" is called everywhere else in
+        # this module (`list_dir` uses the same spelling for the same reason).
+        if not self._granted(EXEC_CAPABILITY, ""):
+            return self._denied(EXEC_CAPABILITY, ".", "run_command")
+
+        timeout_s = args.get("timeout_s")
+        try:
+            requested_timeout = int(timeout_s) if timeout_s is not None else None
+        except (TypeError, ValueError):
+            return ToolResult(False, f"timeout_s must be a whole number of seconds, got {timeout_s!r}")
+        if requested_timeout is not None and requested_timeout < 1:
+            return ToolResult(False, "timeout_s must be at least 1 second")
+
+        try:
+            runner = sandbox_module.SandboxedCommand(workspace_root=self.root, config=self.sandbox)
+            result = runner.run(argv, timeout_s=requested_timeout)
+        except sandbox_module.SandboxError as exc:
+            # A refusal from the runner is a result, not a crash: a model that is told the machine
+            # cannot confine a command can stop trying instead of burning its step bound on retries.
+            return ToolResult(False, str(exc))
+        except Exception as exc:  # noqa: BLE001 - a tool must never kill the node
+            return ToolResult(False, f"run_command failed: {type(exc).__name__}: {exc}")
+
+        if result.refused:
+            return ToolResult(False, result.reason or "the command was refused")
+
+        header = f"$ {' '.join(str(a) for a in argv)}\nexit {result.exit_code}"
+        tail = " [timed out]" if result.timed_out else ""
+        body = result.combined.rstrip()
+        return ToolResult(
+            result.ok,
+            f"{header}{tail}\n{body}" if body else f"{header}{tail}\n(no output)",
+            truncated=result.truncated,
+        )
 
     # -- the goal verdict ---------------------------------------------------
 

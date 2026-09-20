@@ -22,7 +22,13 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from engine.activity import build_activity
+from engine.flow import NEXT_SEP, build_flow, stop_report, why_stopped
 from engine.state import Workspace
+
+#: The gloss `flow._STOP_WORDS` gives the `guardrail-blocked` token — what it means, as opposed to the
+#: token itself. Spelled out here so the assertion tests the *contract* rather than restating the code.
+_GLOSS = "the work finished, but what it handed on was refused at the edge — a contract failure, " \
+         "not a crash"
 
 
 @pytest.fixture
@@ -214,3 +220,166 @@ def test_the_report_maps_skills_to_holders(workspace):
 def test_a_broken_roster_does_not_break_the_report(workspace):
     report = build_activity(workspace, org=object())  # no `agents` attribute at all
     assert "headline" in report
+
+
+# ── a stuck node explains itself, on both surfaces the Owner has ──────────────
+#
+# The reported state, built here rather than read from a project, because the defect is a *shape*: a
+# node record with no `summary` — an edge guardrail refuses the payload before one is ever attached —
+# and a `log` entry that carries the reason. Both surfaces used to print `guardrail-blocked` and stop:
+# the board read only the record's `summary`, which is empty, and the timeline read the trace and the
+# diagnostics, which never carried the reason at all. Nothing but the shape matters to the reading, so
+# the shape is what this builds.
+
+#: The runner's own log action for the report's case, verbatim from
+#: `projects/console/.agent_state/run_state.json`.
+_GUARDRAIL_REASON = ("the payload is missing summary. A receiver that cannot see the status or a summary "
+                     "cannot tell what it was given.")
+
+
+def _guardrail_state(slug: str = "activity-probe") -> dict:
+    return {
+        "run_id": "run_9", "slug": slug, "workflow": slug, "phase": "escalated",
+        "nodes": {"pm": {"status": "blocked", "iterations": 1, "verdict": "guardrail-blocked"},
+                  "architect": {"status": "pending", "iterations": 0}},
+        "log": [{"step": 1, "node": "pm", "action": "guardrail", "detail": _GUARDRAIL_REASON}],
+    }
+
+
+def _guardrail_workspace(workspace, **overrides) -> None:
+    """The state on disk, plus the manifest a recovery command has to be able to name.
+
+    The goal is armed, as it is on the real project this came from: that is what makes "will the loop
+    continue?" a question worth answering rather than one that is already false.
+    """
+    _write(workspace.state_dir.parent, "activity-probe.yaml", "name: activity-probe\n")
+    _write(workspace.state_dir, "run_state.json", json.dumps({**_guardrail_state(), **overrides}))
+    _write(workspace.state_dir, "goal.json", json.dumps({
+        "goal_version": "1.0.0", "objective": "build the console", "state": "armed"}))
+
+
+def test_the_board_reads_a_guardrail_blocks_reason_from_the_log(workspace):
+    _guardrail_workspace(workspace)
+    board = build_flow(workspace)
+    row = next(r for r in board["rows"] if r["node_id"] == "pm")
+    assert "missing summary" in row["blocked_by"], "the log's sentence, not the token"
+    assert row["blocked_by"] != row["verdict"], "the token alone is not the answer"
+    # The token is still there, and it is *said* rather than repeated: what it means is that the node
+    # finished its work and the hand-off refused what it produced.
+    assert row["verdict"] == "guardrail-blocked"
+    assert "refused at the edge" in row["blocked_by"]
+    assert "missing summary" in board["headline"]
+    assert board["counts"]["stuck"] == 1
+
+
+def test_a_recorded_summary_still_wins_over_the_log(workspace):
+    """The log is a fallback, not a replacement: the node's own sentence is the better answer."""
+    _guardrail_workspace(workspace, nodes={
+        "pm": {"status": "needs_review", "verdict": "contract-violation",
+               "summary": "declared criteria not covered: c1"},
+    }, log=[{"step": 2, "node": "pm", "action": "contract",
+             "detail": "declared criteria not covered: c1, c2"}])
+    board = build_flow(workspace)
+    row = next(r for r in board["rows"] if r["node_id"] == "pm")
+    assert row["blocked_by"] == "declared criteria not covered: c1"
+    assert "c1" in board["headline"] and "c2" not in board["headline"]
+
+
+def test_activity_says_why_and_what_next_for_a_guardrail_block(workspace):
+    _guardrail_workspace(workspace)
+    report = build_activity(workspace)
+    assert "pm is stuck" in report["headline"]
+    assert "missing summary" in report["headline"]
+    # The reason reaches the timeline from the checkpoint's own log — the source it was missing.
+    assert any("missing summary" in (e["detail"] or "") for e in report["timeline"])
+    assert any(e["node_id"] == "pm" and e["tone"] == "bad" for e in report["timeline"])
+    # And the next action is a command that applies, not a fixed suggestion.
+    assert report["next_action"]["kind"] == "retry"
+    assert "run --slug activity-probe --manifest" in report["next_action"]["command"]
+    assert "missing summary" in report["next_action"]["detail"]
+    # A goal may not release a safety control that fired, so the report must not claim it will — even
+    # though the goal on disk is armed, which is the state that makes this claim worth checking.
+    assert report["goal"]["live"] is True
+    assert report["going"]["continues"] is False
+
+
+def test_the_next_line_names_the_recovery_and_is_the_same_sentence_in_json(workspace):
+    _guardrail_workspace(workspace)
+    board = build_flow(workspace)
+    command, why = board["next"].split(NEXT_SEP, 1)
+    assert command.startswith("engine.cli run --slug activity-probe --manifest ")
+    assert why, "the line carries the reason it is the next move"
+    # The verbs that look like recoveries are refused for a run whose state is the *runner's*
+    # checkpoint: `reassign`, `takeover` and `abort` all answer `no run found`, so none may be offered.
+    for refused in ("reassign", "takeover", "abort"):
+        assert refused not in board["next"]
+
+
+def test_no_next_move_is_offered_when_the_manifest_cannot_be_named(workspace):
+    """A command naming a file this workspace does not have is the refusal to come, not a next move."""
+    _write(workspace.state_dir, "run_state.json", json.dumps(_guardrail_state()))
+    board = build_flow(workspace)
+    assert board["next"] == ""
+    assert "missing summary" in board["headline"], "the reason is still said"
+    assert build_activity(workspace)["next_action"]["kind"] != "retry"
+
+
+# ── the vocabulary: what counts as a cause, and what a token means ────────────
+
+
+def test_only_the_stopping_actions_are_read_as_a_cause(workspace):
+    state = _guardrail_state()
+    state["log"] = [
+        {"step": 1, "node": "pm", "action": "contract-warning", "detail": "outputs not produced"},
+        {"step": 2, "node": "pm", "action": "guardrail", "detail": _GUARDRAIL_REASON},
+    ]
+    assert why_stopped("pm", state["nodes"]["pm"], state["log"]) == \
+        f"{_GLOSS}: {_GUARDRAIL_REASON}"
+    # A warning never stops a node, so it is not a cause — and the newest cause for the node wins.
+    assert "outputs not produced" not in why_stopped("pm", state["nodes"]["pm"], state["log"])
+    assert [stop["action"] for stop in stop_report(state["nodes"], state["log"])] == ["guardrail"]
+
+
+def test_a_stop_for_a_node_that_is_no_longer_stopped_is_not_promoted(workspace):
+    """The timeline is not a log dump: only a stop that is still in force belongs on it."""
+    state = _guardrail_state()
+    state["nodes"]["pm"] = {"status": "done", "verdict": "ok", "summary": "the PRD"}
+    _write(workspace.state_dir, "run_state.json", json.dumps(state))
+    assert stop_report(state["nodes"], state["log"]) == []
+    report = build_activity(workspace)
+    assert not any("refused at the edge" in e["title"] for e in report["timeline"])
+    assert "is stuck" not in report["headline"]
+
+
+def test_a_released_gate_is_not_counted_as_stuck(workspace):
+    """The runner keeps a gate's `awaiting_owner` verdict after a release; done means done."""
+    _write(workspace.state_dir, "run_state.json", json.dumps({
+        "nodes": {"release": {"status": "done", "verdict": "awaiting_owner"}}}))
+    assert build_flow(workspace)["counts"]["stuck"] == 0
+
+
+def test_the_guardrail_verdict_alone_still_counts_as_stuck(workspace):
+    """The app counts `verdict == "guardrail-blocked"`; the engine must not drop such a node."""
+    _write(workspace.state_dir, "run_state.json", json.dumps({
+        "nodes": {"pm": {"status": "pending", "verdict": "guardrail-blocked"}}}))
+    board = build_flow(workspace)
+    assert board["counts"]["stuck"] == 1
+    assert next(r for r in board["rows"] if r["node_id"] == "pm")["tone"] == "bad"
+
+
+def test_an_adopted_runs_node_list_does_not_break_the_board(workspace):
+    """The orchestrator writes `outcome.nodes` as a *list of ids* on an adopted run.
+
+    Reading that list as a table raised `'list' object has no attribute 'get'`, so a board that must
+    never error on an unfamiliar shape errored on one the engine itself writes. The nodes it can name —
+    here, the ones the plan declares — are the honest answer.
+    """
+    _write(workspace.state_dir, "run_state.json", json.dumps({
+        "run_id": "run_1", "slug": "activity-probe", "phase": "awaiting_approval",
+        "outcome": {"nodes": ["pm", "dev"]},
+        "plan": {"nodes": [{"id": "pm", "skill": "product-manager"},
+                           {"id": "dev", "skill": "backend-developer"}]},
+    }))
+    board = build_flow(workspace)
+    assert [row["node_id"] for row in board["rows"]] == ["pm", "dev"]
+    assert board["counts"]["waiting"] == 2
