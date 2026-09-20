@@ -53,7 +53,16 @@ from .diagnostics import Diagnostics
 from .gateway import BudgetExceeded, Gateway
 from .goal import Goal, GoalState
 from .mission import Mission, MissionError, MissionState, ObjectiveState
-from .host import HostError, RunnerHost, RunOutcome, RunnerState
+from .host import (
+    TERMINATION_ABORTED,
+    TERMINATION_DIED,
+    TERMINATION_SHUTDOWN,
+    TERMINATION_WEDGED,
+    HostError,
+    RunnerHost,
+    RunOutcome,
+    RunnerState,
+)
 from .idempotency import EffectJournal
 from .memory import MemoryEntry, MemoryStore, memory_entry_from_state
 from .org import (
@@ -93,6 +102,38 @@ _STOP_ACTIONS: dict[str, str] = {
     "contract": "a node's completion contract was violated",
     "error": "a node raised an error",
 }
+
+#: What a terminated run says about *why* it was terminated, keyed by the host's own vocabulary
+#: (`host.TERMINATION_*`). Imported rather than respelled, so the word the monitor reports and the
+#: word the summary prints cannot drift apart — a person who saw `wedged` in the UI must not read
+#: `stalled` here and wonder whether those are two different conditions.
+_TERMINATION_CLAUSES: dict[str, str] = {
+    TERMINATION_WEDGED: "the stall watchdog stopped the run",
+    TERMINATION_ABORTED: "the run was aborted by the Owner",
+    TERMINATION_SHUTDOWN: "the engine shut down and stopped the run",
+    TERMINATION_DIED: "the runner exited on its own while the run was being stopped",
+}
+
+
+def _termination_reason(outcome: Any) -> str:
+    """One line naming *why* a terminated run was terminated, with the host's evidence attached.
+
+    `killed` is a boolean that four different events set — the stall watchdog, the Owner's own abort,
+    an engine shutdown reaping the runner, and a process that died before it could be signalled — so a
+    summary that reads only the boolean can say only "the run was aborted". That sentence distinguishes
+    nothing and sends the reader to the checkpoint to guess whether the fix is a longer stall window, a
+    different model, or their own stop command.
+
+    The host records the cause and its detail; this turns them into the sentence. A cause the host did
+    not record falls back to the old wording rather than inventing one, because a summary that guesses
+    is worse than a summary that admits it does not know.
+    """
+    cause = str(getattr(outcome, "termination", "") or "")
+    detail = str(getattr(outcome, "termination_detail", "") or "").strip()
+    clause = _TERMINATION_CLAUSES.get(cause, "")
+    if not clause:
+        return "the run was aborted"
+    return f"{clause} — {detail}" if detail else clause
 
 
 def _derive_stop_reason(state: dict[str, Any], outcome: Any,
@@ -153,7 +194,7 @@ def _derive_stop_reason(state: dict[str, Any], outcome: Any,
         return f"{prefix}run ended: {reason}" + (f" — {detail}" if detail else "")
 
     if getattr(outcome, "killed", False):
-        return "the run was aborted"
+        return _termination_reason(outcome)
     error = str(getattr(outcome, "error", "") or "").strip()
     if error:
         return error
@@ -948,6 +989,11 @@ gated tier rather than the least"
                 "run_id": run.run_id, "stream": "stderr", "text": line[:500]}),
             heartbeat_s=float(self.config.concurrency.heartbeat_s),
             grace_s=float(self.config.concurrency.grace_s),
+            # The stall window is a configured bound like the other two, and it is passed here for the
+            # same reason: the host a *run* builds must use the number in the file. Left to the host's
+            # own resolution it would still be right, but naming it here is what makes the three
+            # supervision bounds read as one block rather than two configured and one inherited.
+            stall_timeout_s=float(self.config.concurrency.stall_timeout_s),
         )
         # Who recovers from a contract refusal is the goal's decision, so the posture sets the width
         # here — the one place the run's host is built. An unattended goal gets the bounded window
@@ -2387,6 +2433,18 @@ gated tier rather than the least"
                 "watchdog.restart": EventType.WATCHDOG_RESTART,
             }.get(event, EventType.AGENT_STATUS)
             self._emit(kind, {"run_id": run.run_id, "host_event": event, **payload})
+            # The *host* reports through the event bus, which writes the run's trace — not through
+            # `Diagnostics`, which is the other file a person reads. So a run the watchdog stopped
+            # left `diagnostics.jsonl` holding `run.prepared`, a `node.bind` and `run.phase: aborted`
+            # and nothing that said a watchdog had fired at all: the one channel that is supposed to
+            # explain a run was the one channel the explanation never reached. Recorded here, and
+            # warning-level because every one of these is a run being stopped and nobody is watching.
+            if event in ("watchdog.stall", "run.terminating", "watchdog.restart",
+                         "run.drain_incomplete"):
+                self.diagnostics.warning(
+                    event, message=str(payload.get("detail") or payload.get("action")
+                                      or payload.get("cause") or ""),
+                    detail=dict(payload), run_id=run.run_id)
             if sink is not None:
                 try:
                     sink(event, payload)
@@ -2406,10 +2464,19 @@ gated tier rather than the least"
             self.diagnostics.warning("memory.write.failed", message=str(exc))
 
     def _log_phase(self, run: Run) -> None:
-        """Record the phase transition, which is what the UI timeline reads."""
-        self.diagnostics.info("run.phase", message=f"{run.slug} is {run.phase.value}",
-                              detail={"outcome": run.outcome.get("outcome"),
-                                      "gate": run.gate.gate_id if run.gate else None})
+        """Record the phase transition, which is what the UI timeline reads.
+
+        The termination cause travels with it. `run.phase: aborted` alone is the record that sent a
+        person to the checkpoint to guess; the cause and its detail are what turn that line into an
+        answer — and for a stall, the window that expired is in the detail.
+        """
+        level = "warning" if run.phase in (RunPhase.ABORTED, RunPhase.FAILED) else "info"
+        self.diagnostics.log("run.phase", level=level, message=f"{run.slug} is {run.phase.value}",
+                             detail={"outcome": run.outcome.get("outcome"),
+                                     "termination": run.outcome.get("termination"),
+                                     "termination_detail": run.outcome.get("termination_detail"),
+                                     "stop_reason": run.stop_reason,
+                                     "gate": run.gate.gate_id if run.gate else None})
 
     def _active_chain(self) -> list[str]:
         """The delegation chain recorded for the current run."""

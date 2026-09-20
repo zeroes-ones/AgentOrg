@@ -17,6 +17,12 @@ DESIGN
 - **A heartbeat proves liveness, not activity.** A runner that is thinking and a runner that is wedged
   look identical from outside, so the host watches the *state file's* mtime and the process's own
   liveness rather than guessing from silence.
+- **The stall window is configured, not compiled in.** `concurrency.stall_timeout_s` is the bound on
+  how long a run may show no work at all, beside `heartbeat_s` and `grace_s`. It used to be a constant
+  in this module, which made a local model's first long reply indistinguishable from a hang and left
+  the person no setting to change; and whatever stops a run records *why* (`TERMINATION_*`), so the
+  summary names a stall, an Owner's abort, an engine shutdown or a runner that died — not one sentence
+  for all four.
 - **Preemption is forceful, in two steps.** SIGTERM, then SIGKILL after the grace period. The runner
   is deliberately *not* modified, and it installs no SIGTERM handler of its own, so SIGTERM ends it —
   it does not checkpoint. What makes that safe is the runner's per-node checkpoint file, so a
@@ -57,11 +63,30 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 __all__ = ["HostError", "RunHandle", "RunOutcome", "RunnerHost", "RunnerState",
-           "shutdown_runners"]
+           "TERMINATION_ABORTED", "TERMINATION_DIED", "TERMINATION_SHUTDOWN",
+           "TERMINATION_WEDGED", "shutdown_runners"]
 
 
 class HostError(RuntimeError):
     """Raised when the runner cannot be started or supervised."""
+
+
+# ── why a run was stopped ────────────────────────────────────────────────────
+#
+# Four different events set the same `killed` flag — the stall watchdog, the Owner's abort, an engine
+# shutdown reaping its runners, and a process that went away before it could be signalled — and the
+# summary used to report all four as "the run was aborted". That sentence distinguishes nothing and
+# sends the reader to the checkpoint to guess whether the fix is a longer window, a different model,
+# or their own stop command. The cause is recorded on the handle by whatever stopped the run, and
+# these are the words it uses.
+#
+# The stall is named `wedged` rather than something new: `RunnerHost.wedged()` already reports the
+# exact condition the watchdog fires on, so a person who saw `wedged` in the UI reads the same word in
+# the summary instead of a second vocabulary for one fact.
+TERMINATION_WEDGED = "wedged"      # the stall window expired with no observable work
+TERMINATION_ABORTED = "aborted"    # the Owner's own stop
+TERMINATION_SHUTDOWN = "shutdown"  # the engine stopped and reaped the runner
+TERMINATION_DIED = "died"          # the process was gone before it could be signalled
 
 
 # ── the live-runner registry ─────────────────────────────────────────────────
@@ -71,7 +96,7 @@ class HostError(RuntimeError):
 # the thing that has to find it at shutdown is whatever is running when the interpreter exits — which
 # is not necessarily the object that spawned it.
 
-_live_runners: dict[int, subprocess.Popen] = {}
+_live_runners: dict[int, tuple[subprocess.Popen, "RunHandle | None"]] = {}
 _live_lock = threading.Lock()
 _reaper_installed = False
 
@@ -106,6 +131,12 @@ class RunOutcome:
     killed: bool = False
     error: str = ""
     stderr_tail: str = ""
+    #: Why the host stopped this run, when it did — one of the `TERMINATION_*` words, empty for a run
+    #: that ended on its own. Carried out of the host because the stop reason the run persists is
+    #: derived from this outcome; a bare `killed` boolean is what made every stop read the same.
+    termination: str = ""
+    #: The evidence behind :attr:`termination` — for a stall, the silence and the window that expired.
+    termination_detail: str = ""
 
     @property
     def ok(self) -> bool:
@@ -132,6 +163,8 @@ class RunOutcome:
             "duration_s": round(self.duration_s, 3), "restarts": self.restarts,
             "killed": self.killed, "error": self.error, "ok": self.ok,
             "gated": self.gated, "broken": self.broken,
+            "termination": self.termination,
+            "termination_detail": self.termination_detail,
             "outcome": self.summary.get("outcome"),
             "steps_used": self.summary.get("steps_used"),
             "iterations": self.summary.get("iterations"),
@@ -155,6 +188,13 @@ class RunHandle:
     #: output, or a new trace entry. See `last_activity_s`.
     last_activity: float = 0.0
     killed: bool = False
+    #: Why this run was stopped, and the evidence for it. Set by whatever stopped it — the stall
+    #: watchdog, `abort`, the engine's shutdown reaper — and empty for a run nothing stopped. See the
+    #: `TERMINATION_*` words above: a `killed` flag on its own is a boolean four different events set,
+    #: which is what made a stall, an Owner's abort and an engine shutdown one indistinguishable
+    #: sentence in the summary.
+    termination: str = ""
+    termination_detail: str = ""
     stderr_lines: list[str] = field(default_factory=list)
     stdout_lines: list[str] = field(default_factory=list)
     #: The two pipe readers. Held here so the supervisor can wait for them *before* it reads the
@@ -234,11 +274,40 @@ def _last_stderr_cause(tail: str) -> str:
     return ""
 
 
-def _register_runner(process: subprocess.Popen) -> None:
-    """Record a live runner so the engine's own exit can reap it. Idempotent per pid."""
+def _note_termination(handle: "RunHandle | None", cause: str, detail: str = "") -> None:
+    """Record why a run is being stopped, first cause wins.
+
+    First cause rather than last, because the later ones are consequences: a shutdown that SIGKILLs a
+    run the watchdog had already stopped is still a stall, and overwriting it with `shutdown` would
+    hide the thing the person needs to act on in favour of the thing that merely finished it off.
+    """
+    if handle is None:
+        return
+    handle.termination = handle.termination or cause
+    if detail:
+        handle.termination_detail = _join_detail(handle.termination_detail, detail)
+
+
+def _join_detail(existing: str, addition: str) -> str:
+    """Append one clause to a termination detail, keeping the earlier one.
+
+    Both clauses are facts about one stop and they are not alternatives: how a process had to be
+    stopped is *part* of why it took this long, and dropping the first sentence to keep the second is
+    how a summary ends up naming a SIGKILL without mentioning what it was killing.
+    """
+    return f"{existing}; {addition}" if existing else addition
+
+
+def _register_runner(process: subprocess.Popen, handle: "RunHandle | None" = None) -> None:
+    """Record a live runner so the engine's own exit can reap it. Idempotent per pid.
+
+    The handle is carried alongside the process so the reaper can say *why* it stopped a run. Without
+    it, a shutdown killed a runner and left a checkpoint claiming an abort nobody could attribute —
+    the same defect the stall path had, one layer down.
+    """
     global _reaper_installed
     with _live_lock:
-        _live_runners[process.pid] = process
+        _live_runners[process.pid] = (process, handle)
         if _reaper_installed:
             return
         atexit.register(_reap_at_exit)
@@ -291,14 +360,18 @@ def shutdown_runners(*, grace_s: float = 2.0) -> list[int]:
     with _live_lock:
         live = list(_live_runners.values())
     pids: list[int] = []
-    for process in live:
+    for process, handle in live:
         if process.poll() is not None:
             _unregister_runner(process)
             continue
         pids.append(process.pid)
+        # Recorded before the signal, not after: the whole point is that the run's own checkpoint
+        # should say the engine stopped it, and an engine on its way out may not get another turn.
+        _note_termination(handle, TERMINATION_SHUTDOWN,
+                          "the engine shut down and stopped the run")
         _kill_group(process, signal.SIGTERM)
     deadline = time.time() + grace_s
-    for process in live:
+    for process, _handle in live:
         if process.pid not in pids:
             continue
         while process.poll() is None and time.time() < deadline:
@@ -327,7 +400,9 @@ class RunnerHost:
     Parameters
     ----------
     config:
-        Supplies the timeouts and the grace period.
+        Supplies the timeouts, the grace period and the stall window. A caller that passes none of
+        them still gets the configured values: `stall_timeout_s` of `None` resolves from
+        `concurrency.stall_timeout_s`.
     library:
         The pinned library, for the runner's path.
     workspace:
@@ -342,7 +417,7 @@ class RunnerHost:
                  on_stderr: Callable[[str], None] | None = None,
                  python: str | None = None,
                  heartbeat_s: float = 30.0, grace_s: float = 5.0,
-                 stall_timeout_s: float = 900.0) -> None:
+                 stall_timeout_s: float | None = None) -> None:
         self.config = config
         self.library = library
         # Accept a Workspace or a path. The orchestrator holds the former and a test the latter, and
@@ -357,7 +432,12 @@ class RunnerHost:
         self.python = python or sys.executable
         self.heartbeat_s = heartbeat_s
         self.grace_s = grace_s
-        self.stall_timeout_s = stall_timeout_s
+        # Resolved here rather than read at the stall check, so `command_surface()` and the watchdog
+        # cannot disagree about the window actually in force — the number a person is shown has to be
+        # the number that will stop their run. `None` means "ask the config", the same resolution
+        # `contract_rework()` uses, so a host built without one still honours the file.
+        self.stall_timeout_s = (self._configured_stall_timeout() if stall_timeout_s is None
+                                else float(stall_timeout_s))
         #: The explicit rework width, when the caller set one. `None` means "ask the config", which
         #: `contract_rework()` resolves — so an unconfigured host gets the conservative default.
         self._contract_rework: int | None = None
@@ -711,8 +791,9 @@ def classify(node_id, result, state):
             self._handle = handle
         # From here on the runner is this process's responsibility, including on the way out. Registered
         # before the first drain thread so there is no window in which the process exists and the
-        # shutdown path cannot see it.
-        _register_runner(process)
+        # shutdown path cannot see it — and with its handle attached, so a reap from either side can
+        # record who stopped the run and why.
+        _register_runner(process, handle)
 
         self._emit("run.start", {"run_id": run_id, "workflow": workflow,
                                  "pid": process.pid, "args": args[1:6]})
@@ -735,7 +816,12 @@ def classify(node_id, result, state):
             # alive here is one nothing is supervising any more, so it is terminated rather than left.
             self._join_drains(handle)
             if handle.alive:
-                self._terminate(handle, force=True)
+                # The run is being stopped by the host itself, outside any policy or command: the
+                # supervisor is unwinding, so nothing is watching this process any more. Recorded as a
+                # shutdown rather than an abort, because "the Owner aborted it" would be false and the
+                # whole point of carrying the cause is that the summary does not say false things.
+                self._terminate(handle, force=True, cause=TERMINATION_SHUTDOWN,
+                                detail="the host stopped supervising the run")
                 try:
                     handle.process.wait(timeout=1.0)
                 except (subprocess.TimeoutExpired, OSError):
@@ -793,15 +879,25 @@ def classify(node_id, result, state):
                 handle.state = RunnerState.RUNNING
                 self._emit("run.resumed", {"run_id": handle.run_id})
 
-            if handle.last_activity_s() > self.stall_timeout_s:
+            if self._liveness_state(handle) == TERMINATION_WEDGED:
                 # A long silence from a live process *with no sign of work at all* is the wedge the
                 # watchdog exists to catch. The checkpoint alone is not that signal — it is written per
                 # node, so one long node looks identical to a hang, and killing a working run is the
                 # worst outcome available: it discards real work and calls it a stall.
+                #
+                # The condition and the word come from `_liveness_state`, the same ladder `wedged()`
+                # reports, so the run is stopped on exactly the state a person was already being shown
+                # and the cause recorded below is that state's own name.
+                silence = round(handle.last_activity_s(), 1)
                 self._emit("watchdog.stall", {"run_id": handle.run_id, "pid": handle.pid,
-                                              "silence_s": round(handle.last_activity_s(), 1),
+                                              "liveness": TERMINATION_WEDGED,
+                                              "silence_s": silence,
+                                              "stall_timeout_s": self.stall_timeout_s,
                                               "checkpoint_age_s": round(handle.state_age_s(), 1)})
-                self._terminate(handle, force=True)
+                self._terminate(handle, force=True, cause=TERMINATION_WEDGED,
+                                detail=(f"no checkpoint, trace or output for {silence:.0f}s, past the "
+                                        f"{self.stall_timeout_s:.0f}s stall window "
+                                        f"(concurrency.stall_timeout_s)"))
                 break
 
         exit_code = handle.process.wait()
@@ -812,6 +908,8 @@ def classify(node_id, result, state):
         outcome.exit_code = exit_code
         outcome.restarts = handle.restarts
         outcome.killed = handle.killed
+        outcome.termination = handle.termination
+        outcome.termination_detail = handle.termination_detail
         outcome.duration_s = time.time() - started
         outcome.stderr_tail = "\n".join(handle.stderr_lines[-30:])
         outcome.summary = self._read_summary(handle)
@@ -928,25 +1026,44 @@ def classify(node_id, result, state):
             handle = self._handle
         if handle is None:
             return False
-        self._terminate(handle, force=False)
+        # Recorded as the Owner's own stop, so the summary can say so. Without a cause every stop read
+        # as "the run was aborted", and a person who had pressed Stop could not tell their own action
+        # from a watchdog that had fired at the same moment.
+        self._terminate(handle, force=False, cause=TERMINATION_ABORTED)
         return True
 
-    def _terminate(self, handle: RunHandle, *, force: bool) -> None:
+    def _terminate(self, handle: RunHandle, *, force: bool, cause: str = TERMINATION_ABORTED,
+                   detail: str = "") -> None:
         """Signal the process group, escalating to SIGKILL after the grace period.
 
         The whole process group is signalled rather than the process alone, so a provider subprocess or
         a tool the runner spawned does not outlive the run.
+
+        `cause` is *why* the caller is stopping the run, and it is what the summary will report; the
+        escalation below appends to `detail` rather than replacing it, so a stop that needed a SIGKILL
+        still says what it was stopping.
         """
         if not handle.alive:
+            # Nothing to signal: the process went between the caller's liveness check and here. The
+            # cause recorded is `died`, not what the caller asked for — the sentence a person reads
+            # should describe what happened, and "the Owner aborted it" would name an action nobody
+            # took. `killed` is deliberately left alone, matching the old behaviour: this call did not
+            # kill anything, so the run is reported by whatever actually ended it.
+            _note_termination(handle, TERMINATION_DIED,
+                              "the runner exited before it could be signalled")
             return
+        _note_termination(handle, cause, detail)
         handle.state = RunnerState.TERMINATING
-        self._emit("run.terminating", {"run_id": handle.run_id, "pid": handle.pid, "force": force})
+        self._emit("run.terminating", {"run_id": handle.run_id, "pid": handle.pid, "force": force,
+                                       "cause": handle.termination,
+                                       "termination_detail": handle.termination_detail})
         try:
             self._signal_group(handle, signal.SIGTERM)
         except (OSError, ProcessLookupError):
             handle.killed = True
             return
-        deadline = time.time() + (0.5 if force else self.grace_s)
+        sent_at = time.time()
+        deadline = sent_at + (0.5 if force else self.grace_s)
         while handle.alive and time.time() < deadline:
             time.sleep(0.1)
         if handle.alive:
@@ -955,7 +1072,11 @@ def classify(node_id, result, state):
             except (OSError, ProcessLookupError):
                 pass
             handle.killed = True
+            handle.termination_detail = _join_detail(
+                handle.termination_detail,
+                f"it ignored SIGTERM for {time.time() - sent_at:.1f}s and was SIGKILLed")
             self._emit("watchdog.restart", {"run_id": handle.run_id, "pid": handle.pid,
+                                            "cause": handle.termination,
                                             "action": "SIGKILL after the grace period"})
         else:
             handle.killed = True
@@ -978,6 +1099,23 @@ def classify(node_id, result, state):
 
     # ── liveness ────────────────────────────────────────────────────────────
 
+    def _liveness_state(self, handle: RunHandle) -> str:
+        """The monitor's own word for how a run is behaving: the `alive → slow → warned → wedged` ladder.
+
+        One ladder in one place, because the watchdog terminates a run on exactly the condition that
+        makes this return `wedged` — so the state a person was already being shown and the cause
+        recorded when the run is stopped are the same fact, not two vocabularies for it.
+
+        `slow` and `warned` are not terminations: they are the run being reported as falling behind, so
+        that a window set too tight is visible as a warning before it becomes a kill.
+        """
+        silence = handle.last_activity_s()
+        if silence <= self.heartbeat_s:
+            return "alive"
+        if silence <= self.heartbeat_s * 2:
+            return "slow"
+        return "warned" if silence <= self.stall_timeout_s else TERMINATION_WEDGED
+
     def wedged(self) -> dict[str, Any] | None:
         """The current run's liveness, or None when nothing is running.
 
@@ -989,13 +1127,11 @@ def classify(node_id, result, state):
             handle = self._handle
         if handle is None:
             return None
-        state = "alive" if handle.last_activity_s() <= self.heartbeat_s else (
-            "slow" if handle.last_activity_s() <= self.heartbeat_s * 2 else
-            "warned" if handle.last_activity_s() <= self.stall_timeout_s else "wedged")
         return {
             "run_id": handle.run_id, "pid": handle.pid, "alive": handle.alive,
-            "state": state, "silence_s": round(handle.last_activity_s(), 1),
+            "state": self._liveness_state(handle), "silence_s": round(handle.last_activity_s(), 1),
             "checkpoint_age_s": round(handle.state_age_s(), 1),
+            "stall_timeout_s": self.stall_timeout_s,
             "restarts": handle.restarts,
         }
 
@@ -1041,6 +1177,26 @@ def classify(node_id, result, state):
             section = getattr(self.config, "executor", None) if self.config is not None else None
             return max(0, int(getattr(section, "contract_rework", 0) or 0))
         return max(0, int(self._contract_rework))
+
+    def _configured_stall_timeout(self) -> float:
+        """The stall window from the config, for a host the caller did not hand one to.
+
+        `concurrency.stall_timeout_s` is where the knob lives — beside `heartbeat_s` and `grace_s`,
+        the two other supervision bounds — so the number a person tunes is one they can find, and the
+        host a CLI run builds with no argument honours the file rather than a constant compiled into
+        this module.
+
+        A `config` of `None` is a real case (the lifetime tests build a host with no configuration at
+        all), and so is a plain `SimpleNamespace` standing in for one: both get the same default the
+        dataclass declares, rather than an exception out of a supervisor.
+        """
+        section = getattr(self.config, "concurrency", None) if self.config is not None else None
+        value = getattr(section, "stall_timeout_s", None)
+        try:
+            resolved = float(value)
+        except (TypeError, ValueError):
+            return 1800.0
+        return resolved if resolved > 0 else 1800.0
 
     def with_contract_rework(self, attempts: int | None) -> "RunnerHost":
         """Return this host with the rework window set explicitly.

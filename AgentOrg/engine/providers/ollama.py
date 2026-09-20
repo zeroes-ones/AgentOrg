@@ -116,8 +116,11 @@ class OllamaProvider(Provider):
             options["num_predict"] = request.max_tokens
         if request.stop:
             options["stop"] = request.stop
-        if request.json_mode:
-            options["format"] = "json"
+        # `format` is a *top-level* field of `/api/chat`, not a member of `options`. It used to be set
+        # inside `options`, where Ollama silently ignores it — verified against a live server: a prompt
+        # asking for prose came back as prose with `format` in `options` and as a JSON object with it
+        # top-level. So `json_mode` was inert on the one provider whose models most need it, which is
+        # the provider a local, small model runs on.
 
         body: dict[str, Any] = {
             "model": request.model,
@@ -127,6 +130,8 @@ class OllamaProvider(Provider):
         }
         if options:
             body["options"] = options
+        if request.json_mode:
+            body["format"] = "json"
         if request.tools:
             body["tools"] = [
                 {"type": "function",

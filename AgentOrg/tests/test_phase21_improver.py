@@ -17,6 +17,8 @@ anything pass, so a system whose safety is enforced by code it may rewrite does 
 
 from __future__ import annotations
 
+import difflib
+import hashlib
 import json
 import pathlib
 import sys
@@ -231,8 +233,15 @@ def test_detection_survives_a_corrupt_spans_file(tmp_path):
 
 
 class _Outcome:
-    def __init__(self, name, passed):
-        self.name, self.passed = name, passed
+    """A stub outcome with the fields the real `Outcome` carries.
+
+    `error` in particular: the baseline gate formats a failing outcome's error, so a stub without one
+    would make the comparison raise and the failure would be about the stub rather than the rule.
+    """
+
+    def __init__(self, name, passed, error=""):
+        self.name, self.passed, self.error = name, passed, error
+        self.check, self.detail = "stub", ""
 
 
 class _Result:
@@ -405,6 +414,305 @@ def test_a_suite_that_cannot_run_is_not_a_passed_suite(tmp_path):
     assert not validation.ran
     assert not validation.ok
     assert "broken" in validation.detail
+
+
+# ── validate: the patch is applied to a scratch copy, and only there ─────────
+#
+# The loop could not promote anything real until these existed: the suite ran against the tree as it
+# stood, so no patch could be said to have *caused* anything. These tests pin the two halves of the
+# fix — the patch really is applied somewhere, and that somewhere is never the working tree.
+
+
+def _mini_repo(tmp_path, *, body="value = 1\n"):
+    """A throwaway tree for the loop to copy: one file a patch can aim at, and nothing else."""
+    repo = tmp_path / "mini"
+    (repo / "engine").mkdir(parents=True, exist_ok=True)
+    (repo / "engine" / "prompts.py").write_text(body, encoding="utf-8")
+    return repo
+
+
+def _patch(old, new):
+    """A unified diff of the shape the improver drafts: one hunk, one file, `b/` prefixed."""
+    return ("--- a/engine/prompts.py\n+++ b/engine/prompts.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            f"-{old}\n"
+            f"+{new}\n")
+
+
+def _fingerprint(root):
+    """Every file under `root` by sha256, so a write anywhere shows up as a difference."""
+    return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def _finding(scenario="loop-termination"):
+    return Finding(kind="stagnant_loop", path="engine/prompts.py", subject="reviser",
+                   detail="the loop turns without converging", scenario=scenario)
+
+
+def test_a_patch_that_flips_a_named_scenario_is_applied_in_a_scratch_copy(tmp_path, monkeypatch):
+    """The load-bearing behaviour: the patch is applied to a real copy, the suite runs against the
+    patched code *there*, and only then is a flip claimed.
+
+    The stub suite reads the copy's own file, so this cannot pass on the machinery merely existing —
+    a flip is reported only if the patch actually landed in the copy.
+    """
+    _baseline_file(tmp_path, monkeypatch, {"loop-termination": {"passed": False}})
+    repo = _mini_repo(tmp_path, body="value = 1\n")
+    seen: list[pathlib.Path] = []
+
+    def suite(root):
+        seen.append(pathlib.Path(root))
+        patched = (pathlib.Path(root) / "engine" / "prompts.py").read_text(
+            encoding="utf-8") == "value = 2\n"
+        return _Result([_Outcome("loop-termination", patched)])
+
+    improver = Improver(workspace=_workspace(tmp_path), repo_root=repo, scratch_suite=suite)
+    improver.draft_fn = lambda f: ("restore the loop bound", _patch("value = 1", "value = 2"),
+                                   ["engine/prompts.py"])
+    proposal = improver.draft(_finding())
+    validation = improver.validate(proposal)
+
+    assert validation.ran and validation.patched_in_scratch
+    assert validation.improved == ["loop-termination"]
+    assert validation.regressions == []
+    assert validation.ok
+    assert len(seen) == 2, "the suite runs once without the patch and once with it"
+    assert seen[0] == seen[1], "both runs are the same scratch copy"
+    assert not seen[0].exists(), "the copy is removed when validation finishes"
+    assert (repo / "engine" / "prompts.py").read_text(encoding="utf-8") == "value = 1\n", (
+        "only the copy was written to")
+
+    path = improver.promote(proposal)
+    assert path is not None
+    assert "scratch copy" in path.read_text(encoding="utf-8"), (
+        "a reader has to be told the suite ran against a patched copy")
+
+
+def test_a_proposal_with_no_patch_builds_no_scratch_copy(tmp_path, monkeypatch):
+    """Nothing to apply means nothing can have been caused, so no copy is built and the reason is
+    named rather than left as a bare "no improvement"."""
+    # A stub baseline with only the named scenario in it: the real one has 17 entries, and a run that
+    # covers one of them would be read as 16 lost-coverage regressions rather than as this check.
+    _baseline_file(tmp_path, monkeypatch, {"loop-termination": {"passed": True}})
+
+    def _never(root):
+        raise AssertionError("a scratch copy was built for a proposal carrying no patch")
+
+    improver = Improver(workspace=_workspace(tmp_path), scratch_suite=_never,
+                        run_suite=lambda **k: _Result([_Outcome("loop-termination", True)]))
+    proposal = improver.draft(_finding())          # no draft_fn: described, not patched
+    assert proposal.patch == ""
+
+    validation = improver.validate(proposal)
+    assert validation.ran and not validation.patched_in_scratch
+    assert validation.improved == []
+    assert not validation.ok
+    assert "no patch to apply" in validation.detail
+    assert improver.promote(proposal) is None
+
+
+def test_a_patch_aimed_at_a_safety_surface_is_refused_at_validation_too(tmp_path):
+    """The patch is what lands, so the patch is what the boundary is checked against. A `touches` list
+    that disagreed with the diff would be exactly the disagreement a check must not trust — and the
+    refusal must come before a copy is made, not after."""
+    def _never(root):
+        raise AssertionError("a scratch copy was built for a patch aimed at the judging machinery")
+
+    improver = Improver(workspace=_workspace(tmp_path), repo_root=_mini_repo(tmp_path),
+                        scratch_suite=_never)
+    proposal = improver.draft(_finding())
+    assert proposal.state == "drafted", "the draft check passes a path that looks ordinary"
+    assert proposal.touches == ["engine/prompts.py"]
+    proposal.patch = ("--- a/engine/evals/runner.py\n+++ b/engine/evals/runner.py\n"
+                      "@@ -1,1 +1,1 @@\n-CHECKS = {}\n+CHECKS = None\n")
+
+    validation = improver.validate(proposal)
+    assert not validation.ran and not validation.patched_in_scratch
+    assert "engine/evals/runner.py" in validation.detail
+    assert "not configurable" in validation.detail
+    assert not validation.ok
+    assert improver.promote(proposal) is None
+    assert proposal.state == "rejected"
+
+
+def test_a_patch_that_does_not_apply_is_refused_intact(tmp_path):
+    """A drifted patch is refused whole rather than half-applied, and the copy goes either way."""
+    repo = _mini_repo(tmp_path, body="value = 7\n")
+    seen: list[pathlib.Path] = []
+
+    def suite(root):
+        seen.append(pathlib.Path(root))
+        return _Result([_Outcome("loop-termination", False)])
+
+    improver = Improver(workspace=_workspace(tmp_path), repo_root=repo, scratch_suite=suite)
+    improver.draft_fn = lambda f: ("restore the loop bound", _patch("value = 1", "value = 2"),
+                                   ["engine/prompts.py"])
+    validation = improver.validate(improver.draft(_finding()))
+
+    assert not validation.patched_in_scratch and not validation.ok
+    assert "does not apply" in validation.detail
+    assert (repo / "engine" / "prompts.py").read_text(encoding="utf-8") == "value = 7\n"
+    assert seen and not seen[0].exists()
+
+
+def test_a_patch_that_breaks_the_engine_is_not_read_as_a_run(tmp_path):
+    """A patch that stops the suite from running at all is reported as *unmeasurable*, not as a run
+    with no failures — the suite's own rule, applied to the scratch copy. Read as a run it would look
+    like lost coverage, and the cause (the patch broke the engine) would go unnamed."""
+    target = ROOT / "engine" / "planner.py"
+    original = target.read_text(encoding="utf-8")
+    changed = original + "def broken(:\n"
+    patch = "".join(difflib.unified_diff(original.splitlines(keepends=True),
+                                         changed.splitlines(keepends=True),
+                                         fromfile="a/engine/planner.py",
+                                         tofile="b/engine/planner.py"))
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+
+    improver = Improver(workspace=_workspace(tmp_path))     # the real repo and the real runner
+    proposal = improver.draft(_finding())
+    proposal.patch = patch
+    validation = improver.validate(proposal)
+
+    assert not validation.ran and not validation.patched_in_scratch
+    assert not validation.ok
+    assert "not validated" in validation.detail
+    assert "no scenario" in validation.detail, "the run says what it could not do"
+    assert "SyntaxError" in validation.detail, "the reason the suite never ran is named"
+    assert hashlib.sha256(target.read_bytes()).hexdigest() == digest
+
+
+def test_a_flip_the_patch_did_not_cause_is_not_an_improvement(tmp_path, monkeypatch):
+    """A baseline can be stale. When the named scenario already passes without the patch, the patch
+    has changed nothing about it and must not be credited — the same misattribution as counting an
+    already-passing scenario."""
+    _baseline_file(tmp_path, monkeypatch, {"loop-termination": {"passed": False}})
+    improver = Improver(workspace=_workspace(tmp_path), repo_root=_mini_repo(tmp_path),
+                        scratch_suite=lambda root: _Result([_Outcome("loop-termination", True)]))
+    improver.draft_fn = lambda f: ("tidy a comment", _patch("value = 1", "value = 2"),
+                                   ["engine/prompts.py"])
+    validation = improver.validate(improver.draft(_finding()))
+
+    assert validation.patched_in_scratch
+    assert validation.improved == []
+    assert not validation.ok
+    assert "already passes against the unpatched tree" in validation.detail
+
+
+def test_a_patch_that_regresses_the_suite_is_not_promoted(tmp_path, monkeypatch):
+    """The regression gate is applied to the run *in the copy*: a patch that trades one scenario for
+    another is refused, whatever it claims to improve, because the gate compares against the frozen
+    baseline rather than against the proposal's own story."""
+    _baseline_file(tmp_path, monkeypatch, {"loop-termination": {"passed": True}})
+    calls = {"n": 0}
+
+    def suite(root):
+        calls["n"] += 1
+        return _Result([_Outcome("loop-termination", calls["n"] == 1)])
+
+    improver = Improver(workspace=_workspace(tmp_path), repo_root=_mini_repo(tmp_path),
+                        scratch_suite=suite)
+    improver.draft_fn = lambda f: ("break something else", _patch("value = 1", "value = 2"),
+                                   ["engine/prompts.py"])
+    proposal = improver.draft(_finding())
+    validation = improver.validate(proposal)
+
+    assert validation.patched_in_scratch
+    assert any("loop-termination" in r for r in validation.regressions)
+    assert validation.improved == []
+    assert not validation.ok
+    assert "1 regression(s)" in validation.detail
+    assert improver.promote(proposal) is None
+    assert proposal.state == "rejected"
+
+
+def test_a_comparison_that_cannot_be_made_is_not_a_pass(tmp_path):
+    """The regression check is part of the gate, so a comparison that raised must not read as "nothing
+    regressed" — swallowing it is the one direction that lets a change through unexamined."""
+    class _Thin:
+        name, passed = "loop-termination", False       # enough to break the comparison's formatting
+
+    improver = Improver(workspace=_workspace(tmp_path),
+                        run_suite=lambda **k: _Result([_Thin()]))
+    finding = Finding(kind="stagnant_loop", path=".agentorg/skills/", subject="x", detail="y",
+                      scenario="loop-termination")
+    validation = improver.validate(improver.draft(finding))
+    assert validation.regressions, "a comparison that could not run must be reported"
+    assert "could not be compared" in validation.regressions[0]
+    assert not validation.ok
+
+
+def test_the_scratch_copy_is_removed_even_when_the_suite_raises(tmp_path, monkeypatch):
+    """Every path out deletes the temporary copy, including the one where the suite itself breaks."""
+    _baseline_file(tmp_path, monkeypatch, {"loop-termination": {"passed": False}})
+    seen: list[pathlib.Path] = []
+
+    def suite(root):
+        seen.append(pathlib.Path(root))
+        raise RuntimeError("the suite is broken")
+
+    improver = Improver(workspace=_workspace(tmp_path), repo_root=_mini_repo(tmp_path),
+                        scratch_suite=suite)
+    improver.draft_fn = lambda f: ("restore the loop bound", _patch("value = 1", "value = 2"),
+                                   ["engine/prompts.py"])
+    validation = improver.validate(improver.draft(_finding()))
+
+    assert seen, "the copy was made and the suite was run in it"
+    assert not validation.ran and not validation.patched_in_scratch
+    assert not validation.ok
+    assert "broken" in validation.detail
+    assert not seen[0].exists(), "the copy survives a suite that failed"
+    assert not seen[0].parent.exists(), "the temp directory goes too, not just the tree"
+
+
+def test_a_validation_run_leaves_the_tree_it_copied_byte_identical(tmp_path, monkeypatch):
+    """The claim that makes validating safe, asserted rather than assumed: the tree the patch
+    describes is byte-for-byte what it was, whatever the run decided."""
+    _baseline_file(tmp_path, monkeypatch, {"loop-termination": {"passed": False}})
+    repo = _mini_repo(tmp_path, body="value = 1\n")
+    (repo / "engine" / "other.py").write_text("other = 1\n", encoding="utf-8")
+    before = _fingerprint(repo)
+
+    improver = Improver(workspace=_workspace(tmp_path), repo_root=repo,
+                        scratch_suite=lambda root: _Result([_Outcome("loop-termination", True)]))
+    improver.draft_fn = lambda f: ("restore the loop bound", _patch("value = 1", "value = 2"),
+                                   ["engine/prompts.py"])
+    validation = improver.validate(improver.draft(_finding()))
+
+    assert validation.patched_in_scratch, "the run has to have written somewhere, or it proves nothing"
+    assert _fingerprint(repo) == before, "a validation wrote to the tree it was validating"
+
+
+def test_a_real_validation_runs_against_a_copy_of_the_repo(tmp_path):
+    """The real tree, the real suite, the real runner — and the patch applied somewhere that is not
+    the repo. The file it names is byte-identical afterwards and the suite still passes in the copy,
+    which is what "validated in a scratch copy" has to mean to be worth anything.
+
+    The patch is built from the file's own bytes so it applies whatever else is in flight; a
+    hand-written hunk would drift and the test would fail for the wrong reason.
+    """
+    target = ROOT / "engine" / "prompts.py"
+    original = target.read_text(encoding="utf-8")
+    assert original.endswith("\n"), "the fixture assumes a newline-terminated file"
+    changed = original + "# a proposal-shaped change: a comment no scenario can notice\n"
+    patch = "".join(difflib.unified_diff(original.splitlines(keepends=True),
+                                         changed.splitlines(keepends=True),
+                                         fromfile="a/engine/prompts.py",
+                                         tofile="b/engine/prompts.py"))
+    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+
+    improver = Improver(workspace=_workspace(tmp_path))
+    proposal = improver.draft(_finding())
+    proposal.patch = patch
+    validation = improver.validate(proposal)
+
+    assert validation.ran and validation.patched_in_scratch, validation.detail
+    assert validation.regressions == [], validation.detail
+    assert validation.improved == [], "the shipped baseline already records every scenario passing"
+    assert not validation.ok
+    assert "nothing flipped" in validation.detail
+    assert hashlib.sha256(target.read_bytes()).hexdigest() == digest, (
+        "the working tree was written to by a validation")
 
 
 # ── promote: the Owner decides ───────────────────────────────────────────────

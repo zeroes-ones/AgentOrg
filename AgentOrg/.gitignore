@@ -2,6 +2,11 @@
 # Real credentials never enter the repository. credentials.example.json is the
 # committed template; credentials.json holds live keys and stays local.
 credentials.json
+# ...and so does everything the writer puts beside it. `_keep_previous` keeps the last
+# document as `credentials.json.bak` before replacing it, and the atomic write uses
+# `credentials.json.<...>.tmp` — both hold the same live keys, so a rule matching only the
+# exact name would let the backup of a secret into the repository.
+credentials.json.*
 
 # ── Runtimes ─────────────────────────────────────────────────────────────────
 __pycache__/

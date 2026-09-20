@@ -241,7 +241,7 @@ supply-chain sense: a modified `SKILL.md` is modified system-prompt content. So:
 | `test_phase18_subagents.py` | 36 | Isolated children: own session, shared prefix, durable transcripts, byte paging that reports truncation, depth and budget bounds |
 | `test_phase19_providers.py` | 38 | Custom headers on every dialect, and the credentials writer: merge not replace, mode 0600, never invent a path |
 | `test_phase20_roster.py` | 26 |
-| `test_phase21_improver.py` | 31 | The self-improvement loop: measurement not opinion, a baseline delta as the only proof, and the safety boundary that refuses anything touching its own judging machinery | Hiring and editing: the id (and so the history) survives an edit, save and load agree on one path |
+| `test_phase21_improver.py` | 43 | The self-improvement loop: measurement not opinion, a baseline delta as the only proof, a patch validated by being applied to a scratch copy while the working tree stays byte-identical, and the safety boundary that refuses anything touching its own judging machinery | Hiring and editing: the id (and so the history) survives an edit, save and load agree on one path |
 | `test_phase26_portfolio.py` | 24 | The register: the principal, org identity that survives a rename, and a portfolio that runs and spends nothing |
 | `test_phase27_fleet.py` | 19 | Several orgs at once: lazy load, per-org isolation, the global ceiling and per-org budget, and every refusal named |
 | `test_phase22_activity.py` | 12 | The "what is happening" report: a blocked run explains itself, a gate becomes a decision, the timeline is bounded and deduped, a fresh workspace reads calmly |

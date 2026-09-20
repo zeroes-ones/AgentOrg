@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from engine.config import load
+from engine.config import Config, ProviderConfig, load
 from engine.library import resolve
 from engine.org import (
     S_INVARIANTS,
@@ -1023,9 +1023,39 @@ def test_all_six_invariants_are_documented():
 # ── scheduler ────────────────────────────────────────────────────────────────
 
 
+@pytest.fixture(scope="module")
+def scheduler_config():
+    """The config the scheduler tests run against, built here rather than read from disk.
+
+    These tests used to take the module's `config` fixture, which is `load()` — and `load()` prefers
+    the developer's own `credentials.json`. Whether a local provider ends up limited to one then
+    depended on that file: the shipped `credentials.example.json` declares `ollama` at concurrency 1,
+    but a real file that leaves the field out gets the `ProviderConfig` default of 2, the loader
+    copies that into `per_provider_limits`, and the scheduler's local default of 1 is bypassed — so a
+    test asserting that a second ollama ticket *queues* instead ran both immediately. A test that
+    goes red when someone's config changes is not testing the scheduler, so the config is supplied
+    here.
+
+    `ollama` is deliberately given a `concurrency` above 1 with **no** explicit
+    `per_provider_limits` entry, so the assertion is about the scheduler's own local-provider default
+    rather than a value the config already declared. `openai` is present so the backpressure tests
+    have a cloud provider with room to shrink toward.
+    """
+    return Config(
+        providers={
+            "ollama": ProviderConfig(id="ollama", kind="ollama",
+                                     base_url="http://localhost:11434", concurrency=4),
+            "openai": ProviderConfig(id="openai", kind="openai",
+                                     base_url="https://api.openai.com/v1", concurrency=4),
+        },
+        known_models={},
+        catalog={},
+    )
+
+
 @pytest.fixture
-def scheduler(config):
-    return Scheduler(config=config, caps=detect(), local_models_in_use=1,
+def scheduler(scheduler_config):
+    return Scheduler(config=scheduler_config, caps=detect(), local_models_in_use=1,
                      local_model_ids=["qwen2.5-coder:7b"])
 
 
@@ -1060,8 +1090,8 @@ def test_release_drains_the_queue(scheduler):
     assert scheduler.stats()["running"] >= 1
 
 
-def test_queue_is_bounded_and_sheds_explicitly(config):
-    sched = Scheduler(config=config, caps=detect())
+def test_queue_is_bounded_and_sheds_explicitly(scheduler_config):
+    sched = Scheduler(config=scheduler_config, caps=detect())
     sched.queue_max_depth = 2
     sched.admit(ticket_id="run", agent_id="a0", provider="ollama")
     for i in range(2):
@@ -1075,10 +1105,10 @@ def test_queue_is_bounded_and_sheds_explicitly(config):
     assert sched.shed_log(), "shed work must be visible, never silently dropped"
 
 
-def test_higher_priority_preempts_lower_in_a_full_queue(config):
+def test_higher_priority_preempts_lower_in_a_full_queue(scheduler_config):
     from engine.org.scheduler import Priority
 
-    sched = Scheduler(config=config, caps=detect())
+    sched = Scheduler(config=scheduler_config, caps=detect())
     sched.queue_max_depth = 2
     sched.admit(ticket_id="run", agent_id="a0", provider="ollama")
     sched.admit(ticket_id="q0", agent_id="a1", provider="ollama", priority=Priority.NEW_WORK)

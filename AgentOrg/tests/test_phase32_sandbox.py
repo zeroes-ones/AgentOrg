@@ -37,6 +37,7 @@ import pathlib
 import signal
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -994,3 +995,239 @@ def test_the_per_run_plugin_files_do_not_leak(tmp_path):
     leftovers += sorted(path.name for path in workspace.glob("*.tmp.*"))
     assert leftovers == [], f"the run left its plugin files behind: {leftovers}"
     assert not list((workspace / ".agent_state").glob("*.tmp.*"))
+
+# ── the stall window, and the reason a stopped run gives ─────────────────────
+#
+# Both halves of the same report, reproduced with a real goal:
+#
+#     AGENTORG_CREDENTIALS=…/ollama-creds.json python3 -u -m engine.cli run \
+#         --goal "create a file notes.md …" --root /tmp/finishprobe --slug probe --posture unattended
+#
+#     outcome : failed   steps : None   phase : aborted   stopped : the run was aborted
+#
+# 901 seconds against `stall_timeout_s: 900.0`, a window compiled into `engine/host.py` that no
+# configuration could raise — so an engine that supports a local model supervised as though every
+# model answered in seconds, and a person running one got an abort with no cause and no setting.
+#
+# The abort itself was correct. What is tested here is that the window is now the person's number and
+# that whatever stops a run says *which* of four things it was.
+
+#: A runner that does nothing at all: no output, no checkpoint, no trace. It is the wedge the watchdog
+#: exists to catch, and it is what a model reply that never returns looks like from outside — the
+#: executor writes a trace entry when a call *returns*, so a call still generating is silence.
+_SILENT_RUNNER = '''#!/usr/bin/env python3
+import time
+
+while True:
+    time.sleep(0.2)
+'''
+
+
+def _library_for(tmp_path, fake: pathlib.Path):
+    return SimpleNamespace(files=SimpleNamespace(runner=fake, root=fake.parent))
+
+
+def _workspace_for(tmp_path, name: str = "stall"):
+    workspace = tmp_path / "projects" / name
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "m.yaml").write_text("name: probe\nstart: dev\nnodes:\n  - id: dev\n")
+    (workspace / ".agent_state").mkdir(parents=True, exist_ok=True)
+    return workspace
+
+
+def _config_with(tmp_path, **overrides):
+    """The example credentials with the `concurrency` block edited, loaded through the real loader.
+
+    Loaded from the *file* rather than built in memory, because the question is whether the setting
+    reaches the host — a `ConcurrencyConfig` constructed by hand would prove the dataclass and not the
+    path a person actually uses.
+    """
+    document = json.loads((ROOT / "credentials.example.json").read_text(encoding="utf-8"))
+    document["concurrency"].update(overrides)
+    path = tmp_path / "credentials.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return load(path)
+
+
+def test_the_stall_window_comes_from_the_config_file(tmp_path):
+    """The window is a setting, not a constant in `host.py`.
+
+    Before this, `RunnerHost.stall_timeout_s` defaulted to 900 and nothing read the config: a person
+    whose local model was slower than that had no way to say so, and the abort they got could not be
+    explained by any file they could read. `command_surface()` reports the number actually in force,
+    which is the one they need to see.
+    """
+    config = _config_with(tmp_path, stall_timeout_s=1800)
+    assert config.concurrency.stall_timeout_s == 1800
+
+    fake = tmp_path / "fake_runner.py"
+    fake.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+    host = RunnerHost(config=config, library=_library_for(tmp_path, fake),
+                      workspace=_workspace_for(tmp_path, "from-config"))
+
+    assert host.stall_timeout_s == 1800, "the host must take the window from the config"
+    assert host.command_surface()["stall_timeout_s"] == 1800
+
+
+def test_a_host_built_without_a_window_still_honours_the_file(tmp_path):
+    """A caller that passes nothing gets the configured window rather than a compiled-in one.
+
+    The two hosts a run is built from pass it explicitly, but `RunnerHost` is also built directly —
+    by tests, and by anything that supervises a graph without an orchestrator. A `None` here must mean
+    "ask the config", not "fall back to a constant nothing can change".
+    """
+    config = _config_with(tmp_path, stall_timeout_s=600)
+    fake = tmp_path / "fake_runner.py"
+    fake.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+    host = RunnerHost(config=config, library=_library_for(tmp_path, fake),
+                      workspace=_workspace_for(tmp_path, "unset"))
+
+    assert host.stall_timeout_s == 600
+
+
+def test_the_config_refuses_a_stall_window_that_cannot_be_one():
+    """An invalid window is refused at load, with a message naming the field and the value.
+
+    The two ways to get it wrong are both silent if accepted: zero or negative would stop every run at
+    the first poll, and a window at or below twice the heartbeat would fire before the monitor had
+    even called the run `slow` — so the run would be killed as a stall without ever having been
+    reported as one.
+    """
+    from engine.config import ConfigError, ConcurrencyConfig
+
+    for bad in (0, -1, -900.0):
+        with pytest.raises(ConfigError) as excinfo:
+            ConcurrencyConfig(stall_timeout_s=bad)
+        assert "concurrency.stall_timeout_s" in str(excinfo.value)
+        assert str(bad) in str(excinfo.value), "the offending value must be echoed back"
+
+    with pytest.raises(ConfigError) as excinfo:
+        ConcurrencyConfig(heartbeat_s=30, stall_timeout_s=45)
+    assert "2 × heartbeat_s" in str(excinfo.value)
+
+
+def test_an_invalid_stall_window_in_the_file_is_refused_by_the_loader(tmp_path):
+    """The refusal reaches the person through `load`, not only through the dataclass."""
+    from engine.config import ConfigError
+
+    with pytest.raises(ConfigError) as excinfo:
+        _config_with(tmp_path, stall_timeout_s=0)
+    assert "concurrency.stall_timeout_s" in str(excinfo.value)
+
+
+def test_a_stall_records_the_watchdog_and_the_window_that_expired(tmp_path):
+    """The run stops, and `outcome.termination` says what stopped it and which window ran out.
+
+    A `killed` boolean is all a summary had before, and four different events set it — so this is the
+    assertion that the summary can now name a stall rather than reporting the same sentence as an
+    Owner's abort. `wedged` is the word `wedged()` already uses for this exact condition.
+    """
+    from engine.host import TERMINATION_WEDGED, RunnerState
+
+    fake = tmp_path / "silent_runner.py"
+    fake.write_text(_SILENT_RUNNER, encoding="utf-8")
+    workspace = _workspace_for(tmp_path, "stalls")
+    events: list[str] = []
+    host = RunnerHost(config=None, library=_library_for(tmp_path, fake), workspace=workspace,
+                      heartbeat_s=0.2, grace_s=0.5, stall_timeout_s=2.0,
+                      on_event=lambda event, payload: events.append(event))
+
+    outcome = host.run(manifest_path=workspace / "m.yaml", run_id="run_stall", workflow="probe")
+
+    assert outcome.killed and outcome.state is RunnerState.FAILED, "a stall must still stop the run"
+    assert outcome.termination == TERMINATION_WEDGED
+    assert "stall window" in outcome.termination_detail
+    assert "2s" in outcome.termination_detail, (
+        "the detail must carry the window that expired, or the reader still cannot act on it")
+    assert "concurrency.stall_timeout_s" in outcome.termination_detail
+    assert "watchdog.stall" in events
+    assert outcome.as_dict()["termination"] == TERMINATION_WEDGED
+
+
+def test_an_owner_abort_records_the_owner_and_not_the_watchdog(tmp_path):
+    """The same `killed` flag, a different cause — which is the whole point of the change.
+
+    A person who pressed Stop and a person whose run was reaped by the watchdog used to read the same
+    sentence. The liveness word is on the outcome too, so the two cases cannot be confused even when
+    both happened close together.
+    """
+    from engine.host import TERMINATION_ABORTED
+
+    fake = tmp_path / "silent_runner.py"
+    fake.write_text(_SILENT_RUNNER, encoding="utf-8")
+    workspace = _workspace_for(tmp_path, "aborted")
+    events: list[str] = []
+    # A stall window far beyond the test's own patience: if this run is stopped as a stall, the test
+    # is asserting the wrong thing rather than merely failing.
+    host = RunnerHost(config=None, library=_library_for(tmp_path, fake), workspace=workspace,
+                      heartbeat_s=0.2, grace_s=0.5, stall_timeout_s=300.0,
+                      on_event=lambda event, payload: events.append(event))
+    outcome: list = []
+    thread = threading.Thread(target=lambda: outcome.append(host.run(
+        manifest_path=workspace / "m.yaml", run_id="run_abort", workflow="probe")), daemon=True)
+    thread.start()
+    for _ in range(100):
+        if host.running:
+            break
+        time.sleep(0.05)
+    assert host.running, "the runner never started"
+    assert host.abort()
+    thread.join(timeout=20)
+    assert not thread.is_alive(), "the abort did not stop the run"
+
+    assert outcome[0].killed
+    assert outcome[0].termination == TERMINATION_ABORTED
+    assert "watchdog.stall" not in events, "the Owner's own stop is not a stall"
+
+
+def test_the_shutdown_reaper_records_the_engine_as_the_cause(tmp_path):
+    """An engine that stops its runners says so, rather than leaving an unattributable abort behind.
+
+    This is the half of "why was my run stopped" that no policy produced: the process went away and
+    took its runners with it. Recorded as a shutdown, because describing it as an abort by the Owner
+    would name a decision nobody made.
+    """
+    from engine.host import TERMINATION_SHUTDOWN, shutdown_runners
+
+    fake = tmp_path / "silent_runner.py"
+    fake.write_text(_SILENT_RUNNER, encoding="utf-8")
+    workspace = _workspace_for(tmp_path, "shutdown")
+    host = RunnerHost(config=None, library=_library_for(tmp_path, fake), workspace=workspace,
+                      heartbeat_s=0.2, grace_s=2.0, stall_timeout_s=300.0)
+    outcome: list = []
+    thread = threading.Thread(target=lambda: outcome.append(host.run(
+        manifest_path=workspace / "m.yaml", run_id="run_shutdown", workflow="probe")), daemon=True)
+    thread.start()
+    for _ in range(100):
+        if host.running:
+            break
+        time.sleep(0.05)
+    assert host.running, "the runner never started"
+
+    handle = host._handle
+    killed = shutdown_runners(grace_s=1.0)
+    thread.join(timeout=20)
+    assert not thread.is_alive(), "the reaper did not stop the run"
+
+    assert handle.pid in killed
+    assert handle.termination == TERMINATION_SHUTDOWN
+    assert "shut down" in handle.termination_detail
+    assert outcome[0].termination == TERMINATION_SHUTDOWN
+
+
+def test_the_first_cause_of_a_stop_is_the_one_recorded(tmp_path):
+    """A later stop must not overwrite the earlier one, because the first is the operative cause.
+
+    A shutdown that SIGKILLs a run the watchdog had already stopped is still a stall. Letting the last
+    writer win would hide the thing the person needs to act on behind the thing that merely finished it
+    off, which is the same failure as having one sentence for four causes.
+    """
+    from engine.host import (TERMINATION_ABORTED, TERMINATION_WEDGED, RunHandle, _note_termination)
+
+    handle = RunHandle(run_id="r", process=SimpleNamespace(pid=1),
+                       manifest_path=tmp_path / "m.yaml", state_path=tmp_path / "s.json")
+    _note_termination(handle, TERMINATION_WEDGED, "no work for 1800s")
+    _note_termination(handle, TERMINATION_ABORTED)
+
+    assert handle.termination == TERMINATION_WEDGED
+    assert handle.termination_detail == "no work for 1800s"

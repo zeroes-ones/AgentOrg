@@ -161,37 +161,49 @@ keeping a snapshot for one-command revert. Everything else stays gated.
 
 ## 7. Validation, and what "better" means
 
-> **Status: partially built.** This section previously claimed the loop validates a patch in a
-> scratch copy. No such code exists — `Improver.validate` runs the suite **once, against the tree as
-> it stands**, and nothing in `engine/improver.py` applies a patch anywhere. The claim has been
-> removed rather than left standing, because a validation story that describes a delta the module
-> does not compute is the exact failure this document exists to prevent.
+**Built.** Validation applies the proposal's patch to a **scratch copy** of the tree and runs the suite
+*there*, so a proposal can be shown to have **caused** a flip — and so validating a proposal can never
+be the thing that changes the code being judged.
 
-What the code does today:
+What the code does:
 
-1. **No regression** against the frozen baseline (`compare_to_baseline`), including *lost coverage*:
+1. **The patch is applied somewhere real, and never to the working tree.** A proposal carrying a patch
+   gets a throwaway copy of the tree under a temp directory (`SCRATCH_EXCLUDES` in `engine/improver.py`
+   names what the copy leaves out: git history, the Swift build output, `projects/`, this engine's own
+   state, caches — measured at 248 files / 6.7 MB / ~0.17 s against 663 MB uncopied). The suite runs in
+   that copy **twice**: once as the tree stands, once with the patch applied by `git apply` (after
+   `git apply --check`). The copy is deleted in a `finally`, so a patch that cannot be applied, a suite
+   that raises, and a clean run all leave the filesystem as they found it.
+2. **No patch is not an improvement.** A proposal carrying no patch has nothing to run *with*: no copy
+   is built, the suite still runs against the tree as it stands, and the detail says plainly that a run
+   of the unchanged tree cannot evidence a fix.
+3. **No regression** against the frozen baseline (`compare_to_baseline`), including *lost coverage*:
    a scenario that stopped running is a regression.
-2. **A stated improvement** — the scenario the finding named must have been recorded **failing in the
-   baseline** and now pass. A scenario that was already passing proves nothing about this proposal and
-   is not counted.
+4. **A stated improvement, and one the patch caused** — the scenario the finding named must have been
+   recorded **failing in the baseline**, **failing in the unpatched copy**, and **passing in the patched
+   copy**. A scenario that was already passing proves nothing about this proposal; so does a flip the
+   patch did not cause, which is somebody else's fix.
+5. **Refused with the reason named, before any of that is spent**: no patch to apply, a patch aimed at
+   a `SAFETY_SURFACES` path (re-checked at validation against the **diff**, not the declared file
+   list), or a patch that does not apply cleanly.
 
-If it cannot show both, there is no proposal. A change that is merely *not worse* is not an
+If it cannot show 3 and 4, there is no proposal. A change that is merely *not worse* is not an
 improvement, and calling it one is how a self-improving system drifts.
 
-**The consequence, stated plainly.** Because `engine/evals/baseline.json` records all 17 scenarios
-passing, rule 2 can currently never be satisfied: no proposal can cause a flip that the baseline does
-not already credit. The loop therefore promotes **nothing** that touches Python. It reports that
-honestly (`ok: false`, with the reason naming the already-passing baseline) instead of stamping an
-unchanged tree as an improvement — which is what it did before this was fixed, including on real
-proposals carrying `"patch": ""`.
+**The consequence, still stated plainly.** `engine/evals/baseline.json` as shipped records all 17
+scenarios passing, so rule 4's first condition cannot hold against it: **no proposal is promoted while
+that baseline stands.** The scratch copy makes a flip *observable* — a real patch that flips a scenario
+in the copy is credited, with the two runs as its evidence — but only against a baseline that recorded
+the failure, which is exactly what freezing a baseline in a red state produces. Until then, `ok: false`
+with the already-passing baseline named is the correct reading of the system, not a bug to work around.
 
-**What is missing to make the loop able to promote again:** apply the proposal's patch to a scratch
-copy and run the suite *there*, so a patch can cause a flip. That is the next piece of work on this
-track, and until it lands, "no proposal is promoted" is the correct reading of the system, not a bug
-to work around.
-
-**When it lands:** applied in a scratch copy, never in place — so that *validating* cannot damage the
-working tree, the same reasoning as testing a provider before saving it.
+**Proved end to end.** With a staged copy of this tree carrying one real defect in
+`engine/org/router.py` and a baseline frozen from its own run (16/17 passing, `router-asks-when-unsure`
+failing), the real fix proposed as a patch is reported as
+`improved: ["router-asks-when-unsure"], regressions: [], patched_in_scratch: true, ok: true` — and the
+same patch judged against the shipped all-green baseline is correctly refused
+(`ok: false`, "the baseline already records 'router-asks-when-unsure' as passing"). Both runs are the
+engine's own suite, in a subprocess, in a copy of the tree.
 
 ## 8. Failure modes designed against
 
@@ -201,7 +213,7 @@ working tree, the same reasoning as testing a provider before saving it.
 | **Improvement by vibes** | A change is applied because it *sounds* better | Validation is a baseline *delta*, and must name the scenario that flipped |
 | **Churn** | The same fix proposed every cycle | Rejections are recorded; the effect journal stops re-application |
 | **Invented defects** | A model asked to "find bugs" finds imaginary ones | Q1 is measurement, not opinion — findings carry evidence or do not exist |
-| **Validation damages the tree** | Checking a fix breaks the working copy | Validation only *reads* the tree today (no patch is applied). Re-introduce the guard with the scratch copy when patch application lands — see §7 |
+| **Validation damages the tree** | Checking a fix breaks the working copy | Validation applies the patch to a scratch copy and deletes it; only the copy is written to, and the working tree is byte-identical after a run (fingerprinted by the phase-21 tests) |
 | **Silent discard** | A refused proposal vanishes | Refusals are recorded *with the path named* |
 | **Runaway cost** | The loop spends without bound | It runs on the Goal runtime, which is disarmed on load and budgetable |
 | **A fix that helps here, hurts there** | Total improves while a scenario regresses | Delta comparison, and lost coverage counts |

@@ -29,6 +29,10 @@ DESIGN
 - **Delegation is first-class.** The five-element context pass-through and the requisition
   request are part of the prompt, because an agent that cannot say *why* it needs help
   cannot ask for it safely.
+- **A criterion is named by an id the checker resolves.** Each criterion is printed as `c1`,
+  `c2`, … so the trailer can reference it unambiguously: the contract accepts an index
+  reference as readily as the criterion's own text, and a paraphrase resolves to neither —
+  which reads as no coverage and parks a node whose work was already done.
 
 Usage:
     builder = PromptBuilder(source)
@@ -367,8 +371,11 @@ class PromptBuilder:
                 "**What this is about.** Your reply's fenced trailer — not your prose. It must "
                 "carry `evidence`: one concrete item per claim (a path, a hash, or command output), "
                 "and an entry in `criteria_satisfied` for **every** criterion listed under "
-                "`## COMPLETION CRITERIA` above, each with its `criterion` copied verbatim. One "
-                "entry is not coverage. Emit the work exactly as before and correct only the trailer.",
+                "`## COMPLETION CRITERIA` above, each with its `criterion` set to that criterion's id "
+                "(`c1`, `c2`, …) or its text copied verbatim. One entry is not coverage, and an entry "
+                "naming none of those criteria counts for nothing — least of all a copy of the shape "
+                "example in the output contract. Emit the work exactly as before and correct only the "
+                "trailer.",
                 "",
             ]
         if rule == "R6" and limit:
@@ -526,10 +533,32 @@ class PromptBuilder:
             "## COMPLETION CRITERIA — these gate acceptance",
             "Each criterion is satisfied only with concrete evidence. A criterion with no "
             "evidence is an open item, not a checkbox.",
+            # The standard of judgement, which the prompt never stated. These criteria come from the
+            # skill's procedure for its *typical* use — a PRD, an architecture, an API spec — and a
+            # node whose goal asks for something smaller has no stated way to judge them. A real run's
+            # `api` node resolved that ambiguity the strictest way available: it marked all three
+            # `satisfied: false` with "the task lacks necessary details", which is honest and leaves
+            # the node — and the run — blocked for the Owner, on every attempt, for hours. Saying what
+            # a criterion is measured against is the difference.
+            "Judge a criterion against the goal **you were given**, not against this skill's "
+            "fullest typical use: it is satisfied when your output addresses that dimension as far "
+            "as the goal requires, and false when something the goal needed is genuinely missing. "
+            "Marking one false leaves this node blocked for the Owner, so do that when it is true "
+            "rather than because the goal is small.",
+            "Refer to a criterion by the id it is numbered with below (`c1`, `c2`, …) or by its "
+            "text; either is read as that criterion. These ids are the criteria's own — a checklist "
+            "id (`PM1`, `CR1`) identifies an item in the checklist block below this one, not a "
+            "criterion.",
             "",
         ]
+        # Each criterion carries the reference id the contract check resolves, so *copying the line*
+        # produces a reference that matches. The runner accepts an index reference (`c1`) as readily as
+        # the criterion's own text (`workflow-runner.py::_criterion_index`), and a model that
+        # paraphrases a criterion instead produces a reference that resolves to nothing — which the
+        # contract reports as no coverage, so the node parks with the work already done. Printing the id
+        # is what makes compliance a copy rather than a judgement call.
         for index, criterion in enumerate(bundle.contract.criteria, start=1):
-            lines.append(f"{index}. {criterion}")
+            lines.append(f"c{index}. {criterion}")
         lines.append("")
         lines.append(
             "Evidence must be an artifact path, a hash, or command output — never a "
@@ -576,7 +605,8 @@ class PromptBuilder:
             f"One entry per id: {', '.join(bundle.checklist_ids())}"
             if bundle.checklist else "No checklist for this node; report criteria only."
         )
-        # The criteria get the same per-item mandate the checklist has.
+        # The criteria get the same per-item mandate the checklist has, and it points at the completion
+        # criteria block rather than repeating them.
         #
         # This asymmetry was a defect behind a real failure. The checklist rule read "Include an entry
         # in `checklist` for **every** id: PM1, PM2, …" and named all twelve, so the model reported all
@@ -584,11 +614,13 @@ class PromptBuilder:
         # schema — so a model reported *one* criterion, the node failed its own contract on c1/c2, and a
         # whole run parked on its first node.
         #
-        # The rule points at the completion criteria block rather than repeating them: that block
-        # (`## COMPLETION CRITERIA`) already enumerates every criterion in the body, and duplicating the
-        # text here would grow the recency zone — which is measured, and whose growth dilutes the
-        # cacheable prefix (see `test_the_prompt_prefix_is_stable_across_different_tasks`). One stated
-        # rule, no duplication.
+        # The rule deliberately names neither the criteria nor their ids here. That block
+        # (`## COMPLETION CRITERIA`) already enumerates every criterion in the body, and this zone is
+        # measured: duplicating the criteria, or even their ids, grew it past its budget and diluted
+        # the cacheable prefix (see `test_the_recency_zone_stays_small_so_it_cannot_dilute_the_prefix`).
+        # The ids and the "the schema is a shape example, not a value to copy" warning live in the
+        # system prompt instead — byte-identical per skill, so a provider caches them once rather than
+        # re-reading them on every node.
         return (
             "## OUTPUT CONTRACT — your reply MUST end with this block\n"
             "Write your work first, then finish with exactly one fenced block tagged "
@@ -597,11 +629,12 @@ class PromptBuilder:
             "Rules:\n"
             "- Valid JSON only inside the fence. No comments, no trailing commas.\n"
             "- Include an entry in `criteria_satisfied` for **every** criterion listed under "
-            "`## COMPLETION CRITERIA` above — all of them, each with its `criterion` copied verbatim. "
-            "One entry is not coverage.\n"
+            "`## COMPLETION CRITERIA` above — all of them, each with its `criterion` copied verbatim "
+            "or set to that criterion's id. One entry is not coverage.\n"
             f"- Include an entry in `checklist` for **every** id. {checklist_hint}\n"
-            "- `evidence` must be concrete: a path, a hash, or command output. A `PASS` with no "
-            "evidence is not a pass — mark it `FAIL` or `N/A` instead.\n"
+            "- `evidence` must be concrete: a path, a hash, or command output — this run's contract "
+            "refuses a report that carries none, so give one per criterion and per checklist `PASS`. "
+            "A `PASS` with no evidence is not a pass — mark it `FAIL` or `N/A` instead.\n"
             "- In `artifacts`, every file you create or change MUST include its full `content`. The "
             "engine writes the file from that field, so an artifact with only a path produces no "
             "file and starves every downstream node. Do not write `\"sha256\": \"UNKNOWN\"`.\n"
@@ -639,6 +672,14 @@ class PromptBuilder:
         """
         rules = _ground_rules_from(bundle)
         safety = [r for r in rules if re.search(r"NEVER|MUST NOT|REFUSE", r, re.IGNORECASE)][:6]
+        # The trailer's required shape — its key names, and the fact that `criteria_satisfied` owes an
+        # entry per completion criterion referenced by *this skill's* ids — is stated here because the
+        # system prompt is byte-identical for every agent and every node on this skill, so a provider
+        # caches it once. It used to be a rule in the recency zone, which is measured and must stay
+        # small (see `test_the_recency_zone_stays_small_so_it_cannot_dilute_the_prefix`); a fact that
+        # never varies per turn also has no business in the per-turn tail. The ids are a few bytes and
+        # are stable per skill, so naming them costs nothing here.
+        criteria_ids = ", ".join(f"`c{i}`" for i in range(1, len(bundle.contract.criteria) + 1))
         parts = [
             f"You are an agent in a software engineering organisation, operating as "
             f"{agent_skill or bundle.name}.",
@@ -646,7 +687,12 @@ class PromptBuilder:
             "criteria and checklist. You produce evidence, not assurances.",
             "You never fabricate an API, a version, a file path or a test result. If you are "
             "unsure, you say so and mark the claim [UNKNOWN].",
-            "You end every reply with the required fenced JSON trailer.",
+            "You end every reply with the required fenced JSON trailer. Its `criteria_satisfied` "
+            f"must carry an entry for every criterion of this skill ({criteria_ids}), each "
+            "referencing its own id or its text — a checklist id (`PM1`, `CR1`, …) names a checklist "
+            "item, not a criterion, and counts for nothing here. The schema printed with the "
+            "contract is a shape example: every value in it is a placeholder to replace, never a "
+            "value to copy.",
         ]
         if safety:
             parts.append("Hard constraints: " + "; ".join(safety))

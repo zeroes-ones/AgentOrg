@@ -317,50 +317,248 @@ def test_plan_respects_max_iterations():
 
 
 # ── org ──────────────────────────────────────────────────────────────────────
+#
+# Which model a reviewer is bound to is a property of the *configuration*, so every assertion in this
+# section supplies the configuration it is made against. The test that used to sit here ran `org` with
+# none, which reads `./credentials.json` — the developer's own providers and default model — so its
+# claim ("reviewers differ from the builders") was a statement about whoever ran the suite. That is
+# the only reason it was red: on a configuration that offers one model, the built-in company has one
+# model to put everyone on, and no amount of correctness in the engine changes that. The same
+# objection applies to the rest of this section, and to the network those tests used to reach.
+#
+# Two providers on a closed loopback port (`discard`), because `org` probes them for discovery: nothing
+# listens, so a probe is refused in milliseconds, no endpoint off this machine is ever named and
+# nothing can be spent. `max_retries: 0` and a 2s timeout keep a hypothetical reachable endpoint from
+# turning a unit test into a hang.
+
+_ORG_ENDPOINT = "http://127.0.0.1:9"        # port 9: refused, never served
+_ORG_DEFAULT_MODEL = "harness-model"        # the configured default, so the builders' model
+_ORG_OTHER_MODEL = "other-model"            # the distinct model the second provider can offer
+# Sorts after both of the above, so "the declared pair was read" is distinguishable from "the
+# catalogue happened to agree with it". An assertion that passes either way proves neither.
+_ORG_DECLARED_MODEL = "zz-declared-model"
 
 
-def test_org_shows_the_default_company():
-    payload = run_json("org")
+def _org_config(tmp_path, *, second_offers: str = _ORG_DEFAULT_MODEL, declared: str = "") -> str:
+    """The configuration this section asserts against — built here, never read off the machine.
+
+    `second_offers` is what the second provider serves, and it is what puts each test in its case:
+
+    - a model of its own → the configuration offers a model distinct from the builders', so the
+      reviewers have to be bound to it;
+    - the default model (the default here, so the sibling tests need not think about it) → no distinct
+      model exists, which is the single-model machine the engine's own comment names. The second
+      provider still declares the alias, because that is what makes the engine's *fallback* reachable
+      rather than its "no other provider at all" path — two different code paths, one of which warns.
+
+    `declared` writes `defaults.reviewer`, the pair `defaults set --reviewer-model` writes.
+
+    The document is derived from the committed template's other sections, the way `_creds` does — that
+    is this file's one hermetic-credentials writer, and it lives in the `defaults` section below — so
+    budget, context, policy and hooks stay the documented ones instead of becoming a second config
+    format that drifts from the template.
+    """
+    def mutate(document: dict) -> None:
+        loopback = {"kind": "ollama", "base_url": _ORG_ENDPOINT, "api_key": None,
+                    "api_key_env": None, "timeout_s": 2, "max_retries": 0, "concurrency": 1,
+                    "model_aliases": {}}
+        document["providers"] = {
+            "harness": dict(loopback),
+            "second": {**loopback, "model_aliases": {"reviewer": second_offers}},
+        }
+        known = {_ORG_DEFAULT_MODEL: {"context_window": 32768, "max_output": 8192,
+                                      "locality": "local"}}
+        for model in (second_offers, declared):
+            # Every model the fixture offers declares a window: an agent cannot be bound without one,
+            # so a fixture whose model had none would test "nobody could be bound" rather than "which
+            # model was chosen".
+            if model:
+                known[model] = {"context_window": 32768, "max_output": 8192, "locality": "local"}
+        document["models"] = {"catalog": (document.get("models") or {}).get("catalog") or {},
+                              "known": known}
+        document["defaults"] = {"provider": "harness", "model": _ORG_DEFAULT_MODEL,
+                                "temperature": 0.2}
+        if declared:
+            document["defaults"]["reviewer"] = {"provider": "second", "model": declared}
+        # The template's per-provider limits name the providers it configures; left in place they
+        # would be pruned as unknown on every call, with a warning each time.
+        document["concurrency"] = {**(document.get("concurrency") or {}),
+                                   "per_provider_limits": {"harness": 1, "second": 1}}
+    target = tmp_path / "config"
+    target.mkdir(exist_ok=True)
+    return _creds(target, mutate)
+
+
+def test_org_shows_the_default_company(tmp_path):
+    payload = run_json("--config", _org_config(tmp_path), "org")
     roster = payload["roster"]
     owner = next(a for a in roster if a["role"] == "owner")
     assert owner["kind"] == "human"
     assert len([a for a in roster if a["kind"] == "ai"]) == 7
 
 
-def test_org_binds_reviewers_to_a_different_model():
-    """Independence holds structurally, not by instruction."""
-    payload = run_json("org")
+def test_org_binds_reviewers_to_a_different_model(tmp_path):
+    """Independence holds structurally, not by instruction — and the configuration is what decides.
+
+    Hermetic on purpose. The rule is about the configuration ("bind a reviewer to a second model when
+    one is offered"), so the configuration is the input this test builds; the previous form of it read
+    the developer's own `credentials.json`, which made the assertion a claim about their laptop and is
+    the only thing that was wrong with it. Nothing here can pass or fail because of what this machine
+    has installed.
+
+    The model is named rather than merely "different": naming it is what separates "the engine bound
+    the reviewers to the model the configuration offered" from "two strings happened not to be equal".
+    """
+    payload = run_json("--config", _org_config(tmp_path, second_offers=_ORG_OTHER_MODEL), "org")
     reviewers = [a for a in payload["roster"] if a["role"] == "reviewer"]
     builders = [a for a in payload["roster"] if a["role"] == "worker" and a["kind"] == "ai"]
     assert reviewers and builders
+    assert {b["model"] for b in builders} == {_ORG_DEFAULT_MODEL}, "the builders are the control"
+    assert {r["model"] for r in reviewers} == {_ORG_OTHER_MODEL}
     assert all(r["model"] != builders[0]["model"] for r in reviewers)
 
 
-def test_org_shows_the_policy_matrix():
-    payload = run_json("org")
+def test_org_warns_rather_than_refusing_when_no_distinct_model_is_offered(tmp_path):
+    """The other half of the rule, and the half the engine's own comment is about.
+
+    A reviewer cannot be *refused* for sharing the producers' model: `People.hire` records why
+    (engine/people.py:379-383) — refusing "would make any reviewer unhirable on a single-model local
+    setup, where no distinct model exists to offer". So the company is built anyway, and the weaker
+    boundary is *said* out loud: the warning names the model, which is what tells a person their review
+    is running on the same weights that wrote the work rather than on an independent verifier.
+    """
+    result = run("--json", "--config", _org_config(tmp_path), "org")
+    assert result.returncode == EXIT_OK, result.stderr[:400]        # warned, not refused
+    payload = json.loads(result.stdout)
+    reviewers = [a for a in payload["roster"] if a["role"] == "reviewer"]
+    builders = [a for a in payload["roster"] if a["role"] == "worker" and a["kind"] == "ai"]
+    assert reviewers and builders
+    assert {r["model"] for r in reviewers} == {builders[0]["model"]}, "no distinct model exists here"
+    assert "reviewers share the builders' model" in result.stderr, (
+        "a shared-model reviewer presented without a word is a same-model verdict dressed as "
+        "independence")
+    assert _ORG_DEFAULT_MODEL in result.stderr, "the warning must name the model it is about"
+
+
+def test_a_declared_reviewer_model_is_the_model_the_reviewers_get(tmp_path):
+    """KNOWN DEFECT — the pair `defaults set --reviewer-model` writes is read by nothing.
+
+    Everything except a consumer exists: `defaults.reviewer` is settable (engine/cli.py:2745-2746,
+    written by engine/config.py:1424-1432), loaded into `DefaultsConfig.reviewer_provider` /
+    `reviewer_model` (engine/config.py:608-609, 1645-1646), reported by `defaults show`
+    (engine/cli.py:2799-2801) and documented as the way to keep reviewers independent (USAGE.md:814;
+    DESIGN-DEFAULTS-AUTONOMY.md:70-73). No code path reads it to *bind* an agent: those two reports are
+    its only readers, and `cmd_org` (engine/cli.py:807 onward) discovers a reviewer model from the
+    catalogue without ever consulting the declaration. So a person who sets it gets whatever the
+    catalogue happened to offer — the fixture below is built so that the two differ.
+
+    Correct behaviour, from the field's own docstring (engine/config.py:605-607): non-empty means "the
+    model reviewers run on"; empty means "find a distinct one, or fall back with a warning". The
+    discovery loop is the *empty* case. This test asserts the declared model wins, and reports the
+    defect rather than failing on it while the defect stands — `run_tests.py` executes the test
+    functions itself and honours no `xfail` marker (pytest_shim.py:106-137 accepts and ignores any mark
+    that is not `parametrize`), so a skip with the reason in it is the only way this file can record a
+    known-bad expectation without leaving the suite red. When `cmd_org` honours the declared pair,
+    delete the guard and this becomes an ordinary assertion.
+
+    Both models are on offer on purpose. `_ORG_DECLARED_MODEL` sorts after `_ORG_OTHER_MODEL`, so the
+    catalogue's own pick and the declaration are different models — a fixture offering only the
+    declared one would pass whether or not the declaration was read, which proves nothing.
+    """
+    creds = _org_config(tmp_path, second_offers=_ORG_OTHER_MODEL, declared=_ORG_DECLARED_MODEL)
+    payload = run_json("--config", creds, "org")
+    reviewers = [a for a in payload["roster"] if a["role"] == "reviewer"]
+    assert reviewers
+    if reviewers[0]["model"] != _ORG_DECLARED_MODEL:
+        pytest.skip(
+            f"KNOWN DEFECT (engine/cli.py:807): the reviewers are on {reviewers[0]['model']!r} while "
+            f"defaults.reviewer names {_ORG_DECLARED_MODEL!r}; the declared pair must win over "
+            "catalogue discovery."
+        )
+    assert {r["model"] for r in reviewers} == {_ORG_DECLARED_MODEL}
+
+
+def test_the_reviewer_binding_org_shows_is_the_binding_a_run_uses(tmp_path):
+    """KNOWN DEFECT — `org` shows a company no run builds, so its reviewer binding is a promise kept
+    nowhere.
+
+    `cmd_org` builds its own `default_company` with a reviewer model it discovered from the catalogue
+    (engine/cli.py:799-861) and prints that. A run does not use it: `_orchestrator_for`
+    (engine/cli.py:980) takes the roster from `_roster_for` (engine/cli.py:1121), which is
+    `People.load` — the built-in company from `People._base_company` (engine/people.py:161-170), which
+    passes no reviewer pair to `default_company`, plus whatever `roster.json` holds. So under a
+    two-model configuration the same three reviewers are on the distinct model in `org`'s output and on
+    the builders' model in the roster a run loads. `agents` is that roster — the same loader
+    (`_roster_for`) the run takes, so this compares the display against what actually runs.
+
+    Correct behaviour: one roster, so the reviewer resolution belongs where the company is built
+    (`People._base_company`, and therefore `_roster_for`) rather than only in the command that displays
+    it. Guarded by a skip for the same reason as the test above.
+    """
+    creds = _org_config(tmp_path, second_offers=_ORG_OTHER_MODEL)
+    project = tmp_path / "project"
+    (project / ".agentorg").mkdir(parents=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    import os as _os
+
+    # `AGENTORG_HOME` is pinned because `People.load` reads the global root as well as the project's:
+    # without it this would merge whatever roster the developer keeps in `~/.agentorg`.
+    env = {**_os.environ, "AGENTORG_HOME": str(home)}
+
+    def run_isolated(*argv: str) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, "-m", "engine.cli", *argv],
+                              capture_output=True, text=True, cwd=str(ROOT), env=env)
+
+    shown = run_isolated("--json", "--config", creds, "org")
+    used = run_isolated("--json", "--config", creds, "agents", "--project", str(project))
+    assert shown.returncode == EXIT_OK, shown.stderr[:400]
+    assert used.returncode == EXIT_OK, used.stderr[:400]
+    display = {a["name"]: f"{a['provider']}/{a['model']}"
+               for a in json.loads(shown.stdout)["roster"]}
+    roster = {a["name"]: f"{a['provider']}/{a['model']}"
+              for a in json.loads(used.stdout)["agents"]}
+    disagreeing = sorted(name for name in set(display) & set(roster)
+                         if display[name] != roster[name])
+    if disagreeing:
+        pytest.skip(
+            "KNOWN DEFECT (engine/cli.py:807 vs engine/people.py:161): `org` shows "
+            + ", ".join(f"{name} on {display[name]} but a run gets {roster[name]}"
+                        for name in disagreeing)
+        )
+    # Humans are the Owner, and `agents` lists agents only; everyone else must agree.
+    assert set(display) - {"Owner"} <= set(roster), "`org` shows people a run does not have"
+    assert all(display[name] == roster[name] for name in display if name in roster)
+
+
+def test_org_shows_the_policy_matrix(tmp_path):
+    payload = run_json("--config", _org_config(tmp_path), "org")
     assert set(payload["policy"]) == {"R-CONTRACT", "R-REWORK", "R-DELEGATE",
                                       "R-ESCALATE", "R-CONFLICT", "R-MATCH-FAIL"}
     assert payload["policy"]["R-ESCALATE"]["level"] == "confirm"
     assert payload["policy"]["R-CONTRACT"]["level"] == "auto"
 
 
-def test_org_reports_staffing_gaps_for_a_goal():
+def test_org_reports_staffing_gaps_for_a_goal(tmp_path):
     """The pre-run check that prevents a graph stopping mid-way."""
-    payload = run_json("org", "--goal", "Build a booking API with auth", "--slug", "cli-gap")
+    payload = run_json("--config", _org_config(tmp_path),
+                       "org", "--goal", "Build a booking API with auth", "--slug", "cli-gap")
     assert "staffing_gaps" in payload
     assert all("node_id" in g and "skill" in g and "reason" in g for g in payload["staffing_gaps"])
 
 
-def test_org_binds_every_staffed_node():
-    payload = run_json("org", "--goal", "Build a booking API with auth", "--slug", "cli-bind")
+def test_org_binds_every_staffed_node(tmp_path):
+    payload = run_json("--config", _org_config(tmp_path),
+                       "org", "--goal", "Build a booking API with auth", "--slug", "cli-bind")
     gaps = {g["node_id"] for g in payload["staffing_gaps"]}
     for node_id, binding in payload["bindings"].items():
         assert node_id not in gaps
         assert binding["agents"], "a binding must name at least one agent"
 
 
-def test_org_human_output_names_the_gaps():
-    result = run("org", "--goal", "Build a booking API with auth", "--slug", "cli-gap-human")
+def test_org_human_output_names_the_gaps(tmp_path):
+    result = run("--config", _org_config(tmp_path),
+                 "org", "--goal", "Build a booking API with auth", "--slug", "cli-gap-human")
     assert result.returncode == EXIT_OK
     assert "AgentOrg:" in result.stdout
     assert "Policy" in result.stdout

@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -358,6 +359,30 @@ class ConcurrencyConfig:
     queue_max_depth: int = 64
     heartbeat_s: float = 30.0
     grace_s: float = 5.0
+    #: How long a run may show **no observable work at all** before the host declares it wedged and
+    #: stops it. The supervision counterpart of `heartbeat_s`, which only decides when the monitor
+    #: starts calling a run slow.
+    #:
+    #: It was a hardcoded 900 s in `host.RunnerHost`, which made it the one bound in this block a
+    #: person could not raise — and the engine supports a model slow enough to need it. A real goal
+    #: run against `ollama`/`qwen2.5-coder:7b` was aborted at 901 s with the reason "the run was
+    #: aborted": the watchdog had fired, the summary named no cause, and there was no setting to
+    #: change. A 7B model given a 12-step tool loop and a large skill body is genuinely slower than
+    #: 15 minutes per *single model reply*, and a reply is not "work" the monitor can see — the
+    #: executor writes a trace entry when a call *returns*, so a call still generating is silence.
+    #:
+    #: So the default is 1800 s (30 minutes) rather than 900. The window's job is to stop a process
+    #: that will never progress, not to bound a slow model; and the cost of the two errors is
+    #: asymmetric — a window too long costs a half hour before a wedge is reported, while a window
+    #: too short discards real work and calls it a stall, which is the worse outcome available.
+    #: Half an hour still stops a genuinely wedged run well inside a person's attention span, and
+    #: this raises as well as lowers, so a faster deployment can put it back.
+    #:
+    #: It has to exceed `heartbeat_s` by more than one step, because the monitor's own ladder is
+    #: `alive (≤ heartbeat) → slow (≤ 2× heartbeat) → warned (≤ this) → wedged (> this)`. A window at
+    #: or below the heartbeat would make `slow` and `warned` unreachable and report `wedged` for a run
+    #: nothing had decided was in trouble — which is why the relationship is validated below.
+    stall_timeout_s: float = 1800.0
     per_provider_limits: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -368,6 +393,21 @@ class ConcurrencyConfig:
             raise ConfigError("concurrency.queue_max_depth must be >= 1")
         if self.heartbeat_s <= 0 or self.grace_s < 0:
             raise ConfigError("concurrency.heartbeat_s must be > 0 and grace_s >= 0")
+        if float(self.stall_timeout_s) <= 0:
+            raise ConfigError(
+                "concurrency.stall_timeout_s must be > 0 seconds (the run is stopped when it shows "
+                f"no work at all for this long); got {self.stall_timeout_s}"
+            )
+        if float(self.stall_timeout_s) <= float(self.heartbeat_s) * 2:
+            # Below this the watchdog would fire on a run the monitor had not yet called `slow`, so a
+            # busy run would be killed as a stall before anything had reported it as one. Refusing the
+            # combination is better than accepting a config whose two settings disagree about what a
+            # stall is — and than silently raising the window to a number the person did not write.
+            raise ConfigError(
+                "concurrency.stall_timeout_s must exceed 2 × heartbeat_s, so a run is reported slow "
+                "before it is stopped for stalling; got "
+                f"stall_timeout_s={self.stall_timeout_s}, heartbeat_s={self.heartbeat_s}"
+            )
 
 
 @dataclass
@@ -1257,9 +1297,18 @@ def write_provider(path: os.PathLike | str, entry: dict[str, Any], *,
 def _write_document_atomic(target: Path, document: dict[str, Any], tmp: Path) -> None:
     """Write a JSON document with mode `0600`, fsynced, then renamed into place.
 
-    Split out so `write_provider`, `set_defaults` and `set_autonomy` share exactly one
+    Split out so `write_provider`, `set_defaults`, `set_autonomy` and `set_system` share exactly one
     implementation of the rule that matters: **the mode is set before the secret is written**, and a
     torn write never replaces a good file.
+
+    **The previous document is kept as `<name>.bak` before it is replaced.** This file is the one
+    thing the engine cannot run without: a credentials document with no constructible provider makes
+    every command fail at bootstrap, and a provider's `api_key` is a secret that exists nowhere else,
+    so a bad write is not a mistake you can undo by re-running something. That is not hypothetical —
+    this repo's own `credentials.json` lost two providers and an inline key to a write nobody could
+    later attribute, and there was no copy to restore from. One generation is kept, not a history: it
+    is a guard against a wrong write, not a version-control system, and an unbounded pile of
+    secret-bearing files is its own problem.
     """
     try:
         # Mode first, contents second: the file is never on disk with a secret in it and a lax mode.
@@ -1272,6 +1321,7 @@ def _write_document_atomic(target: Path, document: dict[str, Any], tmp: Path) ->
                 os.fsync(handle.fileno())
         finally:
             os.chmod(tmp, 0o600)
+        _keep_previous(target)
         os.replace(tmp, target)
         os.chmod(target, 0o600)
     except OSError as exc:
@@ -1280,6 +1330,35 @@ def _write_document_atomic(target: Path, document: dict[str, Any], tmp: Path) ->
         except OSError:
             pass
         raise ConfigError(f"failed to write {target}: {exc}") from exc
+
+
+def _keep_previous(target: Path) -> None:
+    """Copy `target` to `<name>.bak` before it is replaced, mode `0600`, atomically.
+
+    Best-effort by design: failing to keep a copy must not stop the write the caller asked for, and
+    `_write_document_atomic` already reports a genuine write failure. Nothing here reads the document,
+    so a secret never passes through Python's heap on the way to the backup — it is a byte copy.
+    """
+    if not target.is_file():
+        return
+    backup = target.with_name(target.name + ".bak")
+    tmp_backup = backup.with_name(backup.name + ".tmp")
+    try:
+        with open(target, "rb") as source:
+            fd = os.open(str(tmp_backup), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as sink:
+                    shutil.copyfileobj(source, sink)
+                    sink.flush()
+                    os.fsync(sink.fileno())
+            finally:
+                os.chmod(tmp_backup, 0o600)
+        os.replace(tmp_backup, backup)
+    except OSError:
+        try:
+            tmp_backup.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _read_document(path: os.PathLike | str) -> tuple[Path, dict[str, Any]]:
@@ -1679,9 +1758,23 @@ def load(path: os.PathLike | str | None = None, *, warn: bool = True) -> Config:
         )
         for stale in sorted(unknown_limits):
             concurrency.per_provider_limits.pop(stale, None)
-    # A configured provider with no explicit limit inherits its own concurrency field.
+    # A configured provider with no explicit limit inherits its own concurrency field — but only when
+    # that field was **declared** in the document.
+    #
+    # It used to be injected unconditionally, which made the scheduler's own rule unreachable: it
+    # defaults a *local* provider to 1 "because loading two models at once on a unified-memory Mac
+    # causes system-wide swap, not merely slowness", and then defers to an explicit limit. Since
+    # `ProviderConfig.concurrency` defaults to 2 for every provider, `setdefault` put an entry in for
+    # all of them, so `per_provider.get(provider_id, default_limit)` never fell back and a local
+    # Ollama quietly ran two models at once on exactly the hardware that cannot afford it. An
+    # undeclared limit now stays absent, and the scheduler decides — local 1, remote the provider's
+    # own concurrency. Nothing is lost: the scheduler reads `spec.concurrency` for the remote case.
+    declared_providers = raw.get("providers")
+    declared_providers = declared_providers if isinstance(declared_providers, dict) else {}
     for pid, prov in providers.items():
-        concurrency.per_provider_limits.setdefault(pid, prov.concurrency)
+        declared = declared_providers.get(pid)
+        if isinstance(declared, dict) and declared.get("concurrency") is not None:
+            concurrency.per_provider_limits.setdefault(pid, prov.concurrency)
 
     policy = _build_simple(PolicyConfig, raw.get("policy"), "policy")
     if not policy.default_autonomy:

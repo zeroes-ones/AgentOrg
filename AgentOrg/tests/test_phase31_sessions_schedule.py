@@ -21,15 +21,34 @@ What these tests pin, in the order the risk matters:
    spend loop, which is the exact failure the autonomy design exists to prevent.
 5. **The new commands work and refuse, from the CLI.** The documented path and the refusal path, in
    the style of `test_phase4_cli.py`.
+
+WHAT NO TEST IN THIS FILE MAY DO: REACH A PROVIDER
+--------------------------------------------------
+`fire` and `schedules watch` resolve their provider from whatever config is in force, and this file
+drives both — `watch` through `python3 -m engine.cli`, which is the real foreground process. Left to
+read the machine's own `credentials.json`, that is a live cloud endpoint with a key: this file
+started a `schedules watch` that spawned the pinned `workflow-runner.py` and left it on an
+established TLS connection to the default provider for minutes, spending, until it was killed. The
+failure the watch test asserted only appeared when the whole file was invoked with
+`AGENTORG_CREDENTIALS=credentials.example.json` — a property of how someone remembered to run it, not
+of the test, which is exactly why the fix had to go in the test rather than in a habit.
+
+So every test here runs against the harness config `_harness_config()` builds: one provider, on a
+**closed loopback port**, with its retries off. Nothing can leave the machine, the run still fails
+for a named reason (the connection is refused), and the failure the tests assert is the one they get.
+A test that genuinely needed a *model* would have to skip rather than spend; none of these do — what
+they test is the schedule's decisions around a fire, not the model's answer inside one.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 import zipfile
 
 import pytest
@@ -66,10 +85,106 @@ from engine.session_exchange import (
 from engine.state import Workspace
 
 
+# ── the config every test in this file runs against ──────────────────────────
+#
+# One provider, on a loopback port nothing listens on. See the module docstring for why this is not
+# optional: without it, `schedules watch` starts a real run against the machine's default provider and
+# spends. Two properties are what make it the right shape rather than merely a smaller config:
+#
+# - **`ollama` at `127.0.0.1:9`.** Loopback with nothing listening is refused by the kernel in
+#   milliseconds, so the run's first model call fails at once — no endpoint off the machine is ever
+#   named, so there is nothing to dial and nothing to bill. `max_retries: 0` and a 2s timeout keep a
+#   hypothetical reachable endpoint from turning a unit test into a hang.
+# - **A declared model window.** `_auto_staff_window` refuses to hire on a model with no known context
+#   window, so a config whose model is undeclared would report a staffing gap instead of exercising the
+#   run — the test would pass for a reason it did not arrange. `harness-model` is declared local with a
+#   32768-token window, so the plan is staffed exactly as it would be under a real local model.
+#
+# It is derived from the committed `credentials.example.json` rather than written from scratch, the
+# way `test_phase4_cli._creds` does, so every *other* section (budget, context, policy, hooks) is the
+# documented one and stays in step with the template instead of drifting into a second config format.
+
+_HARNESS_PROVIDER = "harness"
+_HARNESS_MODEL = "harness-model"
+#: Port 9 (discard). Nothing listens: a connection here is refused, never served.
+_HARNESS_ENDPOINT = "http://127.0.0.1:9"
+
+
+def _harness_config() -> dict:
+    """The hermetic configuration document, built fresh from the committed template."""
+    document = json.loads((ROOT / "credentials.example.json").read_text(encoding="utf-8"))
+    document["providers"] = {
+        _HARNESS_PROVIDER: {
+            "kind": "ollama",
+            "base_url": _HARNESS_ENDPOINT,
+            "api_key": None,
+            "api_key_env": None,
+            "timeout_s": 2,
+            "max_retries": 0,
+            "concurrency": 1,
+            "model_aliases": {},
+        }
+    }
+    document["models"] = {
+        "catalog": (document.get("models") or {}).get("catalog") or {},
+        "known": {_HARNESS_MODEL: {"context_window": 32768, "max_output": 8192,
+                                   "locality": "local"}},
+    }
+    document["defaults"] = {"provider": _HARNESS_PROVIDER, "model": _HARNESS_MODEL,
+                            "temperature": 0.2}
+    # The template's per-provider limits name the providers it configures, so leaving them would have
+    # the loader prune five unknown entries and warn about it on every CLI call in this file.
+    document["concurrency"] = {**(document.get("concurrency") or {}),
+                               "per_provider_limits": {_HARNESS_PROVIDER: 1}}
+    return document
+
+
+def _scratch_root() -> pathlib.Path:
+    """A scratch directory that is never inside the checkout.
+
+    `TMPDIR` pointing into the repository is not hypothetical here: the runner's own note records it
+    leaving 819 `agentorg-test_*` directories in the tree, where they read as untracked work. Writing
+    the harness config under such a `TMPDIR` would do the same thing one directory at a time.
+    """
+    base = pathlib.Path(tempfile.gettempdir()).resolve()
+    if base == ROOT or ROOT in base.parents:
+        fallback = pathlib.Path("/tmp")
+        if fallback.is_dir():
+            base = fallback
+    return pathlib.Path(tempfile.mkdtemp(prefix="agentorg-phase31-config-", dir=str(base)))
+
+
+_HARNESS_PATH = _scratch_root() / "credentials.json"
+_HARNESS_PATH.write_text(json.dumps(_harness_config(), indent=1), encoding="utf-8")
+os.chmod(_HARNESS_PATH, 0o600)   # the loader warns about group/world-readable credentials
+
+
 def _run(*args: str) -> subprocess.CompletedProcess:
-    """Run the CLI as a subprocess, so the real entry point is exercised."""
+    """Run the CLI as a subprocess, so the real entry point is exercised.
+
+    `AGENTORG_CREDENTIALS` is forced rather than inherited: the CLI, the orchestrator it builds and
+    the `workflow-runner.py` child that child spawns all resolve their provider through it, and the
+    child inherits this environment, so one variable is what makes the whole process tree hermetic.
+    Passing the path explicitly (`--config`) would not do that — the runner reads the *environment*.
+    """
     return subprocess.run([sys.executable, "-m", "engine.cli", *args],
-                          capture_output=True, text=True, cwd=str(ROOT))
+                          capture_output=True, text=True, cwd=str(ROOT),
+                          env={**os.environ, "AGENTORG_CREDENTIALS": str(_HARNESS_PATH)})
+
+
+def test_the_cli_subprocesses_run_against_the_hermetic_config():
+    """The pin on the fix above, because a hermetic fixture one `env=` edit away from being lost is
+    not hermetic — it is a decision someone has to keep making.
+
+    `defaults show` reports the config actually in force, so this asserts that the *child* read the
+    harness config and not the machine's: under the real `credentials.json` it names that file's
+    provider, which is a live cloud endpoint.
+    """
+    result = _run("--json", "defaults", "show")
+    assert result.returncode == EXIT_OK, result.stderr[:400]
+    payload = json.loads(result.stdout)
+    assert payload["provider"] == _HARNESS_PROVIDER
+    assert payload["model"] == _HARNESS_MODEL
 
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
@@ -208,10 +323,13 @@ def test_fork_leaves_the_source_byte_identical(tmp_path):
     fork_session(source, "probe-alt", root=tmp_path / "projects")
 
     after = _hashes(source.path)
+    # Computed outside the assert because the expression does not fit an f-string: the nested
+    # line-break form is 3.12-only syntax, and this file has to load on the 3.11 floor the README
+    # documents. It was the only file in the repository that did not.
+    differing = sorted(set(before) ^ set(after)) or [k for k in before if before[k] != after.get(k)]
     assert after == before, (
         "the source session changed; a fork must copy, never move or rewrite. "
-        f"differing files: {sorted(set(before) ^ set(after)) or
-                               [k for k in before if before[k] != after.get(k)]}"
+        f"differing files: {differing}"
     )
 
 
@@ -996,11 +1114,22 @@ def _stub_file(tmp_path) -> pathlib.Path:
 
 
 def _orchestrator(tmp_path, slug: str = "probe"):
+    """An orchestrator over the harness config, never the machine's own.
+
+    `load()` with no path reads `./credentials.json` — on a working machine a live cloud endpoint with
+    a key. Every `fire` test below goes through this, so this is the one line that decides whether a
+    unit test of the fire *decision* can spend money.
+
+    A caller whose test spawns the runner must also put `_HARNESS_PATH` in the environment: the
+    `workflow-runner.py` child loads its own config, and it inherits the environment rather than this
+    object. `test_fire_reports_a_gated_run_as_gated_rather_than_done` is the one that does.
+    """
     from engine.config import load
     from engine.library import resolve
 
     workspace = _workspace(tmp_path, slug)
-    return Orchestrator(config=load(), library=resolve(), workspace=workspace), workspace
+    return Orchestrator(config=load(_HARNESS_PATH), library=resolve(),
+                        workspace=workspace), workspace
 
 
 def test_fire_sets_an_armed_goal_through_the_orchestrator(tmp_path):
@@ -1038,15 +1167,20 @@ def test_fire_sets_an_armed_goal_through_the_orchestrator(tmp_path):
     assert reloaded is not None and reloaded.objective == "triage the overnight issues"
 
 
-def test_fire_reports_a_gated_run_as_gated_rather_than_done(tmp_path):
+def test_fire_reports_a_gated_run_as_gated_rather_than_done(tmp_path, monkeypatch):
     """The outcome names *what happened to the goal*, because that is what decides a re-arm.
 
     Driven through a real plan and a real executor until the graph parks at its terminal gate: the
     point is that `fire` reaches the same end state a manual `run` does and *classifies* it, rather
     than reporting a run sitting at a gate as done.
+
+    This is the one test here that spawns `workflow-runner.py`, so it is the one that needs the harness
+    config in the *environment* rather than only in the orchestrator: the child loads its own config
+    and would otherwise take the machine's, which names a live cloud endpoint.
     """
     from engine.schedules import fire
 
+    monkeypatch.setenv("AGENTORG_CREDENTIALS", str(_HARNESS_PATH))
     orch, workspace = _orchestrator(tmp_path)
     entry = ScheduleEntry(slug="probe", objective="Add cursor pagination to the booking API",
                           posture="supervised")
@@ -1232,9 +1366,18 @@ def test_schedules_watch_fires_a_due_entry_and_pauses_after_a_failure(tmp_path):
     """The refusal the whole feature is built around, driven from the CLI.
 
     A one-shot entry set to the immediate past is due at the first tick. The goal it starts cannot
-    run — there is no executor the provider could build for a bare objective here — so the fire fails,
-    the entry pauses itself, and the watcher says why. `--ticks 3` keeps the test finite while leaving
-    room for a second fire to be possible: if the no-re-arm rule were missing, it would happen.
+    run — the only provider the harness configures is a closed loopback port, so the run's first model
+    call is refused in milliseconds — so the fire fails, the entry pauses itself, and the watcher says
+    why. `--ticks 3` keeps the test finite while leaving room for a second fire to be possible: if the
+    no-re-arm rule were missing, it would happen.
+
+    What this docstring used to say — "there is no executor the provider could build for a bare
+    objective here" — was never true, and the reason it looked true is the defect this file has now
+    fixed. `_run` read the *machine's* `credentials.json`, whose default provider is a live cloud
+    endpoint: the fire really did plan, really did start, and the watcher sat on an established TLS
+    connection to that endpoint for minutes spending money until someone killed it. The failure
+    asserted below only appeared when the whole file was invoked with
+    `AGENTORG_CREDENTIALS=credentials.example.json` — a property of how it was run, not of the test.
     """
     root = tmp_path / "projects"
     workspace = _workspace(tmp_path, "clocked", root=root)

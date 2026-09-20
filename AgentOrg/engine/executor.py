@@ -35,6 +35,11 @@ DESIGN
 - **A parse failure is a needs_review, not a crash.** A model that ignores the trailer format has still
   done work; discarding it would waste the tokens it cost, so the raw reply is preserved as the
   summary and the node is marked for review.
+- **The trailer is asked for in the form the provider can enforce.** Where the provider declares JSON
+  mode, the turns whose job is the trailer request it (`_json_mode`) instead of asking a small model for
+  a JSON object in prose — which is how a node whose work had already succeeded parked on a contract it
+  reported nothing against. A tool loop's tool-calling turns are exempt: they must remain able to call
+  a tool.
 
 Usage:
     executor = NodeExecutor(context=ctx)
@@ -1627,9 +1632,17 @@ class NodeExecutor:
         # focused repair turn is attempted, which restates this node's own criteria verbatim. This is
         # a repair, not a rework: the same attempt, one extra cheap call, asked only for the trailer.
         if self._may_repair_trailer() and self._trailer_needs_repair(trailer, parse_error, bundle):
+            # What the reply *did* carry, passed into the repair so the retry can name the failure
+            # rather than restate the rule. Two shapes cover nothing while looking complete: names
+            # that resolve to no criterion of this node (the skill's checklist ids, say), and a
+            # correct list of criteria all marked `satisfied: false`. A model told only "cover every
+            # criterion" reproduces whichever it produced.
+            _, unrecognized = self._criterion_references(trailer, list(bundle.contract.criteria))
             repaired = self._repair_trailer(agent, node_id=node_id, session=session, reply=reply,
                                             bundle=bundle, attempt=attempt,
-                                            reason="parse" if parse_error else "criteria")
+                                            reason="parse" if parse_error else "criteria",
+                                            unrecognized=unrecognized,
+                                            unsatisfied=_unsatisfied_count(trailer))
             if repaired is not None:
                 trailer, parse_error = repaired
 
@@ -2225,6 +2238,12 @@ class NodeExecutor:
             system=prompt.system,
             max_tokens=min(self.ctx.max_output_tokens,
                            int(agent.max_output or self.ctx.max_output_tokens)),
+            # A node without tools has no prose deliverable to trade against: its reply *is* the
+            # trailer, so the provider is asked to enforce the JSON shape where it declares it can.
+            # This is the common case that needed no repair at all until the trailer was asked for in
+            # prose — and it was asked for in prose everywhere in the engine, on every node, because
+            # nothing ever set this field.
+            json_mode=self._json_mode(agent),
         )
         inputs_hash = str(hash(prompt.text))[-12:]
         started = time.time()
@@ -2245,6 +2264,35 @@ class NodeExecutor:
                 return response
 
         return self._invoke(agent, request, node_id=node_id, session=session, latency_start=started)
+
+    def _json_mode(self, agent: Any) -> bool:
+        """Whether to ask this agent's provider to *enforce* a JSON object for this reply.
+
+        The trailer is a JSON object, and asking for it in prose is the thing a small model fails at.
+        A real run made this plain: a `pm` node answered with a verbatim echo of the prompt's own
+        schema example, and every repair turn after it answered in prose. Its provider declares JSON
+        mode, both adapters honour it, and **nothing in the engine ever set it** — so the trailer was
+        requested in the one form the provider cannot enforce, and the run parked on a contract the
+        node had no reliable way to satisfy.
+
+        Only a verified ``True`` is honoured. `ProviderCapabilities` documents ``None`` as *unprobed*,
+        and that distinction is load-bearing: sending `response_format`/`format: json` to an endpoint
+        that ignores it loses the trailer the contract depends on while the log says it was asked for.
+
+        `capabilities()` is a declaration, not a probe — the provider interface requires it to be
+        cheap and free of network I/O — so this is safe to call on every turn.
+        """
+        providers = getattr(getattr(self.ctx, "gateway", None), "providers", None)
+        if not providers:
+            return False
+        provider = providers.get(str(getattr(agent, "provider", "") or ""))
+        if provider is None:
+            return False
+        try:
+            capabilities = provider.capabilities()
+        except Exception:  # noqa: BLE001 - a provider that cannot report is not asked
+            return False
+        return getattr(capabilities, "supports_json_mode", None) is True
 
     # ── the agentic loop ────────────────────────────────────────────────────
 
@@ -2494,6 +2542,14 @@ class NodeExecutor:
         def _complete(request: ChatRequest) -> Any:
             # The model id and provider come from the agent, since the loop builds the request.
             request.model = agent.model
+            # JSON mode on the loop's **final, tool-less turn** only — the one the loop reserves for
+            # the answer ("tools are disabled. Produce your work and the required output trailer
+            # now"). That turn's whole job is the trailer, so constraining it to a JSON object cannot
+            # cost a tool call. Forcing it on every turn would: a model that must emit a tool call
+            # cannot also be constrained to a JSON object the tool-call schema does not admit, and an
+            # intermediate prose answer is not what the contract reads.
+            if not request.tools:
+                request.json_mode = self._json_mode(agent)
             return self.ctx.gateway.complete(request, provider_id=agent.provider,
                                              agent_id=agent.id, node_id=node_id,
                                              session_id=session.session_id)
@@ -2643,6 +2699,7 @@ class NodeExecutor:
 
     def _repair_trailer(self, agent: Any, *, node_id: str, session: Session, reply: str,
                         bundle: SkillBundle, attempt: int, reason: str = "parse",
+                        unrecognized: list[str] | None = None, unsatisfied: int = 0,
                         ) -> tuple[dict[str, Any], str] | None:
         """Ask, in a focused turn, for the trailer the first reply omitted or mis-scoped.
 
@@ -2660,12 +2717,28 @@ class NodeExecutor:
         is returned. `ok` is logged only when the criteria are actually covered; otherwise the
         incompleteness is named — which is what the reader needs to know, because it distinguishes
         "the model could not evidence its own work" from "the engine mangled a good reply".
+
+        `unrecognized` is the list of names the rejected reply used that resolved to no criterion of
+        this node. It is fed back into the repair because that is the only difference between the
+        retry that works and the retry that repeats the failure: a model that answered `PM1`–`PM12`
+        (this skill's checklist ids) needs to be told those name a different block, not merely told
+        again to cover every criterion. It is carried forward from turn to turn for the same reason.
+
+        `unsatisfied` is the other way a reply covers nothing while looking complete: every criterion
+        named correctly and every one marked `satisfied: false`. Carried forward the same way, and for
+        the same reason — the retry that repeats an honest negative covers nothing again.
         """
         from .providers.base import ChatRequest, Message, Role
 
         checklist = ", ".join(bundle.checklist_ids()) or "(none)"
         criteria_list = list(bundle.contract.criteria)
-        criteria = "\n".join(f"- {c}" for c in criteria_list) or "- (none declared)"
+        # Each criterion is listed with the id the contract check resolves, so "copy the line" yields a
+        # reference that matches instead of one the checker reports as covering nothing. The repair
+        # prompt had told the model to copy the text verbatim while the list carried no ids — and a
+        # real run's two repair turns, and every attempt after them, still produced zero coverage.
+        criteria = "\n".join(f"- c{i} — {c}" for i, c in enumerate(criteria_list, 1)) \
+            or "- (none declared)"
+        ignored = list(unrecognized or [])
         best: tuple[dict[str, Any], int] | None = None
         last_error = ""
         turns = 2 if criteria_list else 1
@@ -2679,7 +2752,8 @@ class NodeExecutor:
             " characters omitted from the middle] …\n\n" + reply[-6000:])
         for turn in range(1, turns + 1):
             instruction = self._repair_instruction(
-                reason=reason, turn=turn, criteria=criteria, checklist=checklist)
+                reason=reason, turn=turn, criteria=criteria, checklist=checklist,
+                unrecognized=ignored, unsatisfied=unsatisfied)
             request = ChatRequest(
                 model=agent.model,
                 messages=[Message.text_message(Role.USER,
@@ -2687,6 +2761,12 @@ class NodeExecutor:
                                                f"{excerpt}")],
                 system="You emit one JSON object in a fenced block, and nothing else.",
                 max_tokens=min(self.ctx.max_output_tokens, 2048),
+                # This turn exists for exactly one reason — to produce the trailer the first reply
+                # omitted or mis-scoped — so the provider is asked to enforce the JSON shape rather
+                # than trusting a small model to comply in prose, which is what it had been doing.
+                # The fence becomes optional as a side effect: a reply constrained to a bare JSON
+                # object is still read, by the parser's trailing-object fallback.
+                json_mode=self._json_mode(agent),
             )
             self._log("trailer.repair", node_id=node_id, agent_id=agent.id,
                       detail={"original_chars": len(reply), "turn": turn})
@@ -2703,7 +2783,8 @@ class NodeExecutor:
             if error:
                 last_error = error
                 continue
-            covered = len(self._criteria_met(trailer, criteria_list))
+            met, ignored_now = self._criterion_references(trailer, criteria_list)
+            covered = len(met)
             if best is None or covered > best[1]:
                 best = (trailer, covered)
             if not criteria_list or covered >= len(criteria_list):
@@ -2712,36 +2793,81 @@ class NodeExecutor:
                                   "criteria": len(criteria_list)})
                 return trailer, ""
             # Under-covered: say so plainly, and try once more with a sharper restatement. The
-            # missing criteria are named because "which ones" is the actionable part.
+            # missing criteria are named because "which ones" is the actionable part — and so are the
+            # names the model used instead, which is what makes the second attempt a correction rather
+            # than a repetition.
+            ignored = ignored_now
+            unsatisfied = _unsatisfied_count(trailer)
             self._log("trailer.repair.incomplete", level="warning", node_id=node_id,
                       agent_id=agent.id,
-                      detail={"turn": turn, "covered": covered, "criteria": len(criteria_list)})
+                      detail={"turn": turn, "covered": covered, "criteria": len(criteria_list),
+                              # What the reply actually carried, so "0 of 3" is not the whole story:
+                              # a reply that omitted `criteria_satisfied` and one that marked all
+                              # three `satisfied: false` are the same number and need different
+                              # answers — the first is a shape failure, the second an honest negative.
+                              "keys": sorted(str(key) for key in trailer)[:8],
+                              "unsatisfied": unsatisfied,
+                              "unrecognized": ignored_now[:6]})
         if best is not None:
             # Return the best attempt even when incomplete: the node stays `needs_review` through the
             # contract check, and the trailer gives the Owner the most coverage the model produced.
             return best[0], last_error
         return None
 
-    def _repair_instruction(self, *, reason: str, turn: int, criteria: str, checklist: str) -> str:
+    def _repair_instruction(self, *, reason: str, turn: int, criteria: str, checklist: str,
+                            unrecognized: Iterable[str] = (), unsatisfied: int = 0) -> str:
         """The repair prompt. Turn 2 is sharper and explicit about the failure mode.
 
         A model that under-covered once is usually one restatement away from covering everything, and
         the second turn names *why* the first was rejected — so the retry is a correction rather than a
         repetition, which is the only kind of retry worth spending.
+
+        `unrecognized` names the references the rejected reply actually used and that resolved to no
+        criterion here. A real run's replies named `PM1`–`PM12` — the *checklist* ids, printed in the
+        prompt just above the criteria — so "cover every criterion" restated produced the same list
+        again, twice, on every attempt. Saying which names counted for nothing is what turns the retry
+        into a correction; it invents no coverage, it reports what the check did with what was written.
+
+        `unsatisfied` is the other zero-coverage case, and the one the wording missed: the reply named
+        every criterion correctly and marked all of them `"satisfied": false`. Another real run's `api`
+        node did exactly that — "the task lacks necessary details to cover the domain operations" — on
+        every attempt, so the contract recorded no coverage each time while the reply looked complete.
+        The prompt invited that reading; it now states the standard, and this says it again where the
+        model is actually looking.
         """
+        ignored = [str(name) for name in unrecognized if str(name).strip()]
         if reason == "criteria":
             framing = (
                 "You have already produced the work below. It is complete; do not redo it.\n\n"
                 "Your previous reply's `criteria_satisfied` did NOT cover THIS node's own completion "
-                "criteria — most likely because you reported the upstream node's criteria, which "
-                "happened to be in your context. The criteria that gate THIS node are the ones listed "
-                "below, and only those count.\n\n"
+                "criteria — most likely because you named the upstream node's criteria, or the "
+                "checklist's own ids, rather than this node's criteria. The criteria that gate THIS "
+                "node are the ones listed below, and only those count.\n\n"
             )
         else:
             framing = (
                 "You have already produced the work below. It is complete; do not redo it.\n\n"
                 "Your previous reply is in the user message. It is MISSING the required machine-readable "
                 "trailer, so the engine could not record your result.\n\n"
+            )
+        if ignored:
+            framing += (
+                "The criteria your last reply named were: "
+                + ", ".join(f"`{name[:80]}`" for name in ignored[:6])
+                + ". NONE of those is a criterion of this node, so the coverage they claim is nothing. "
+                "A checklist id (`PM1`, `CR1`) identifies an item in the checklist block, not a "
+                "criterion — the two blocks are separate and both must be reported, in their own "
+                "fields.\n\n"
+            )
+        if unsatisfied and not ignored:
+            framing += (
+                f"Your last reply named this node's criteria correctly and marked all {unsatisfied} of "
+                "them `\"satisfied\": false`. The contract counts only criteria you claim as satisfied, "
+                "so a reply like that reports no coverage at all and the node stays blocked. Measure "
+                "each criterion against the goal you were given rather than against the skill's fullest "
+                "use: if your output addresses that dimension as far as the goal requires, mark it "
+                "`true` and cite the evidence; mark it `false` only when the goal needed something that "
+                "is genuinely missing.\n\n"
             )
         if turn > 1:
             framing += (
@@ -2762,8 +2888,10 @@ class NodeExecutor:
             "This is a required handoff field: a payload without it is refused at the edge, so an "
             "answer with no summary cannot advance even when every criterion is covered.\n"
             '- `criteria_satisfied`: an ARRAY with one object for EVERY criterion below, each with '
-            '`criterion` (verbatim, copied from the list) `satisfied` (true/false) and `evidence` (a '
-            'path, a hash, or command output). Cover ALL of them.\n'
+            '`criterion` either the criterion\'s id (`c1`, `c2`, … as listed below) or its text '
+            'copied verbatim from the list, `satisfied` (true/false) and `evidence` (a path, a hash, '
+            'or command output). Cover ALL of them. An entry naming none of the criteria below counts '
+            'for nothing — including a copy of an example, which is not a report.\n'
             f'- `checklist`: one entry per id for every id here: {checklist}. Each entry is '
             '`{"id":…,"status":"PASS|FAIL|N/A","evidence":…}`. Do not omit an id.\n'
             '- `artifacts`: the files you produced, each as '
@@ -2945,11 +3073,25 @@ class NodeExecutor:
         Matching is exact first, then a distinctive-fragment match, mirroring the runner's own rule so
         the two cannot disagree about what counts.
         """
+        return self._criterion_references(trailer, criteria)[0]
+
+    def _criterion_references(self, trailer: dict[str, Any],
+                              criteria: list[str]) -> tuple[list[str], list[str]]:
+        """Resolve the trailer's criteria references, and report the ones that resolved to nothing.
+
+        The second half is what a repair turn needs. A model that covered nothing usually *did* answer
+        with references — just not to this node's criteria: a real run's replies named `PM1`–`PM12`,
+        which are this skill's **checklist** ids, printed in the prompt immediately above the criteria.
+        Coverage of nothing is then not a mystery, and the retry can say which names were ignored
+        instead of repeating the same instruction and getting the same list back. Naming them fabricates
+        nothing: it only reports what the model already wrote and what the check did with it.
+        """
         if not criteria:
-            return []
+            return [], []
         satisfied = trailer.get("criteria_satisfied") or []
         normalised = [c.strip() for c in criteria]
         met: list[str] = []
+        unmatched: list[str] = []
         for entry in satisfied:
             if isinstance(entry, dict):
                 # `satisfied: false` means the model explicitly did not meet it, which must not count.
@@ -2967,6 +3109,8 @@ class NodeExecutor:
                 index = int(index_match.group(1))
                 if 1 <= index <= len(normalised):
                     met.append(normalised[index - 1])
+                else:
+                    unmatched.append(reference)
                 continue
             exact = [c for c in normalised if c.lower() == lowered]
             if exact:
@@ -2977,15 +3121,10 @@ class NodeExecutor:
                 met.append(partial[0])
                 continue
             # No match: the reference names something this node was not asked to satisfy. Dropping it
-            # is the whole point — see the docstring.
+            # is the whole point — see `_criteria_met`.
+            unmatched.append(reference)
         # De-duplicate while preserving order.
-        seen: set[str] = set()
-        out: list[str] = []
-        for entry in met:
-            if entry not in seen:
-                seen.add(entry)
-                out.append(entry)
-        return out
+        return _unique_strings(met), _unique_strings(unmatched)
 
     def _evidence_for(self, trailer: dict[str, Any], artifacts: list[ArtifactRef],
                       met: list[str]) -> list[str]:
@@ -3033,7 +3172,12 @@ class NodeExecutor:
                 "dimension": str(entry.get("dimension") or "quality"),
                 "owasp": str(entry.get("owasp") or ""),
                 "file": str(entry.get("file") or entry.get("path") or ""),
-                "line": int(entry.get("line") or 0),
+                # A model writes `"line": "N/A"` as readily as a number, and `int()` on that raised
+                # `ValueError` straight out of `execute_node`. The runner reports that as "a node
+                # raised an error" and ends the run on it — a real run died this way on its third
+                # node, with two nodes already done. A line number is not worth a run: an
+                # unparsable one becomes 0, exactly as an absent one does.
+                "line": _as_int(entry.get("line")),
                 "issue": str(entry.get("issue") or entry.get("note") or "")[:1000],
                 "fix": str(entry.get("fix") or "not specified")[:1000],
             })
@@ -3508,7 +3652,7 @@ class NodeExecutor:
             node_id=node_id, skill=skill, agent_id=agent.id, agent_name=agent.name,
             status=str(result.get("status") or ""), verdict=str(result.get("verdict") or ""),
             session_id=session.session_id,
-            attempts=int(trailer.get("attempt") or 1),
+            attempts=_as_int(trailer.get("attempt"), 1),
             tokens=(usage.get("tokens_in") or 0) + (usage.get("tokens_out") or 0),
             cost_usd=usage.get("cost_usd"),
             artifacts=list(artifacts),
@@ -3634,6 +3778,46 @@ class NodeExecutor:
         with self.ctx.lock:
             return [session.as_dict(include_turns=False)
                     for session in self.ctx.sessions.values()]
+
+
+def _unsatisfied_count(trailer: dict[str, Any]) -> int:
+    """How many of a reply's criteria entries it explicitly marked `satisfied: false`.
+
+    The count is what distinguishes "the reply never mentioned the criteria" from "the reply named
+    every criterion and denied every one" — the same zero coverage, and two failures that need
+    different corrections.
+    """
+    return sum(1 for entry in (trailer.get("criteria_satisfied") or [])
+               if isinstance(entry, dict) and entry.get("satisfied") is False)
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    """Coerce a model-supplied number, tolerating what a model writes instead.
+
+    `"N/A"`, `""` and `null` are all values a real reply put where a number was asked for, and any of
+    them raised `ValueError` out of `execute_node` — which the runner reports as a node that "raised an
+    error" and ends the run on. Nothing the engine can do with such a field is worth a run, so it
+    degrades to the default rather than propagating.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    """De-duplicate, preserving order — the order is the model's own, and it reads as a narration."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
 
 
 def _env_flag(name: str) -> bool:

@@ -27,10 +27,15 @@ DESIGN
 - **The boundary is code, not config.** An improver that can edit its own eval gate can make anything
   pass, so a system whose safety is enforced by code it can rewrite does not have that property. The
   refused list is hard-coded; a config knob would imply a supported alternative and there is none.
-- **Validation reads the tree; it does not patch it.** The suite runs against the working tree as it
-  stands and the result is compared to the frozen baseline. No patch is ever applied, so a run cannot
-  be said to have *caused* anything — an improvement means a scenario the baseline recorded failing now
-  passes, and anything else, including a scenario that already passed, has demonstrated nothing.
+- **Validation patches a copy, never the tree.** A proposal that carries a patch is applied to a
+  throwaway copy of the tree and the suite runs *there* — so the proposal can be shown to have
+  *caused* a flip, and validating a proposal cannot be the thing that changes the code being judged.
+  A proposal carrying no patch has nothing to run *with*; the suite still runs, because the honest
+  result of doing nothing is worth recording, and the detail says so.
+- **An improvement is a delta the patch caused.** The named scenario must have been failing in the
+  frozen baseline, failing in the copy *before* the patch, and passing *after* it. "It passes now" is
+  true of every proposal, including one that changes nothing, and a flip the patch did not cause is
+  somebody else's fix.
 - **A refusal names the path.** An improver that quietly discards work teaches nobody anything.
 - **Rejections are recorded**, so the same proposal is not re-litigated every cycle.
 - **Promotion is a file, not an action.** A proposal is written where a person can read and diff it.
@@ -49,6 +54,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,12 +66,41 @@ from typing import Any, Callable, Iterable
 __all__ = [
     "ImproverError", "Finding", "Proposal", "Validation", "Improver",
     "SAFETY_SURFACES", "is_safety_surface", "PROPOSALS_DIRNAME", "PROPOSAL_VERSION",
+    "SCRATCH_EXCLUDES", "SCRATCH_TIMEOUT_S",
 ]
 
 #: Where promoted proposals wait for the Owner. A directory rather than a queue, because a proposal is
 #: a diff a person has to *read*, and the tool for reading a diff is already on their machine.
 PROPOSALS_DIRNAME = "proposals"
 PROPOSAL_VERSION = "1.0.0"
+
+#: What a scratch copy leaves out, and why each entry is safe to leave out.
+#:
+#: Validation copies the tree so the suite can be run against a *patched* copy, which means the copy
+#: needs everything the suite reads and nothing else:
+#:
+#: - `.git`         — history and objects. The copy is not a repository, and a patch is not a commit;
+#:                    `git apply` works on files, so nothing here is needed.
+#: - `.build`       — Swift build output (`macos/.build` is ~640 MB on this checkout alone).
+#: - `projects/`    — the user's own workspaces, including a *live* run's traces and artifacts. A
+#:                    validation must not read the state of the run it is judging.
+#: - `.agent_state` — this engine's spans, proposals and journals, for the same reason.
+#: - caches and stale bytecode: `.agent_cache`, `.pytest_cache`, `.ruff_cache`, `__pycache__`.
+#:
+#: Measured on this checkout: the copy is 248 files / 6.7 MB and takes ~0.17 s to make. The tree it
+#: copies is 663 MB, of which `macos/.build` alone is 639 MB — so the exclusions are what make a
+#: copy-per-validation affordable rather than a reason to skip the copy and patch in place.
+SCRATCH_EXCLUDES: tuple[str, ...] = (
+    ".git", ".build", "projects", ".agent_cache", ".agent_state",
+    ".pytest_cache", ".ruff_cache", "__pycache__",
+)
+
+#: How long a scratch suite run may take before it is declared unrunnable.
+#:
+#: The suite takes ~2 s here, so this is a ceiling for a *hung* run rather than a budget. A run that
+#: hits it is reported as one that could not run — never as a pass, which is the same rule the suite
+#: itself follows for a scenario that cannot run.
+SCRATCH_TIMEOUT_S = 900
 
 #: The machinery that judges this loop. **Refused, always, and not configurable.**
 #:
@@ -188,6 +226,11 @@ class Validation:
 
     Both halves are required. "Not worse" is not an improvement, and calling it one is how a
     self-improving system drifts.
+
+    `patched_in_scratch` is separate from `ran` on purpose. `ran` means the suite produced a result;
+    `patched_in_scratch` means there was a patch, it was applied to a **copy** of the tree, and the
+    suite ran against that copy. Only the second can evidence that a proposal changed anything, and a
+    result without it is a run of the tree as it already stands.
     """
 
     ran: bool = False
@@ -195,6 +238,9 @@ class Validation:
     improved: list[str] = field(default_factory=list)
     #: Set when the Python suite cannot judge the change at all — Swift, docs, UI.
     unvalidatable: str = ""
+    #: Whether the patch was applied to a scratch copy and the suite run there. The working tree is
+    #: never written to; see `Improver._validate_patch`.
+    patched_in_scratch: bool = False
     detail: str = ""
 
     @property
@@ -205,6 +251,7 @@ class Validation:
     def as_dict(self) -> dict[str, Any]:
         return {"ran": self.ran, "regressions": list(self.regressions),
                 "improved": list(self.improved), "unvalidatable": self.unvalidatable,
+                "patched_in_scratch": self.patched_in_scratch,
                 "detail": self.detail, "ok": self.ok}
 
 
@@ -257,7 +304,8 @@ class Proposal:
     def from_dict(cls, data: dict[str, Any]) -> "Proposal":
         validation = Validation(**{
             k: v for k, v in (data.get("validation") or {}).items()
-            if k in ("ran", "regressions", "improved", "unvalidatable", "detail")})
+            if k in ("ran", "regressions", "improved", "unvalidatable", "patched_in_scratch",
+                     "detail")})
         return cls(
             proposal_id=str(data.get("proposal_id") or ""),
             finding=Finding.from_dict(data.get("finding") or {}),
@@ -305,6 +353,9 @@ class Proposal:
             lines.append("(no file paths declared — treat this as a description, not a patch)")
         lines += ["", "## Validation", ""]
         lines.append(f"- ran: {self.validation.ran}")
+        if self.validation.patched_in_scratch:
+            lines.append("- applied to a **scratch copy** of the tree, and the suite ran there; the "
+                         "working tree was not written to")
         lines.append(f"- improves: {', '.join(self.validation.improved) or '(none demonstrated)'}")
         lines.append(f"- regressions: {', '.join(self.validation.regressions) or '(none)'}")
         if self.validation.unvalidatable:
@@ -356,10 +407,18 @@ class Improver:
         The spans file to read. Defaults to the workspace's own.
     run_suite:
         Injected, so the validator can be tested without running 17 scenarios. Defaults to the real
-        suite.
+        suite. It runs the suite **as it stands**, for a proposal that carries no patch.
     draft_fn:
         Injected, so a test can supply a proposal without a model. With none, `draft` produces a
         *described* proposal from the finding alone — which is still useful, and still gated.
+    repo_root:
+        The tree a proposal's patch is written against, and the tree a scratch copy copies. Defaults to
+        the checkout this module lives in, because that is the tree a proposal describes.
+    scratch_suite:
+        How the suite is run *inside a scratch copy*. Defaults to a subprocess of this repo's own
+        runner with the copy as its working directory — out of process on purpose, because an
+        in-process run imports the engine already loaded in `sys.path` and would keep exercising the
+        original tree however the working directory were set.
     """
 
     workspace: Any
@@ -367,6 +426,8 @@ class Improver:
     telemetry_path: Path | None = None
     run_suite: Callable[..., Any] | None = None
     draft_fn: Callable[[Finding], tuple[str, str, list[str]]] | None = None
+    repo_root: Path | None = None
+    scratch_suite: Callable[[Path], Any] | None = None
     _counter: int = 0
 
     # ── Q1: detect ──────────────────────────────────────────────────────────
@@ -625,13 +686,23 @@ class Improver:
     # ── Q3: validate ────────────────────────────────────────────────────────
 
     def validate(self, proposal: Proposal) -> Validation:
-        """Run the suite as it stands and compare against the frozen baseline. Never modifies the tree.
+        """Run the suite **with the proposal's patch applied to a scratch copy**, and compare.
 
-        The suite runs against the *unmodified* tree — this module applies no patch, so the run cannot
-        be said to have caused anything. What it can show is a delta against the baseline, and the only
-        honest claim available is a scenario the baseline recorded **failing** that now passes. The
-        proposal must show **no regression** *and* such a flip — a change that is merely not-worse is
-        not an improvement, and neither is a scenario the baseline already passed.
+        Three outcomes, and the difference between them is the point:
+
+        - **A proposal carrying a patch** has that patch applied to a throwaway copy of the tree, and
+          the suite runs there — twice, once as the tree stands and once with the patch — so a flip can
+          be attributed to *this* patch. The working tree is never written to: validating a proposal
+          must not be the thing that changes the code being judged.
+        - **A proposal carrying no patch** cannot be run *with* anything. The suite still runs, because
+          the honest result of doing nothing is worth recording, and the detail says plainly that a run
+          of the unchanged tree cannot evidence a fix.
+        - **A patch that cannot be applied** — none to apply, aimed at a safety surface, or not applying
+          cleanly — is refused with the reason named, before a scratch copy or a suite run is spent.
+
+        Either way the claim is a *delta the patch caused*, never a threshold: no regression against the
+        frozen baseline, and the scenario the finding names must have been failing in that baseline,
+        failing in the copy before the patch, and passing after it.
         """
         validation = Validation()
         if proposal.state == "refused":
@@ -649,30 +720,156 @@ class Improver:
             proposal.validation = validation
             return validation
 
+        baseline = self._baseline()
+
+        if proposal.patch.strip():
+            self._validate_patch(proposal, validation, baseline)
+            proposal.validation = validation
+            return validation
+
         runner = self.run_suite or self._default_run_suite()
         if runner is None:
             validation.detail = "no behavioural suite is available to validate against"
             proposal.validation = validation
             return validation
+        self._validate_unchanged(proposal, validation, runner, baseline)
+        proposal.validation = validation
+        return validation
 
+    def _validate_unchanged(self, proposal: Proposal, validation: Validation, runner: Callable[..., Any],
+                            baseline: dict[str, Any] | None) -> None:
+        """A proposal with no patch: run the suite as it stands, and say what that can mean.
+
+        Kept rather than short-circuited because "nothing was demonstrated" is a result worth
+        recording, and a described proposal is still shown to the Owner (`promote` writes it out;
+        `proposals.apply` refuses it for carrying no patch). There is nothing to apply, so no scratch
+        copy is built and nothing here can be read as *caused* by the proposal.
+        """
         try:
             result = runner()
         except Exception as exc:  # noqa: BLE001 - a suite that cannot run is not a passed suite
             validation.detail = f"the suite could not run: {type(exc).__name__}: {exc}"
-            proposal.validation = validation
-            return validation
+            return
 
         validation.ran = True
-        baseline = self._baseline()
-        regressions = self._regressions(result)
-        validation.regressions = regressions
+        validation.regressions = self._regressions(result)
         validation.improved = self._improvements(result, proposal.finding, baseline)
-        validation.detail = (
-            f"{len(validation.improved)} improvement(s), {len(regressions)} regression(s)"
-            if (validation.improved or regressions)
-            else self._no_improvement_detail(proposal.finding, baseline))
-        proposal.validation = validation
-        return validation
+        if validation.improved or validation.regressions:
+            validation.detail = (f"{len(validation.improved)} improvement(s), "
+                                 f"{len(validation.regressions)} regression(s)")
+        else:
+            validation.detail = (
+                "no patch to apply, so nothing this proposal does can be shown to have changed the "
+                "suite; " + self._no_improvement_detail(proposal.finding, baseline))
+
+    def _validate_patch(self, proposal: Proposal, validation: Validation,
+                        baseline: dict[str, Any] | None) -> None:
+        """Apply the patch to a scratch copy, run the suite there twice, and fill in the proof.
+
+        The copy is made before anything is checked and removed in a `finally`, so a patch that cannot
+        be applied, a suite that raises, and a clean run all leave the filesystem as they found it. Two
+        runs rather than one because a flip has to be *caused*: the first run is the tree as it stands,
+        and a scenario that already passed there cannot have been fixed by this patch.
+        """
+        # Lazy: `engine/proposals.py` imports this module. Its `git apply` and its patch-path reader
+        # are reused rather than re-implemented, because a second answer to "what does this patch
+        # touch" or "does it apply" is a second answer that can disagree with the one that writes bytes.
+        from .proposals import _git, _paths_in_patch, _tail
+
+        paths = _paths_in_patch(proposal.patch) or [str(t) for t in proposal.touches]
+        for path in paths:
+            if is_safety_surface(path):
+                validation.detail = (
+                    f"refused: the patch aims at {path}, which is part of the machinery that judges "
+                    "this loop. That boundary is not configurable, and the patch was not applied — not "
+                    "even to a scratch copy.")
+                return
+
+        parent = Path(tempfile.mkdtemp(prefix="agentorg-scratch-"))
+        root = parent / "tree"
+        patch_file = parent / "proposal.diff"
+        try:
+            # `symlinks=False` dereferences: if a link ever appears in the tree, the copy holds real
+            # bytes, so a patch applied in the copy cannot write through to the original file.
+            shutil.copytree(self.repo(), root,
+                            ignore=shutil.ignore_patterns(*SCRATCH_EXCLUDES), symlinks=False)
+            patch_file.write_text(
+                proposal.patch if proposal.patch.endswith("\n") else proposal.patch + "\n",
+                encoding="utf-8")
+
+            suite = self.scratch_suite or self._scratch_suite_result
+            before = suite(root)
+
+            check = _git(root, "apply", "--check", "--verbose", str(patch_file))
+            if check.returncode == 127:
+                validation.detail = (
+                    f"refused: git could not be run, so the patch can be neither checked nor applied "
+                    f"({_tail(check.stderr)})")
+                return
+            if check.returncode != 0:
+                validation.detail = (
+                    "refused: the patch does not apply to a copy of the current tree — it has drifted "
+                    f"since it was drafted. git said: {_tail(check.stderr)}")
+                return
+            applied = _git(root, "apply", str(patch_file))
+            if applied.returncode != 0:
+                validation.detail = (
+                    "refused: the patch passed its check but git could not apply it "
+                    f"({_tail(applied.stderr or applied.stdout)})")
+                return
+
+            after = suite(root)
+        except Exception as exc:  # noqa: BLE001 - a copy or suite that fails is not a passed suite
+            validation.detail = (f"the patch was not validated: {type(exc).__name__}: {exc}")
+            return
+        finally:
+            shutil.rmtree(parent, ignore_errors=True)
+
+        validation.ran = True
+        validation.patched_in_scratch = True
+        validation.regressions = self._regressions(after)
+        validation.improved = self._flips(after, before, proposal.finding, baseline)
+        validation.detail = self._patch_detail(proposal.finding, baseline, before,
+                                               validation.improved, validation.regressions)
+
+    def repo(self) -> Path:
+        """The tree a patch is written against: this package's checkout, unless one was injected.
+
+        A field rather than a constant because a test needs to point the loop at a throwaway tree; the
+        default is the checkout the running engine lives in, which is the tree a proposal describes.
+        """
+        if self.repo_root is not None:
+            return Path(self.repo_root)
+        return Path(__file__).resolve().parent.parent
+
+    def _scratch_suite_result(self, root: Path) -> Any:
+        """Run the behavioural suite inside `root` — out of process, with the copy as the cwd.
+
+        Out of process on purpose: the suite imports the engine from `sys.path`, so an in-process run
+        would keep exercising *this* tree whatever directory it was pointed at, and the copy would be
+        decorated rather than tested. A subprocess started in the copy imports the copy's engine, which
+        is the only run that can show what the patch does.
+        """
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "engine.evals.runner", "--json", "--no-gate"],
+                cwd=str(root), capture_output=True, text=True, timeout=SCRATCH_TIMEOUT_S)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ImproverError(f"the suite could not be run in the scratch copy: {exc}") from exc
+        try:
+            payload = json.loads(proc.stdout.strip())
+        except json.JSONDecodeError:
+            payload = {}
+        if not (payload.get("results") or {}):
+            # An unparseable or empty result is not "the suite ran and found no scenarios": it is a
+            # suite that never got far enough to run one — a patch that broke the engine's import, for
+            # instance. Reading it as a run would report lost coverage for a cause it never named, and
+            # the cause is the useful part: git's own output and Python's traceback name it.
+            from .proposals import _tail
+
+            raise ImproverError(
+                "the suite ran no scenario in the scratch copy; stderr: " + _tail(proc.stderr))
+        return _result_from_payload(payload)
 
     def _default_run_suite(self) -> Callable[..., Any] | None:
         try:
@@ -696,7 +893,14 @@ class Improver:
 
     @staticmethod
     def _regressions(result: Any) -> list[str]:
-        """Regressions against the frozen baseline, including lost coverage."""
+        """Regressions against the frozen baseline, including lost coverage.
+
+        A comparison that could not be *made* is reported as a regression rather than as an absence of
+        one: "the check could not run" and "nothing regressed" are different claims, and the second is
+        the one that lets a change through. An unreadable baseline stays the exception, because a
+        baseline that is not there means no comparison exists at all — and `improved` is empty without
+        one, so nothing can be promoted on the strength of that.
+        """
         try:
             from .evals.runner import compare_to_baseline, BASELINE_PATH
             baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
@@ -704,8 +908,8 @@ class Improver:
             return []
         try:
             return compare_to_baseline(result, baseline)
-        except Exception:  # noqa: BLE001
-            return []
+        except Exception as exc:  # noqa: BLE001 - a comparison that raised is not a passed check
+            return [f"the run could not be compared against the baseline: {type(exc).__name__}: {exc}"]
 
     @staticmethod
     def _improvements(result: Any, finding: Finding,
@@ -714,11 +918,13 @@ class Improver:
 
         A flip *against the frozen baseline*, not merely a passing scenario. `baseline.json` records all
         17 scenarios passing, so "it passes now" is true of every proposal, including one with an empty
-        diff; counting that as an improvement stamps the unchanged tree as a fix. The baseline is what
-        makes "improved" mean that something changed.
+        diff; counting that as an improvement stamps the unchanged tree as a fix.
 
         Bounded deliberately to the scenario the finding points at, because "some other scenario got
         better" is not evidence that *this* change fixed *this* problem.
+
+        Used for a proposal that carries **no patch**: with nothing applied, the run cannot be said to
+        have caused anything, so the baseline is the only thing a flip could be measured against.
         """
         scenario = finding.scenario
         if not scenario or not baseline:
@@ -726,10 +932,73 @@ class Improver:
         was = (baseline.get("results") or {}).get(scenario)
         if not was or was.get("passed"):
             return []
-        for outcome in getattr(result, "outcomes", []) or []:
-            if outcome.name == scenario and getattr(outcome, "passed", False):
-                return [scenario]
+        if _passed(result, scenario):
+            return [scenario]
         return []
+
+    @staticmethod
+    def _flips(after: Any, before: Any, finding: Finding,
+               baseline: dict[str, Any] | None) -> list[str]:
+        """The named scenario, when the proposed patch can be shown to have *caused* it to flip.
+
+        Three conditions, all required:
+
+        1. the frozen baseline recorded it **failing** — because "it passes now" is true of every
+           proposal, including one that changes nothing;
+        2. it failed in the scratch copy **before** the patch was applied, so the flip is this patch's
+           doing rather than something already sitting in the tree;
+        3. it passes **after** the patch.
+
+        Dropping (2) would credit a patch with a fix somebody else already made, which is the same
+        misattribution as counting an already-passing scenario.
+        """
+        scenario = finding.scenario
+        if not scenario or not baseline:
+            return []
+        was = (baseline.get("results") or {}).get(scenario)
+        if not was or was.get("passed"):
+            return []
+        if not _failed(before, scenario):
+            return []
+        return [scenario] if _passed(after, scenario) else []
+
+    def _patch_detail(self, finding: Finding, baseline: dict[str, Any] | None, before: Any,
+                      improvements: list[str], regressions: list[str]) -> str:
+        """What the two scratch runs showed, named rather than asserted.
+
+        When neither an improvement nor a regression holds, the reason has to say *which* of the
+        required conditions failed — otherwise "nothing to promote" reads as a formality rather than as
+        a diagnosis.
+        """
+        if improvements or regressions:
+            return (f"{len(improvements)} improvement(s), {len(regressions)} regression(s) — the patch "
+                    "was applied to a scratch copy of the tree and the suite ran there; the working "
+                    "tree was not written to")
+        return ("the patch was applied to a scratch copy of the tree and the suite ran there, and "
+                "nothing flipped: " + self._no_flip_detail(finding, baseline, before))
+
+    @staticmethod
+    def _no_flip_detail(finding: Finding, baseline: dict[str, Any] | None, before: Any) -> str:
+        """Why the patched run evidenced no improvement, named case by case."""
+        trailing = "nothing to promote"
+        scenario = finding.scenario
+        if not scenario:
+            return (f"the finding names no scenario to improve, so a run cannot evidence a fix; "
+                    f"{trailing}")
+        if baseline is None:
+            return (f"the baseline cannot be read, so no failing-to-passing flip for {scenario!r} can "
+                    f"be shown and none is claimed; {trailing}")
+        was = (baseline.get("results") or {}).get(scenario)
+        if was is None:
+            return (f"the baseline records no {scenario!r}, so a run cannot evidence a fix; {trailing}")
+        if was.get("passed"):
+            return (f"the baseline already records {scenario!r} as passing, so this patch cannot have "
+                    f"flipped it — the patch has demonstrated nothing; {trailing}")
+        if not _failed(before, scenario):
+            return (f"{scenario!r} already passes against the unpatched tree, so the flip is not this "
+                    f"patch's doing; {trailing}")
+        return (f"{scenario!r} was failing at baseline and still fails with the patch applied, so "
+                f"nothing flipped; {trailing}")
 
     @staticmethod
     def _no_improvement_detail(finding: Finding, baseline: dict[str, Any] | None) -> str:
@@ -875,6 +1144,46 @@ def _is_swift_or_docs(path: str) -> bool:
     """Whether a path is something the Python suite cannot judge."""
     text = str(path or "").lower()
     return text.endswith((".swift", ".md", ".plist")) or text.startswith("macos/")
+
+
+def _result_from_payload(payload: dict[str, Any]) -> Any:
+    """A suite's `--json` output as the real `ScenarioResult`, so the gate's own comparison runs.
+
+    Rebuilt as the actual dataclass rather than a look-alike because `compare_to_baseline` and the
+    improvement rule are the gate: a private copy of the result type would let the two drift, and a
+    validation that compared with a different function from the one that ships is not the same check.
+    """
+    from .evals.runner import Outcome, ScenarioResult
+
+    result = ScenarioResult()
+    for name, entry in sorted((payload.get("results") or {}).items()):
+        entry = entry or {}
+        result.outcomes.append(Outcome(
+            name=str(name), passed=bool(entry.get("passed")),
+            check=str(entry.get("check") or ""), detail=str(entry.get("detail") or ""),
+            error=str(entry.get("error") or ""),
+            duration_ms=float(entry.get("duration_ms") or 0.0)))
+    return result
+
+
+def _outcome(result: Any, name: str) -> Any:
+    """The named scenario's outcome in a suite result, or `None` when it did not run."""
+    for outcome in getattr(result, "outcomes", []) or []:
+        if outcome.name == name:
+            return outcome
+    return None
+
+
+def _passed(result: Any, name: str) -> bool:
+    outcome = _outcome(result, name)
+    return bool(outcome is not None and getattr(outcome, "passed", False))
+
+
+def _failed(result: Any, name: str) -> bool:
+    """Whether the scenario ran *and* did not pass. Missing is not failing: a scenario that did not run
+    has demonstrated nothing, and crediting it would be coverage invented out of absence."""
+    outcome = _outcome(result, name)
+    return bool(outcome is not None and not getattr(outcome, "passed", False))
 
 
 def _iso_now() -> str:

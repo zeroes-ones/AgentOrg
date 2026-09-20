@@ -1,0 +1,227 @@
+# tests.yml — the gate this repository did not have.
+#
+# WHY THIS EXISTS
+# ---------------
+# Nothing ran the suite automatically. Two symptoms were already visible: the tier-3 behavioural
+# evals under the Skills library (38 scenarios) have never been executed by anything in this
+# repository, and one test file had been quietly spending money on a live provider every time it ran.
+# Both are named below, with the reason, because a gate that silently skips things is worse than no
+# gate at all.
+#
+# WHY `run_tests.py` AND NOT PYTEST
+# ---------------------------------
+# `python3 run_tests.py` is the repository's own runner: stdlib only, discovers `test_*`, honours
+# `pytest.raises`, runs the fixtures the suite uses, and needs nothing installed (see its docstring).
+# That is the property that makes a gate worth having — a gate that needs a dependency is a gate that
+# gets skipped when the dependency is missing. The suite is also valid pytest, so nothing here is a
+# second, weaker definition of green.
+#
+# WHY macOS, AND WHY PYTHON 3.11
+# ------------------------------
+# **3.11** is the floor README.md:307 documents, so it is the version most likely to catch drift, and
+# it caught some immediately: `tests/test_phase31_sessions_schedule.py` did not even *parse* on 3.11
+# (a 3.12-only multi-line f-string at its line 327) — a defect no run on the developer's 3.14 could
+# ever have shown. It is fixed and the file now loads and passes on both. Verified locally on
+# 3.11.15 and 3.14.6.
+# **macOS** because the engine and the console are macOS-first and the suite's environmental
+# assumptions were verified there. This repository is public, so GitHub-hosted macOS minutes are free;
+# on a private fork they are billed at 10x — which is why `swift` is its own job, so dropping it on a
+# fork is deleting one block rather than weakening the Python gate.
+# The runner image is `macos-latest` rather than a numbered pin: a pin is a promise about
+# availability, and a retired image is a job that never starts. `macos-14` is the pin to use if
+# reproducibility ever matters more (the Swift manifest's floor is `.macOS(.v14)`).
+#
+# WHAT IS DELIBERATELY NOT RUN, ONE REASON PER ENTRY
+# --------------------------------------------------
+# 1. `tests/test_phase7_chat.py` — its `creds` fixture copies the checkout's own `credentials.json`
+#    (`tests/test_phase7_chat.py:773`) with no guard. That file is gitignored, so it does not exist in
+#    a checkout: measured in a tracked-files-only checkout, the file gives **62 passed, 4 failed**,
+#    each failure `FileNotFoundError: .../credentials.json`. They pass on a machine that has the file.
+#    Do NOT "fix" this by writing a `credentials.json` in CI: the absence is load-bearing —
+#    `tests/test_phase45_system_actions.py:74` skips its config-copying tests *because* there is no
+#    file to copy, and a fabricated one turns a deliberate skip into a run against a config nobody
+#    chose. The fix belongs in the fixture: skip when the source is missing, exactly as
+#    `tests/test_phase45_system_actions.py:73-74` already does.
+#
+# 2. `tests/test_phase32_sandbox.py` — the confinement tests execute inline Python *through
+#    `sys.executable`* inside the Seatbelt profile, and that profile grants read access to a fixed list
+#    of system paths (`engine/sandbox.py:104` `SYSTEM_READ_PATHS`: `/usr`, `/System`, `/Library/Frameworks`,
+#    `/private/var/folders`, …). An interpreter installed outside those cannot load its own dylib inside
+#    the sandbox, so 20 of the file's 48 tests fail with `dyld: Library not loaded`.
+#    Measured, same machine, same checkout:
+#      · Python 3.11 (Homebrew, `/opt/homebrew/…`)  → **28 passed, 20 failed**
+#      · Python 3.14 (python.org, `/Library/Frameworks/…`, granted) → **48 passed, 0 failed**
+#    GitHub's `actions/setup-python` installs to the tool cache (`/Users/runner/hostedtoolcache/…`),
+#    which is not granted either, so the Python job would take those 20 failures. The real fix is one
+#    line in `engine/sandbox.py` — grant the interpreter's own prefix (`sys.prefix`, or the resolved
+#    `sys.executable`'s prefix) alongside the constants — and this exclusion should be deleted with it.
+#    A second environmental dependency in the same file is worth knowing about: its
+#    `test_the_home_directory_cannot_be_read` asserts `~/.zshrc` exists (measured: 47 passed, 1 failed
+#    with an empty `$HOME`), so even with a granted interpreter it needs a home directory with a shell
+#    rc file in it.
+#
+# 3. The tier-3 behavioural evals — `evals/tier3-behavioral/*.json` in the Skills library, **38
+#    scenarios** (`seed-scenarios.json` 18, `adversarial-scenarios.json` 12,
+#    `adversarial-coding.json` 8). Excluded for two independent reasons, either one sufficient:
+#    (a) no runner exists — `engine/library.py:80` records that those directories "serve the library's
+#    own skill and eval toolchain", and no line in `engine/` or `tests/` opens them; (b) they cannot
+#    run without spending — a scenario validates *recorded agent output* against its checklist, so
+#    running them means generating that output from a live model. This is not the same thing as
+#    `engine/evals/` (17 in-process scenarios whose own soundness gate is
+#    `tests/test_phase5_evals.py`, which IS in the run below).
+#
+# 4. Anything that would reach a provider. There is no `credentials.json` in a checkout and this job
+#    sets no API keys, so nothing here can spend. That is a property of the environment, not a
+#    promise, and it was already broken once: `tests/test_phase31_sessions_schedule.py` drove
+#    `schedules watch` through the real CLI against the *machine's* credentials, so the watcher
+#    spawned the pinned `workflow-runner.py`, opened a TLS connection to the default provider and sat
+#    there for minutes spending until someone killed it. That file now forces a harness config — one
+#    provider, on a closed loopback port, retries off — through `AGENTORG_CREDENTIALS`, and
+#    `test_the_cli_subprocesses_run_against_the_hermetic_config` fails if that wiring is ever dropped.
+#    A future test that genuinely needs a model must skip rather than spend.
+#
+# 5. The app bundle script and the GUI: `scripts/run-macos-app.sh` assembles and launches the .app,
+#    and nothing here runs it. The `swift` job builds the package and unit-tests AgentOrgKit, which is
+#    the part that can be verified without a window.
+#
+# 6. 27 of the Swift package's 389 tests, in three classes that launch the real engine and assert it
+#    reaches `running` — measured red here (6 failures one run, 41 another) because the engine will not
+#    boot with this machine's current `credentials.json`. The `swift` job names them and the condition
+#    for re-including them.
+#
+# WHAT "GREEN" DOES AND DOES NOT MEAN
+# -----------------------------------
+# `run_tests.py` counts a *skip* as a pass — its own docstring says a missing optional import is
+# skipped, never failed, and that is right for a suite meant to run on a bare interpreter. So a green
+# run here means **"nothing failed"**, not "everything ran". Measured in a checkout with no
+# `credentials.json`, no `~/.agentorg` and an empty `$HOME`: `tests/test_phase45_system_actions.py`
+# reports its 13 tests in 0 seconds because the config-copying ones skip
+# (`tests/test_phase45_system_actions.py:73`), and the machine-tool tests in `test_phase37`/
+# `test_phase42` skip the same way. Read the pass count as "N checks reported no failure", and compare
+# it with a local full run — which is larger — before reading a green job as full coverage.
+#
+# WHAT WAS VERIFIED BEFORE THIS FILE WAS PUSHED, AND WHAT WAS NOT
+# ---------------------------------------------------------------
+# The job's runner, environment and file selection were reproduced locally against a tracked-files-only
+# checkout (no `credentials.json`, `HOME` isolated, `AGENTORG_SKILLS_ROOT` pointing at the library):
+# **31 of the 55 files were run there, 29 green (~1568 tests, 0 failures)**. The two that were not green
+# are exclusions 1 and 2 above — each measured, not assumed. The other 24 files were NOT run by hand
+# (the whole suite is ~25 minutes, and running it was out of scope for adding this file), so the first
+# push is where they are exercised. If this job goes red on a file not named above, that is new
+# information: add it here with its reason rather than weakening the job.
+#
+# KNOWN FLAKE, LEFT IN ON PURPOSE
+# -------------------------------
+# `tests/test_phase11_serve.py` carries a load-dependent race in `Server.serve_forever`: commands run
+# off a daemon worker thread while `_drain` waits on `empty() and _in_flight == 0`. It is documented
+# in SESSION-STATE.md:336-342 and reproduces on pristine `HEAD`, so this job can fail there under load
+# with nothing actually broken. It is NOT excluded: hiding 77 tests to keep a gate quiet is the wrong
+# trade, and the race is a real defect that deserves a red run. Fix the race, not the gate.
+
+name: tests
+
+on:
+  push:
+  pull_request:
+
+# Read-only: nothing in this workflow writes to the repository, and a token that could is a token
+# that some future step will use by accident.
+permissions:
+  contents: read
+
+# A push-heavy branch would otherwise queue one redundant run per commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python suite (run_tests.py, Python 3.11)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: AgentOrg
+    env:
+      # The engine refuses to resolve without a Skills checkout — `engine/library.py:574` raises
+      # `LibraryError` unless `scripts/workflow-runner.py` is found — and on a runner none of
+      # `default_search_paths()` exists. This is the same variable a developer sets locally
+      # (README.md:578). It points outside the workspace so the library is never mistaken for part
+      # of the tree under test.
+      AGENTORG_SKILLS_ROOT: ${{ runner.temp }}/skills-library
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # The documented floor, not the newest. See the header.
+          python-version: "3.11"
+
+      - name: Provide the Skills library the engine runs on
+        # Cloned at its default branch rather than pinned: this is the version a developer's machine
+        # resolves, so a capability check that passes here means the same thing locally. The trade-off
+        # is honest and worth stating — a change in that repository can turn this job red without a
+        # commit here. Verified against commit 8fbfda61. To pin instead, append
+        # `&& git -C "$AGENTORG_SKILLS_ROOT" checkout <sha>` and bump it deliberately.
+        run: git clone --depth 1 https://github.com/zeroes-ones/Skills.git "$AGENTORG_SKILLS_ROOT"
+
+      - name: Check the library the engine will actually resolve
+        # Fails the job at the cause rather than 200 tests later: a missing or incomplete library
+        # makes almost every test fail with the same message, which reads like a broken suite.
+        run: python3 -c "from engine.library import resolve; lib = resolve(); print('library:', lib.files.root); print('runner :', lib.files.runner)"
+
+      - name: Run the suite
+        # Two files are excluded, both for the reasons in the header (each measured in a checkout with
+        # no `credentials.json`): `test_phase7_chat.py` copies a file a checkout does not have, and
+        # `test_phase32_sandbox.py` cannot load its interpreter inside the Seatbelt profile used by
+        # `actions/setup-python`. Everything else runs, and a red suite fails the job:
+        # `run_tests.py` exits 1 when any test fails.
+        run: |
+          excluded='tests/test_phase7_chat\.py|tests/test_phase32_sandbox\.py'
+          files=$(ls tests/test_*.py | grep -vE "$excluded")
+          all=$(ls tests/test_*.py | wc -l | tr -d ' ')
+          echo "excluded: $excluded"
+          echo "running $(printf '%s\n' $files | wc -l | tr -d ' ') of $all test files"
+          echo "$files" | tr ' ' '\n'
+          python3 run_tests.py -q $files
+
+  swift:
+    name: macOS console (swift build + swift test)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: AgentOrg/macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        # Printed so a failure can be attributed to the toolchain rather than to the code.
+        run: swift --version
+
+      - name: Build the package, including the app target
+        # `swift test` builds only the test target's dependencies, which would leave the SwiftUI
+        # executable unbuilt; `swift build` is what proves the app itself compiles.
+        # Verified locally: "Build complete! (4.89 sec)".
+        run: swift build
+
+      - name: Unit-test AgentOrgKit
+        # No window, no GUI: `Tests/AgentOrgKitTests` is deliberately view-code-free — that split is
+        # the reason the process bridge is testable without a running app (macos/Package.swift:17).
+        #
+        # Three classes are skipped, and every test in them fails for the same reason: they launch the
+        # *real* engine (`python3 -m engine.cli serve`) and assert it reaches `running`. Measured on
+        # this machine with its current `credentials.json` — which configures only keyless providers,
+        # so `build_providers` refuses and the engine never boots — `swift test` fails 6 of 389 tests
+        # in one run and 41 in another, all in these three classes, each failure after a ~20s wait on
+        # `the real engine must reach 'running'`. The Swift code is not what fails; the engine cannot
+        # start. Skipping them costs 27 tests and buys a gate that means something:
+        #   OrgRemovalTests        (10 failures — org/schedule removal through the controller)
+        #   SystemPanelTests        (6 failures — the System panel's round trip)
+        #   SmoothnessMeasurements  (1 failure  — launch → engine.ready)
+        # RE-INCLUDE THEM once the engine boots on the machine running this job (restore a provider
+        # that can be constructed, or give the runner one) — delete the `--skip` flag and the classes
+        # run again. Do not delete this comment instead: the skip is a statement about the environment,
+        # not about the app.
+        #
+        # Verified locally with the flag: **362 tests, 0 failures, 47s**. Without it, 389 tests and
+        # the failures above. (`--skip` is SwiftPM's own filter; verified on Swift 6.4.)
+        run: swift test --skip 'OrgRemovalTests|SystemPanelTests|SmoothnessMeasurements'

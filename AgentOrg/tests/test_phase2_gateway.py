@@ -19,7 +19,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from engine.bus import EventBus
 from engine.catalog import ModelCatalog
-from engine.config import ConfigError, load
+from engine.config import Config, ConfigError, ModelSpec, ProviderConfig, load
 from engine.gateway import BudgetExceeded, Cost, CostLedger, Gateway
 from engine.providers.anthropic import AnthropicProvider
 from engine.providers.base import (
@@ -514,13 +514,25 @@ def test_anthropic_health_without_key_is_misconfigured():
 
 
 def test_ollama_maps_options_not_openai_names():
+    """Ollama's option names differ from OpenAI's — and `format` is not an option at all.
+
+    `format: json` is a **top-level** field of `/api/chat`. Set inside `options` it is silently
+    ignored: verified against a live server, a prompt asking for prose came back as prose with
+    `format` in `options`, and as a JSON object with `format` top-level. So `json_mode` was inert on
+    the one provider whose models most need it — the local, small models this adapter exists for.
+    This test used to pin the ignored shape, which is why it asserts the top-level one now.
+    """
     provider = _ollama(StubTransport())
     body = provider._payload(ChatRequest(model="m", messages=[], temperature=0.1, max_tokens=64,
                                          json_mode=True))
     assert body["options"]["num_predict"] == 64
-    assert body["options"]["format"] == "json"
+    assert body["format"] == "json", "top-level, which is where Ollama reads it"
+    assert "format" not in body["options"], "inside options it is silently ignored"
     assert "max_tokens" not in body and "response_format" not in body
     assert "keep_alive" in body, "weights must be releasable to free unified memory"
+    # `format` reshapes the reply, so it must not be sent when it was not asked for.
+    plain = provider._payload(ChatRequest(model="m", messages=[]))
+    assert "format" not in plain, "only a caller that asked for JSON mode gets it"
 
 
 def test_ollama_usage_is_measured_and_free():
@@ -869,9 +881,29 @@ def test_catalog_dispatches_on_declared_kind_not_class_name():
     assert catalog.resolve("ollama", "m").source == "probed"
 
 
+def _offline_catalog_config() -> Config:
+    """A config built here, not read from the developer's `credentials.json`.
+
+    This test used to call `load()`, which prefers the real credentials file. The offline fallback
+    it exercises is a property of the code, but *whether the fallback yields anything* is a property
+    of the config: with no `lmstudio` provider (or one that is not local) the curated table belongs
+    to no provider and offers nothing, so the test went red on whose machine ran it. The provider
+    here is local, so the curated local models are offered — the same shape the shipped example
+    config has.
+    """
+    return Config(
+        providers={"lmstudio": ProviderConfig(id="lmstudio", kind="openai",
+                                              base_url="http://localhost:1234/v1")},
+        known_models={"qwen2.5-coder:7b": ModelSpec(model_id="qwen2.5-coder:7b",
+                                                    context_window=32768, max_output=8192,
+                                                    locality="local")},
+        catalog={"offline_fallback": True},
+    )
+
+
 def test_catalog_falls_back_offline_when_the_provider_is_down():
     transport = StubTransport(error=GatewayError(ErrorKind.CONNECTION, "refused"))
-    catalog = ModelCatalog(load(), {"lmstudio": _openai(transport)})
+    catalog = ModelCatalog(_offline_catalog_config(), {"lmstudio": _openai(transport)})
     entries = catalog.list_models(provider_id="lmstudio")
     assert entries, "the app must still offer models when a provider is down"
     assert all(e.context_window is not None for e in entries)

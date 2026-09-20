@@ -272,8 +272,10 @@ class ProposalStore:
         The order is the safety story, so it is not rearranged for convenience:
 
         1. **Refuse unless the change is verified.** `Validation.ok` is required — no demonstrated
-           improvement means no edit, whatever the Owner pressed. `unvalidatable` refuses outright,
-           because "the suite could not judge it" must never read as "the suite passed it".
+           improvement means no edit, whatever the Owner pressed. `ok` is only ever set by a validation
+           that applied *this* patch to a scratch copy and saw a scenario the baseline recorded failing
+           flip to passing there, so it also means the patch exists and lands. `unvalidatable` refuses
+           outright, because "the suite could not judge it" must never read as "the suite passed it".
         2. **Refuse unless a real patch exists.** A described proposal is not a patch, and pretending
            otherwise would apply nothing while reporting success.
         3. **Refuse anything aimed at the judging machinery**, re-checked here rather than trusted

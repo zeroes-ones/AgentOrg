@@ -283,6 +283,29 @@ class _SequenceProvider(FakeProvider):
                             model=request.model, provider_id=self.provider_id)
 
 
+class _ProseThenJsonProvider(FakeProvider):
+    """Returns raw text per call, so a *prose* reply and a JSON one can be scripted in sequence.
+
+    `_SequenceProvider` serialises each reply as JSON, which is right for scripting a trailer and
+    wrong for scripting the reply that omits one: the failure being repaired is a model answering in
+    prose, and a test that sends JSON-but-wrong is testing a different failure.
+    """
+
+    def __init__(self, replies: list[str], provider_id: str = "fake") -> None:
+        super().__init__(provider_id=provider_id)
+        self._replies = list(replies)
+        self._calls = 0
+
+    def complete(self, request):
+        from engine.providers.base import ChatResponse, Usage
+
+        self._record(request, streamed=False)
+        text = self._replies[min(self._calls, len(self._replies) - 1)]
+        self._calls += 1
+        return ChatResponse(text=text, usage=Usage(prompt_tokens=900, completion_tokens=200),
+                            model=request.model, provider_id=self.provider_id)
+
+
 def _executor_with(provider, tmp_path, config, skills, library, manifest):
     from engine.artifacts import ArtifactStore
     from engine.executor import ExecutorContext
@@ -374,6 +397,232 @@ def test_the_node_reports_which_agent_and_session_ran_it(tmp_path, config, skill
     result = executor.execute_node("dev", _state(), {"pass": 1})
     assert result["_agent"]["name"]
     assert result["_agent"]["session"].startswith("ses_")
+
+
+# ── the trailer is asked for in the form the provider can enforce ────────────
+#
+# The defect these pin, reproduced on a real run: a weak local model answered a `pm` node with a
+# verbatim echo of the prompt's own schema example, and both repair turns after it covered none of the
+# node's three criteria — so the runner refused the node as a contract violation and the run parked,
+# while the file the node was asked for had already been written. `ChatRequest.json_mode` existed, both
+# adapters implemented it, and **nothing in the engine ever set it**: the trailer was requested in the
+# one form the provider cannot enforce.
+
+
+class _UnverifiedJsonProvider(FakeProvider):
+    """A provider reporting `supports_json_mode=None` — the *unprobed* case.
+
+    `ProviderCapabilities` documents `None` as unprobed, and the distinction is load-bearing: an
+    endpoint that has not confirmed JSON support and ignores `response_format` would lose the trailer
+    the contract depends on while the log said it had been asked for.
+    """
+
+    def capabilities(self):
+        from engine.providers.base import ProviderCapabilities
+
+        return ProviderCapabilities(supports_tools=True, supports_streaming=True,
+                                    supports_json_mode=None, reports_usage=True, source="assumed")
+
+
+def test_json_mode_is_requested_for_a_node_call_when_the_provider_declares_it(
+        tmp_path, config, skills, library):
+    """A node without tools has no prose deliverable: its reply *is* the trailer."""
+    manifest = {"nodes": [{"id": "dev", "skill": "backend-developer", "outputs": ["change"]}]}
+    executor, _, _ = _executor(tmp_path, config, skills, library, manifest=manifest)
+    provider = executor.ctx.gateway.providers["fake"]
+
+    executor.execute_node("dev", _state(), {"pass": 1})
+
+    assert provider.capabilities().supports_json_mode is True, "the fixture declares it"
+    assert [r.request.json_mode for r in provider.requests] == [True], (
+        "the trailer is a JSON object; asking for it in prose is what the model failed at")
+
+
+def test_json_mode_is_not_requested_when_the_capability_is_unverified(
+        tmp_path, config, skills, library):
+    """`None` is not `True`. Sending an unsupported format loses the trailer silently."""
+    manifest = {"nodes": [{"id": "dev", "skill": "backend-developer", "outputs": ["change"]}]}
+    provider = _UnverifiedJsonProvider(provider_id="fake")
+    executor = _executor_with(provider, tmp_path, config, skills, library, manifest)
+
+    executor.execute_node("dev", _state(), {"pass": 1})
+
+    assert provider.requests, "the node really called the provider"
+    assert all(r.request.json_mode is False for r in provider.requests), (
+        "a provider that has not verified JSON mode must not be sent one")
+
+
+def test_the_repair_turn_asks_for_the_trailer_as_json(tmp_path, config, skills, library):
+    """The repair exists only to produce a trailer, so it is the turn most able to be constrained."""
+    manifest = {"nodes": [{"id": "dev", "skill": "backend-developer", "outputs": ["change"]}]}
+    complete = {"status": "done", "verdict": "fixed", "summary": "covered",
+                "criteria_satisfied": [{"criterion": c, "satisfied": True, "evidence": "src/app.py"}
+                                       for c in DEV_CRITERIA]}
+    provider = _ProseThenJsonProvider(["I did the work but wrote no JSON", json.dumps(complete)])
+    executor = _executor_with(provider, tmp_path, config, skills, library, manifest)
+    logged: list[str] = []
+    executor._log = lambda event, **kw: logged.append(event)
+
+    result = executor.execute_node("dev", _state(), {"pass": 1})
+
+    assert [r.request.json_mode for r in provider.requests] == [True, True], (
+        "both the node call and the repair turn must ask for the JSON the trailer is")
+    assert "trailer.repair" in logged, "the repair really ran"
+    assert result["status"] == "done", (
+        "a prose reply followed by a JSON repair reply must complete the node, not park it")
+
+
+def test_a_tool_loop_does_not_constrain_its_tool_calling_turns(tmp_path, config, skills, library):
+    """JSON mode on a turn that may call a tool would break the tool call it exists to make.
+
+    The loop's reserved final turn runs with tools disabled, so it is the one turn that can be
+    constrained — and the reply that turn must carry is the trailer.
+    """
+    from engine.providers.base import ChatResponse, ToolCall, Usage
+
+    class _ToolThenAnswer(FakeProvider):
+        """Calls a tool on the first turn, then answers on the tool-less final one."""
+
+        def complete(self, request):
+            self._record(request, streamed=False)
+            usage = Usage(prompt_tokens=10, completion_tokens=5)
+            if request.tools:
+                return ChatResponse(text="", usage=usage, model=request.model,
+                                    provider_id=self.provider_id,
+                                    tool_calls=[ToolCall(id="c1", name="list_dir",
+                                                         arguments={"path": "."})])
+            return ChatResponse(
+                text=json.dumps({"status": "done", "verdict": "fixed", "summary": "from tools",
+                                 "criteria_satisfied": [{"criterion": c, "satisfied": True,
+                                                         "evidence": "listed"} for c in DEV_CRITERIA]}),
+                usage=usage, model=request.model, provider_id=self.provider_id)
+
+    manifest = {"nodes": [{"id": "dev", "skill": "backend-developer", "outputs": ["change"],
+                           "tools": True, "max_steps": 2}]}
+    provider = _ToolThenAnswer(provider_id="fake")
+    executor = _executor_with(provider, tmp_path, config, skills, library, manifest)
+
+    executor.execute_node("dev", _state(), {"pass": 1})
+
+    flags = [(len(r.request.tools or []), r.request.json_mode) for r in provider.requests]
+    assert flags[0][0] > 0, "the first turn really carried tools"
+    assert flags[0][1] is False, "a turn that may call a tool must not be constrained to JSON"
+    assert flags[-1] == (0, True), "the tool-less final turn is the trailer turn, and is asked for JSON"
+
+
+def test_the_repair_names_the_references_that_resolved_to_nothing(tmp_path, config, skills, library):
+    """A model that answered with the skill's *checklist* ids must be told so, not told again.
+
+    Reproduced on a real run: every reply named `PM1`–`PM12` — this skill's checklist ids, printed in
+    the prompt immediately above the criteria — so `criteria_met` was empty, and "cover every criterion"
+    restated produced the same list again. Naming what was ignored is the difference between a
+    correction and a repetition, and it reports the model's own words rather than inventing coverage.
+    """
+    manifest = {"nodes": [{"id": "dev", "skill": "backend-developer", "outputs": ["change"]}]}
+    wrong = {"status": "done", "verdict": "fixed", "summary": "by checklist id",
+             "criteria_satisfied": [{"criterion": "PC1", "satisfied": True, "evidence": "x"},
+                                    {"criterion": "PC2", "satisfied": True, "evidence": "x"}]}
+    right = {"status": "done", "verdict": "fixed", "summary": "by criterion id",
+             "criteria_satisfied": [{"criterion": f"c{i}", "satisfied": True, "evidence": "x"}
+                                    for i in range(1, len(DEV_CRITERIA) + 1)]}
+    provider = _SequenceProvider([wrong, wrong, right])
+    executor = _executor_with(provider, tmp_path, config, skills, library, manifest)
+    detail: list[dict] = []
+    executor._log = lambda event, **kw: detail.append({"event": event, **kw})
+
+    result = executor.execute_node("dev", _state(), {"pass": 1})
+
+    incomplete = [d for d in detail if d["event"] == "trailer.repair.incomplete"]
+    assert incomplete and incomplete[0]["detail"]["unrecognized"] == ["PC1", "PC2"], (
+        "the names that resolved to nothing must be reported, not silently dropped")
+    assert "PC1" in provider.requests[1].last_user_text, (
+        "and the repair turn must tell the model which of its own names counted for nothing")
+    assert result["status"] == "done", "with the correction the node completes"
+
+
+def test_a_trailer_that_uses_the_ids_the_prompt_names_covers_the_node(
+        tmp_path, config, skills, library):
+    """The prompt now tells the model to name a criterion by its `c`-id. That must actually resolve.
+
+    The rule is only worth stating if the checker accepts what it recommends: the runner resolves an
+    index reference (`c1`) as readily as the criterion's text, and the executor maps the trailer's
+    `criteria_satisfied` onto the declared criteria. This pins both ends together — a reply in the form
+    the prompt asks for must produce full coverage, or the prompt is recommending something the
+    contract refuses.
+    """
+    from engine.prompts import PromptBuilder, TaskContext
+
+    bundle = skills.load("backend-developer")
+    prompt = PromptBuilder().node_prompt(
+        bundle, TaskContext(node_id="dev", instruction="fix it"), agent_skill="backend-developer")
+    for index in range(1, len(bundle.contract.criteria) + 1):
+        assert f"c{index}." in prompt.body, (
+            f"criterion {index} must be printed with the id the check resolves")
+    # The id rule lives in the system prompt, not the contract block: the system prompt is
+    # byte-identical per skill (so cached), while the recency zone is measured and kept small
+    # (`test_phase12_cache.test_the_recency_zone_stays_small_so_it_cannot_dilute_the_prefix`).
+    assert "`c1`, `c2`" in prompt.system, "the prompt must say that id form is accepted"
+
+    manifest = {"nodes": [{"id": "dev", "skill": "backend-developer", "outputs": ["change"]}]}
+    executor, _, _ = _executor(tmp_path, config, skills, library, manifest=manifest)
+    executor.ctx.gateway.providers["fake"].set_default(json_reply({
+        "status": "done", "verdict": "fixed", "summary": "by id",
+        "criteria_satisfied": [{"criterion": f"c{i}", "satisfied": True, "evidence": "src/app.py"}
+                               for i in range(1, len(bundle.contract.criteria) + 1)],
+    }))
+
+    result = executor.execute_node("dev", _state(), {"pass": 1})
+
+    assert len(result["criteria_met"]) == len(bundle.contract.criteria), (
+        "the ids the prompt names must resolve to the criteria the contract checks")
+    assert result["status"] == "done"
+
+
+def test_a_non_numeric_finding_line_does_not_raise_out_of_the_executor(
+        tmp_path, config, skills, library):
+    """`"line": "N/A"` was an uncaught `ValueError` out of `execute_node`, and it ended a run.
+
+    Reproduced: a real run's third node answered with findings whose `line` was the string a model
+    writes when it does not know one, `int()` raised, and the runner reported "a node raised an error"
+    and stopped the run on it — with two nodes already done. A field the model may fill with anything
+    must not be able to kill the run it was helping.
+    """
+    manifest = {"nodes": [{"id": "review", "skill": "code-reviewer", "phase": "REVIEW",
+                           "outputs": ["review-report"]}]}
+    executor, _, _ = _executor(tmp_path, config, skills, library, manifest=manifest)
+    executor.ctx.gateway.providers["fake"].set_default(json_reply({
+        "status": "changes_requested", "verdict": "changes_requested",
+        "summary": "no line numbers available",
+        "criteria_satisfied": [{"criterion": c, "satisfied": True, "evidence": "src/app.py"}
+                               for c in REVIEW_CRITERIA],
+        "findings": [{"id": "F1", "severity": "High", "issue": "unbounded query",
+                      "fix": "bind the parameter", "line": "N/A", "file": "src/app.py"}],
+    }))
+
+    result = executor.execute_node("review", _state(), {"pass": 1})
+
+    assert result["findings"][0]["line"] == 0, "an unparsable line number reads as an absent one"
+    assert result["status"] in ("done", "needs_review"), "and the node still reports its work"
+
+
+def test_the_ollama_payload_puts_format_where_ollama_reads_it():
+    """`format` is a top-level field of `/api/chat`; inside `options` Ollama ignores it.
+
+    This is why `json_mode` was inert on the provider a local model runs on: the engine asked, the
+    adapter built the body, and the server never saw the request. Verified against a live server — a
+    prompt asking for prose came back as prose with `format` in `options` and as JSON with it on top.
+    """
+    from engine.providers.base import ChatRequest, Message, Role
+    from engine.providers.ollama import OllamaProvider
+
+    provider = OllamaProvider(provider_id="ollama", base_url="http://127.0.0.1:11434")
+    body = provider._payload(ChatRequest(
+        model="qwen2.5-coder:7b", messages=[Message.text_message(Role.USER, "hello")],
+        json_mode=True), stream=False)
+
+    assert body.get("format") == "json", "Ollama reads `format` at the top level of the body"
+    assert "format" not in (body.get("options") or {}), (
+        "inside `options` it is silently ignored, which is how json_mode did nothing at all")
 
 
 # ── the executor: artifacts ──────────────────────────────────────────────────

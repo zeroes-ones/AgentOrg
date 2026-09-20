@@ -39,6 +39,7 @@ than fastest: local concurrency 1, escalation gated, a 3-attempt loop, a $25 run
 | `concurrency` | `per_provider_limits` | local 1, cloud 3–4 | more parallel | more serial |
 | `concurrency` | `queue_max_depth` | 64 | more work buffered | sheds sooner |
 | `concurrency` | `heartbeat_s` | 30 | slower hang detection | faster detection, more false alarms |
+| `concurrency` | `stall_timeout_s` | 1800 | a slow local model gets room to finish a reply | a wedge is reported sooner |
 | `health` | `min_samples` | 5 | more patience with a new hire | judges sooner, noisier |
 | `health` | `healthy_at` / `degraded_at` | 0.80 / 0.50 | more agents degraded | more quarantined |
 | `delegation` | `max_depth` | 3 | longer chains, more compounding | flatter |

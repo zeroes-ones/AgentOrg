@@ -581,3 +581,168 @@ def test_the_host_only_passes_the_flag_when_a_window_is_wanted(config, library, 
     assert host.contract_rework() == config.executor.contract_rework
     assert host.with_contract_rework(0).contract_rework() == 0
     assert host.with_contract_rework(4).contract_rework() == 4
+
+
+# ── 7. a stopped run says *why* it was stopped ───────────────────────────────
+#
+# Reproduced with a real goal against a local model:
+#
+#     python3 -u -m engine.cli run --goal "create a file notes.md …" --posture unattended
+#     outcome : failed   phase : aborted   stopped : the run was aborted
+#
+# 901 seconds, no cause, no node named, no stderr — and `diagnostics.jsonl` holding only
+# `run.prepared`, `run.approved`, `node.bind`, `node.tools.start` and `run.phase: aborted`. The host
+# had stopped the run on the stall window (`stall_timeout_s: 900.0`), which is a *correct* decision for
+# a 7B model slower than 900 s per reply. What was wrong is that four different events set the same
+# `killed` flag and the summary had one sentence for all of them, so the person could not tell whether
+# to raise the window, change the model, or look at their own abort.
+#
+# These are unit tests on the derivation: the sentence is what travels to the checkpoint, the CLI and
+# the diagnostics log, and it is the thing that was useless.
+
+
+class _StoppedOutcome:
+    """The shape `_derive_stop_reason` reads: a `RunOutcome` after the host stopped the run."""
+
+    def __init__(self, *, termination: str, detail: str = "") -> None:
+        self.killed = True
+        self.error = ""
+        self.termination = termination
+        self.termination_detail = detail
+
+
+def _stopped_reason(termination: str, detail: str = "") -> str:
+    from engine.orchestrator import _derive_stop_reason
+
+    # An empty runner checkpoint: the state a stalled run leaves, because it never finished a node.
+    return _derive_stop_reason({}, _StoppedOutcome(termination=termination, detail=detail), {})
+
+
+def test_a_stall_abort_names_the_stall_and_the_window_that_expired():
+    """The reason has to say *what* stopped the run and *which* window ran out.
+
+    "the run was aborted" sends the reader to the checkpoint to guess. Naming the watchdog and the
+    window is the difference between "raise `concurrency.stall_timeout_s`", "this model is too slow"
+    and "I pressed Stop" — three different actions for three different people.
+    """
+    reason = _stopped_reason(
+        "wedged",
+        "no checkpoint, trace or output for 1800s, past the 1800s stall window "
+        "(concurrency.stall_timeout_s)")
+
+    assert "watchdog" in reason
+    assert "1800" in reason, "the window that expired is the number a person has to change"
+    assert "concurrency.stall_timeout_s" in reason, (
+        "the setting has to be named, or the person still cannot find it")
+    assert "Owner" not in reason, "a stall is not a person's decision"
+
+
+def test_an_owner_abort_and_a_stall_give_different_reasons():
+    """The defect in one assertion: four causes, one sentence.
+
+    A person who pressed Stop and a person whose run was reaped by the watchdog had byte-identical
+    summaries. They need opposite things — one wants to know their own action took effect, the other
+    wants to know why a run they left alone vanished.
+    """
+    stall = _stopped_reason("wedged", "no checkpoint, trace or output for 1800s")
+    owner = _stopped_reason("aborted")
+    shutdown = _stopped_reason("shutdown", "the engine shut down and stopped the run")
+
+    assert len({stall, owner, shutdown}) == 3, (
+        f"each cause must read differently; got {stall!r} / {owner!r} / {shutdown!r}")
+    assert "Owner" in owner
+    assert "watchdog" not in owner
+    assert "shut down" in shutdown
+
+
+def test_a_shutdown_is_not_described_as_the_owners_decision():
+    """The engine's own reap is the case a person is most likely to misread as "my run crashed".
+
+    It is neither: the run was stopped because the process it lived in went away, and saying so is
+    what stops someone hunting a bug in their plan for a run that never failed.
+    """
+    reason = _stopped_reason("shutdown", "the engine shut down and stopped the run")
+    assert "aborted by the Owner" not in reason
+    assert "watchdog" not in reason
+    assert "shut down" in reason
+
+
+def test_a_runner_that_died_before_it_could_be_signalled_is_not_called_an_abort():
+    """`died` is the honest word when the process was gone before the signal could land.
+
+    Reported as an abort, it would name an action nobody took — and the summary is a claim about what
+    happened, so it must not invent one.
+    """
+    reason = _stopped_reason("died", "the runner exited before it could be signalled")
+    assert "on its own" in reason
+    assert "aborted by the Owner" not in reason
+
+
+def test_a_kill_with_no_recorded_cause_keeps_the_old_wording():
+    """A run stopped by a host that recorded nothing must not have a cause invented for it.
+
+    The fallback is the phrase this whole change exists to stop *being* the answer — but it is the
+    correct answer for an outcome that genuinely carries no cause (an older host, a test double), and
+    a summary that guessed would be worse than one that admits it does not know.
+    """
+    assert _stopped_reason("") == "the run was aborted"
+
+
+def test_a_stall_still_stops_the_run_and_the_phase_says_so(config, library, tmp_path):
+    """The change is about *reporting* the stop, not about softening it.
+
+    A stall still ends the run: the phase is `aborted`, the outcome is neither `ok` nor `gated`, and
+    the completion contract is untouched. Without this assertion the fix could be mistaken for
+    patience with bad work — which is the one thing it must not be.
+    """
+    from engine.host import RunnerState, RunOutcome
+
+    ws = _project(tmp_path)
+    orch = _orch(config, library, ws)
+    run = orch.adopt(ws.path / "autonomous-recovery.yaml", slug="autonomous-recovery")
+    orch._run = run
+    outcome = RunOutcome(
+        run_id=run.run_id, state=RunnerState.FAILED, exit_code=-9, killed=True,
+        termination="wedged",
+        termination_detail=("no checkpoint, trace or output for 1800s, past the 1800s stall window "
+                            "(concurrency.stall_timeout_s)"))
+    orch._settle(run, outcome)
+
+    assert run.phase is RunPhase.ABORTED, "a stalled run must still be stopped"
+    assert not outcome.ok and outcome.broken
+    assert run.outcome["termination"] == "wedged"
+    assert "watchdog" in run.stop_reason and "1800" in run.stop_reason
+    # And the diagnostics log carries it, which is the channel the real run left empty.
+    records = orch.diagnostics.tail(event="run.phase")
+    assert records and records[-1]["detail"].get("termination") == "wedged"
+
+
+def test_a_watchdog_stop_reaches_the_diagnostics_log_and_not_only_the_trace(config, library, tmp_path):
+    """The gap the real run exposed: the host reports on the *bus*, which writes the trace.
+
+    `diagnostics.jsonl` is the other file a person reads, and it is where a run explains itself — the
+    `run.phase` line lives there. The 901-second run's log held `run.prepared`, `run.approved`, a
+    `node.bind`, a `node.tools.start` and `run.phase: aborted`, and nothing that said a watchdog had
+    fired: `watchdog.stall` and `run.terminating` went to `trace.jsonl` only. So the channel that is
+    supposed to be the explanation was the one channel the explanation never reached, and the person
+    had to know to open the *other* file — and read a trace line with no window in it — to find out.
+    """
+    ws = _project(tmp_path)
+    orch = _orch(config, library, ws)
+    run = orch.adopt(ws.path / "autonomous-recovery.yaml", slug="autonomous-recovery")
+    orch._run = run
+    handler = orch._host_event(run, None)
+    handler("watchdog.stall", {"run_id": run.run_id, "pid": 4242, "liveness": "wedged",
+                               "silence_s": 1800.4, "stall_timeout_s": 1800.0})
+    handler("run.terminating", {"run_id": run.run_id, "pid": 4242, "force": True, "cause": "wedged"})
+
+    log = ws.state_dir / "diagnostics.jsonl"
+    written = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line]
+    events = [record["event"] for record in written]
+    assert "watchdog.stall" in events, "the watchdog has to say so in the file a person reads"
+    assert "run.terminating" in events
+
+    stall = next(record for record in written if record["event"] == "watchdog.stall")
+    assert stall["level"] == "warning", "a run being stopped is not routine"
+    assert stall["detail"]["stall_timeout_s"] == 1800.0, (
+        "the window is what the reader needs in order to change it")
