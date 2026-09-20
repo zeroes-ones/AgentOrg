@@ -14,20 +14,31 @@ What was missing was not permission but *progress*. The loop measured a defect, 
 agree." A detection that cannot be acted on in the tool that detected it is a report, not a loop.
 So this module gives a proposal a **lifecycle a person can drive**:
 
-    drafted ──accept──> accepted ──apply──> applied
-       │                    │
-       └────reject──────────┴──────> rejected   (with a reason, remembered)
+    drafted ──promote──> promoted ──accept──> accepted ──apply──> applied ──undo──> accepted
+       │                    │                   │
+       └────reject──────────┴───────────────────┴──────> rejected   (with a reason, remembered)
+
+`promoted` is not this module's state — it is what `Improver.promote` leaves a validated proposal in,
+which makes it the commonest state in the directory. It is drawn here because it is *live*: a person
+can accept it, reject it, or apply it directly (the act of applying is a decision, and requiring a
+button press after the person already typed `apply` would only hide the applier on the proposals the
+loop just produced).
 
 Three of those four transitions are bookkeeping and cannot damage anything. The fourth — `apply` —
 edits the working tree, so it is the only one with a safety story, and the story is *evidence, not
 trust*:
 
-- **It refuses without a demonstrated improvement.** `accepted` is the human decision; `apply` also
-  requires the proposal to have validated (`Validation.ok`), because "the Owner agreed" and "the
-  suite says this helps" are different claims and a patch needs both.
+- **It refuses without a demonstrated improvement.** `Validation.ok` is required whatever the person
+  decided, because "the Owner agreed" and "the suite says this helps" are different claims and a
+  patch needs both.
+- **It refuses a proposal nothing can be applied from** — one a person already rejected, or one that
+  has already landed and needs `undo` first.
 - **It runs the project's own tests before and after**, by the repo's standard command rather than a
   private one, and a regression **reverts** rather than reports. An applied change that made things
   worse and stayed applied is the failure this exists to prevent.
+- **A run that could not be read is not a passing run**, in both directions: an unreadable baseline
+  refuses before anything is written, and a suite that cannot run *after* the change is reverted,
+  because "no summary line" is not "zero failures".
 - **The patch is checked before anything is written** (`git apply --check`), so a stale or
   conflicting patch is refused intact rather than half-applied.
 - **The original bytes are kept**, so undo is exact rather than a reverse patch that may itself
@@ -267,21 +278,27 @@ class ProposalStore:
     # ── the one transition that edits the tree ───────────────────────────────
 
     def apply(self, proposal_id: str, *, by: str = "owner", force: bool = False) -> ApplyOutcome:
-        """Apply an accepted proposal, verified by the project's own tests and reversible.
+        """Apply a live proposal, verified by the project's own tests and reversible.
 
         The order is the safety story, so it is not rearranged for convenience:
 
-        1. **Refuse unless the change is verified.** `Validation.ok` is required — no demonstrated
+        1. **Refuse a settled proposal.** One a person rejected, or one that has already landed and
+           needs `undo`, is not something to write. Everything still live may be applied —
+           `promoted` included, since that is the state the loop's own writer leaves a validated
+           proposal in and the command itself is the person's decision.
+        2. **Refuse unless the change is verified.** `Validation.ok` is required — no demonstrated
            improvement means no edit, whatever the Owner pressed. `ok` is only ever set by a validation
            that applied *this* patch to a scratch copy and saw a scenario the baseline recorded failing
            flip to passing there, so it also means the patch exists and lands. `unvalidatable` refuses
            outright, because "the suite could not judge it" must never read as "the suite passed it".
-        2. **Refuse unless a real patch exists.** A described proposal is not a patch, and pretending
+        3. **Refuse unless a real patch exists.** A described proposal is not a patch, and pretending
            otherwise would apply nothing while reporting success.
-        3. **Refuse anything aimed at the judging machinery**, re-checked here rather than trusted
+        4. **Refuse anything aimed at the judging machinery**, re-checked here rather than trusted
            from draft time — the file list could have been edited on disk since.
-        4. **Check the patch applies cleanly** (`git apply --check`) before writing a byte.
-        5. **Run the tests before and after**, and revert on regression.
+        5. **Check the patch applies cleanly** (`git apply --check`) before writing a byte.
+        6. **Run the tests before and after**, and revert on regression. A run that could not be read
+           counts as neither: an unreadable baseline refuses here, and an unreadable run afterwards is
+           reverted, because a missing summary line is not zero failures.
         """
         proposal = self.load(proposal_id)
         outcome = ApplyOutcome(proposal_id=proposal_id)
@@ -312,7 +329,15 @@ class ProposalStore:
 
         before = self._tests()
         outcome.tests_before = before.as_dict()
-        if before.ran and before.failed:
+        # `ran` is checked *before* `failed`, and both are checked: a suite with no summary line has
+        # zero failures and is not a passing suite (`TestRun`'s own docstring), so treating it as one
+        # here would apply a change nothing measured. Nothing has been written at this point.
+        if not before.ran:
+            outcome.refused = (
+                "the suite could not run before this change, so the change cannot be verified and "
+                f"nothing was applied. {before.detail}")
+            return outcome
+        if before.failed:
             outcome.refused = (
                 f"the suite was already failing ({before.failed} failure(s)) before this change, so "
                 "there is no baseline to judge it against. Fix the tree first.")
@@ -330,7 +355,21 @@ class ProposalStore:
 
         after = self._tests()
         outcome.tests_after = after.as_dict()
-        if after.ran and after.failed:
+        if not after.ran:
+            # The mirror of the baseline check, and the reason it is a *revert* rather than a success:
+            # a run the parser could not read leaves the change unverified, and an unverified change
+            # must not stay in the tree. Same revert-from-saved-bytes path as a regression, so the
+            # tree is exactly as it was.
+            self._restore(backup)
+            outcome.reverted = True
+            outcome.detail = (
+                "reverted: the suite could not run after the change, so the change is unverified and "
+                f"was not left in the tree. {after.detail}")
+            self._journal({"at": _iso_now(), "proposal_id": proposal_id, "decision": "apply_reverted",
+                           "by": by, "reason": outcome.detail, "files": outcome.files,
+                           "kind": proposal.finding.kind, "subject": proposal.finding.subject})
+            return outcome
+        if after.failed:
             # A regression is reverted, not reported. An applied change that made the tree worse and
             # stayed applied is the failure this whole guard exists to prevent — and the person is
             # told *what* regressed, so a revert is information rather than a mystery.
@@ -393,9 +432,25 @@ class ProposalStore:
         Pure and side-effect free, so the app can ask the same question to decide whether to offer
         the button — the two surfaces then describe one rule rather than two.
         """
-        if proposal.state not in ("accepted", "drafted"):
-            return (f"{proposal.proposal_id} is {proposal.state!r}; accept it first "
-                    "(`proposals accept`), or reject it")
+        # **Every live state, not just `accepted`.** `promoted` is what the improver's own writer
+        # leaves a validated proposal in — the commonest state in the directory — so a gate of
+        # `("accepted", "drafted")` refused the one case the lifecycle exists for, and offered the
+        # button on `drafted`, the *less* proven of the two. What may not be applied is a *settled*
+        # proposal: a person rejected it, or it has already landed. Widening this does not hand the
+        # loop a way to apply its own change — nothing in `engine/` calls `apply` except the person's
+        # own command (the CLI's `proposals apply`, the console's `proposal_apply`) — and the
+        # evidence checks below are unchanged, so a promoted proposal still needs `Validation.ok`.
+        if proposal.state == "applied":
+            return (f"{proposal.proposal_id} has already been applied; `proposals undo` it before "
+                    "applying it again")
+        if proposal.state == "rejected":
+            return (f"{proposal.proposal_id} was rejected — re-run the cycle to draft a fresh "
+                    "proposal rather than applying a settled one")
+        if proposal.state not in LIVE_STATES:
+            # A closed list, so this is only reachable from a hand-edited file. Refused rather than
+            # guessed, because "a state this module has never heard of" is not a licence to write.
+            return (f"{proposal.proposal_id} is in state {proposal.state!r}, which the lifecycle "
+                    f"does not know ({', '.join(LIVE_STATES)} are the states it can apply from)")
         if not proposal.patch.strip():
             return ("this proposal carries no patch — it is a description, not a diff. Nothing can "
                     "be applied automatically; read it and make the change yourself.")

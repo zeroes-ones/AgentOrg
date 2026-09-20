@@ -11,12 +11,18 @@ can act on is a report, not a loop.
 
 So the fix is a **lifecycle a person drives**, not permission for the loop to edit the tree:
 
-    drafted ──accept──> accepted ──apply──> applied ──undo──> accepted
-       └──── reject (with a reason, remembered) ────> rejected
+    drafted ──promote──> promoted ──accept──> accepted ──apply──> applied ──undo──> accepted
+       │                     │                  │
+       └─────reject──────────┴──────────────────┴──────> rejected (with the reason, remembered)
 
-`accept` and `reject` are bookkeeping. `apply` is the one transition that touches the tree, and it
-earns the right to: a demonstrated improvement is required, the project's own suite runs before and
-after, and a regression **reverts** from a saved copy rather than reporting and leaving the damage.
+`promoted` is not this module's state: it is what the loop's own writer leaves a validated proposal in,
+which makes it the commonest state in the directory, and it is *live* — a person can accept it, reject
+it, or apply it. `accept` and `reject` are bookkeeping. `apply` is the one transition that touches the
+tree, and it earns the right to: a demonstrated improvement is required, the project's own suite runs
+before and after, and a regression **reverts** from a saved copy rather than reporting and leaving the
+damage. A proposal a person already settled — rejected, or applied and not yet undone — is refused
+before those rules are reached, so the refusal names the state rather than something that is not the
+problem.
 
 What these tests pin, in order of how much they matter:
 
@@ -24,8 +30,9 @@ What these tests pin, in order of how much they matter:
    is now on that list. A boundary you can edit is not a boundary.
 2. **A rejection is remembered** in the improver's own `rejected.jsonl` format, or the same finding
    comes back every cycle and nothing ever moves forward.
-3. **Apply refuses without evidence** — no patch, no demonstrated improvement, or a change the suite
-   cannot judge. None of those is "safe because it could not be checked".
+3. **Apply refuses without evidence** — no patch, no demonstrated improvement, a change the suite
+   cannot judge, or a suite that cannot run at all. None of those is "safe because it could not be
+   checked", and an unreadable run is neither a pass nor a verdict of zero failures.
 4. **Apply reverts on regression**, from the saved bytes, so the tree is exactly as it was.
 5. **None of the bookkeeping states writes to a source file**, asserted by fingerprinting the whole
    repo before and after.
@@ -55,7 +62,6 @@ from engine.improver import (
 from engine.proposals import (
     LIVE_STATES,
     STATES,
-    ApplyOutcome,
     ProposalLifecycleError,
     ProposalStore,
     TestRun,
@@ -112,6 +118,13 @@ def _seed(store, tmp_path, *, pid="prop_0001", patch=None, state="promoted",
 
     Written through a real `Proposal` and the improver's own writer, so the file layout the lifecycle
     reads is the layout the loop produces — not a hand-copied directory of JSON that could drift.
+
+    Returns `(proposal, path)` where **`path` is the JSON record**, not the `.md` beside it.
+    `Improver._write` returns the markdown on purpose — that is the file a person reads and what
+    `promote` hands back (`tests/test_phase21_improver.py` pins its text) — but a caller seeding a
+    proposal wants the machine-readable twin, because every assertion after this point is about the
+    *record*: its state, its validation, and the state a person edits before applying. Returning the
+    prose made `json.loads` fail on a markdown heading, which is how the ambiguity surfaced.
     """
     proposal = Proposal(
         proposal_id=pid,
@@ -126,7 +139,7 @@ def _seed(store, tmp_path, *, pid="prop_0001", patch=None, state="promoted",
         state=state,
     )
     improver = Improver(workspace=store.workspace)
-    path = improver._write(proposal)          # noqa: SLF001 - the loop's own writer, on purpose
+    path = improver._write(proposal).with_suffix(".json")   # noqa: SLF001 - the loop's writer
     return proposal, path
 
 
@@ -167,6 +180,28 @@ def test_apply_re_checks_the_boundary_rather_than_trusting_draft_time(tmp_path):
     assert outcome.applied is False
     assert "engine/config.py" in outcome.refused
     assert "not configurable" in outcome.refused
+
+
+def test_the_seed_hands_back_the_record_with_the_prose_beside_it(tmp_path):
+    """`_seed` is the writer every other test reads through, so its return value is a contract.
+
+    It hands back the proposal's **record** — the JSON twin of the pair `Improver._write` writes —
+    because that is what the lifecycle reads and what the boundary test above rewrites to move a
+    proposal into a state. `_write` itself keeps returning the `.md`: that is the file a person opens
+    and what `promote` hands back (`tests/test_phase21_improver.py` asserts the markdown's own text),
+    so changing it would break a documented caller to fix a test helper. That the *pair* exists is the
+    second half of this assertion — a record with no prose, or prose with no record, is a proposal that
+    says two different things about itself.
+    """
+    store = ProposalStore(workspace=_workspace(tmp_path), repo_root=_repo(tmp_path))
+    _, path = _seed(store, tmp_path)
+
+    assert path.suffix == ".json", "the record, so `json.loads(path.read_text())` is what it says"
+    assert path.parent == store.workspace.state_dir / PROPOSALS_DIRNAME
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["proposal_id"] == "prop_0001" and payload["state"] == "promoted"
+    # The prose the state's words live in, beside it and readable — `accept` rewrites both.
+    assert "Nothing has been applied" in path.with_suffix(".md").read_text(encoding="utf-8")
 
 
 # ── accept: a decision, not an edit ──────────────────────────────────────────
@@ -285,6 +320,37 @@ def test_apply_refuses_without_a_demonstrated_improvement(tmp_path):
     assert (store._repo() / "module.py").read_text(encoding="utf-8") == "value = 1\n"  # noqa: SLF001
 
 
+def test_a_proposal_the_loop_just_promoted_is_applied_without_a_separate_accept(tmp_path):
+    """`promoted` is what `Improver._write` leaves a validated proposal in — the commonest state in
+    the directory — so a gate that refused it refused the one case the applier exists for, and offered
+    the button on `drafted`, the less proven of the two. The command is the person's decision."""
+    repo = _repo(tmp_path)
+    store = ProposalStore(workspace=_workspace(tmp_path), repo_root=repo,
+                          run_tests=lambda: TestRun(ran=True, passed=345, failed=0))
+    _seed(store, tmp_path)                              # state="promoted", as the loop writes it
+
+    outcome = store.apply("prop_0001")
+    assert outcome.applied is True
+    assert (repo / "module.py").read_text(encoding="utf-8") == "value = 2\n"
+
+
+def test_a_settled_proposal_cannot_be_applied_whatever_the_evidence_says(tmp_path):
+    """The other half of the same gate, and the reason it is not simply "anything goes": a proposal a
+    person rejected, and one that has already landed, are both refused *before* the evidence rules, so
+    the refusal names what to do about the state rather than something that is not the problem."""
+    store = ProposalStore(workspace=_workspace(tmp_path), repo_root=_repo(tmp_path),
+                          run_tests=lambda: TestRun(ran=True, passed=1, failed=0))
+    _seed(store, tmp_path, pid="prop_0001", state="rejected")
+    _seed(store, tmp_path, pid="prop_0002", state="applied")
+
+    rejected = store.apply("prop_0001")
+    assert rejected.applied is False and "rejected" in rejected.refused
+    assert store.can_apply(store.load("prop_0001")) is False
+    # Undo is the documented next move for an applied one, so the refusal has to say so.
+    landed = store.apply("prop_0002")
+    assert landed.applied is False and "undo" in landed.refused
+
+
 def test_apply_refuses_a_change_the_suite_cannot_judge(tmp_path):
     """`unvalidatable` must never read as "the check passed" — it means the check did not happen."""
     store = ProposalStore(workspace=_workspace(tmp_path), repo_root=_repo(tmp_path))
@@ -361,6 +427,38 @@ def test_a_suite_that_cannot_run_is_not_a_passed_suite(tmp_path):
     outcome = store.apply("prop_0001")
     assert outcome.applied is False
     assert "cannot be verified" in outcome.refused or "could not run" in outcome.refused
+    assert (repo / "module.py").read_text(encoding="utf-8") == "value = 1\n", (
+        "an unreadable suite refuses before anything is written")
+
+
+def test_a_suite_that_cannot_run_after_the_change_is_reverted_not_counted_as_a_pass(tmp_path):
+    """The mirror of the baseline check, and the one direction nobody looks.
+
+    A good run before and an unreadable one after is exactly the state in which "no failures" would be
+    believed: `after.ran` is False, `after.failed` is 0, and a check written as `if after.failed` would
+    leave the change in the tree having verified nothing. It is reverted, from the saved bytes, and
+    the outcome says the tree was still written to — a revert is not the same as never writing.
+    """
+    repo = _repo(tmp_path)
+    calls = {"n": 0}
+
+    def _suite():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return TestRun(ran=True, passed=345, failed=0)
+        return TestRun(ran=False, detail="the runner died before printing a summary")
+
+    store = ProposalStore(workspace=_workspace(tmp_path), repo_root=repo, run_tests=_suite)
+    _seed(store, tmp_path, state="accepted")
+
+    outcome = store.apply("prop_0001")
+    assert outcome.applied is False
+    assert outcome.reverted is True
+    assert outcome.files == ["module.py"], "it did write, and the revert says so"
+    assert outcome.touched_the_tree is True
+    assert (repo / "module.py").read_text(encoding="utf-8") == "value = 1\n"
+    assert outcome.tests_after["ran"] is False
+    assert store.load("prop_0001").state != "applied"
 
 
 def test_an_already_failing_tree_is_refused_before_anything_is_written(tmp_path):
@@ -485,6 +583,32 @@ def _creds(tmp_path):
         "models": {"known": {"qwen2.5-coder:7b": {"context_window": 32768}}},
         "defaults": {"provider": "ollama", "model": "qwen2.5-coder:7b"}}))
     return path
+
+
+def test_every_proposals_verb_takes_the_workspace_flags_after_it():
+    """`proposals <verb> <id> --slug s --root r` is the order a person types, and every other verb in
+    this parser takes its flags there (`pool list`, `status`, `decide`, …). It was a usage error here —
+    exit 2, "unrecognized arguments" — because `--slug`/`--root` lived only on the `proposals` noun,
+    which is the one order the shipped surface did not accept.
+
+    Both orders must resolve to the same workspace, which is the half that is easy to lose: argparse's
+    subparser defaults are copied *over* the parent namespace, so a verb-level `--slug` with a normal
+    default would silently reset a slug given before the verb. `argparse.SUPPRESS` is what keeps the
+    two orders equivalent, and this asserts it rather than trusting it.
+    """
+    from engine.cli import build_parser
+
+    parser = build_parser()
+    ident = "prop_0001"
+    for verb, extra in (("accept", []), ("reject", ["--reason", "r"]), ("apply", []), ("undo", [])):
+        after = parser.parse_args(["proposals", verb, ident, *extra, "--slug", "s", "--root", "/r"])
+        before = parser.parse_args(["proposals", "--slug", "s", "--root", "/r", verb, ident, *extra])
+        assert (after.slug, after.root) == ("s", "/r"), f"{verb} does not take the flags after it"
+        assert (before.slug, before.root) == ("s", "/r"), (
+            f"{verb} loses a --slug given before it, the argparse subparser-default trap")
+        # The id is still the verb's own positional argument, not swallowed by the flags.
+        assert after.proposal_id == ident
+        assert after.func is before.func is not None
 
 
 def test_the_lifecycle_reaches_a_proposal_through_the_cli(tmp_path):

@@ -3238,9 +3238,11 @@ def cmd_proposals(args: argparse.Namespace) -> int:
 
     - `accept` and `reject` are bookkeeping and cannot touch the tree.
     - `apply` is the one transition that edits anything, so it requires a **demonstrated improvement**
-      *and* an accepted proposal, runs the project's own test suite before and after, and **reverts on
-      regression**. A proposal whose patch is a description rather than a diff is refused with that
-      said plainly rather than quietly "applied" as a no-op.
+      *and* a proposal nothing has settled yet — a rejected or already-applied one is refused before
+      the evidence is even read. It runs the project's own test suite before and after, and **reverts
+      on regression** (or on a run it could not read, which is not a pass). A proposal whose patch is a
+      description rather than a diff is refused with that said plainly rather than quietly "applied" as
+      a no-op.
     - Everything aimed at the machinery that judges this loop is still refused, and
       `engine/proposals.py` — the applier itself — is on that list.
     """
@@ -4732,10 +4734,24 @@ def build_parser() -> argparse.ArgumentParser:
     # The lifecycle, as subcommands of the listing. Deliberately *not* separate top-level nouns:
     # `decide` already owns approve/reject for gates, and a second `accept` at the top level would be
     # a second word for one idea. Under `proposals` the object is unambiguous.
+    #
+    # Each verb carries `--slug`/`--root` too, like every other verb in this parser (`pool list`,
+    # `status`, `decide`, …): `proposals accept <id> --slug s` is the order a person types, and a flag
+    # that is only legal *before* the verb is a usage error the reader cannot act on — which is what
+    # this surface shipped, so its own tests could not reach a proposal at all.
+    #
+    # `default=argparse.SUPPRESS` is load-bearing here for the reason `common`'s own flags document:
+    # with a normal default, the verb's copy of `--slug` would set `None` and silently overwrite one
+    # given before the verb, breaking the order that used to work. Suppressed, the flag is only
+    # written when it is actually passed, so both orders resolve to the same slug.
     proposals_accept = proposals_sub.add_parser(
         "accept", parents=[common],
         help="agree with a proposal — records the decision and applies NOTHING")
     proposals_accept.add_argument("proposal_id", help="the proposal id, e.g. prop_0001")
+    proposals_accept.add_argument("--slug", default=argparse.SUPPRESS,
+                                  help="project name (optional with --project)")
+    proposals_accept.add_argument("--root", default=argparse.SUPPRESS,
+                                  help="projects root (default: AgentOrg/projects)")
     proposals_accept.set_defaults(func=cmd_proposals)
 
     proposals_reject = proposals_sub.add_parser(
@@ -4743,22 +4759,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="decline a proposal; the reason is recorded so the finding is not re-drafted")
     proposals_reject.add_argument("proposal_id", help="the proposal id, e.g. prop_0001")
     proposals_reject.add_argument("--reason", default="", help="why, in your words")
+    proposals_reject.add_argument("--slug", default=argparse.SUPPRESS,
+                                  help="project name (optional with --project)")
+    proposals_reject.add_argument("--root", default=argparse.SUPPRESS,
+                                  help="projects root (default: AgentOrg/projects)")
     proposals_reject.set_defaults(func=cmd_proposals)
 
+    # "a proposal nothing has settled yet", not "an accepted one": `promoted` — what the improver's
+    # own writer leaves a validated proposal in — is applyable, because requiring an explicit `accept`
+    # first would hide the button on every proposal the loop just produced. What `apply` refuses is a
+    # *settled* proposal (rejected or already applied), an unvalidated one, and one with no patch.
     proposals_apply = proposals_sub.add_parser(
         "apply", parents=[common],
-        help="apply an accepted proposal — runs the test suite before and after and reverts on "
-             "regression")
+        help="apply a proposal the loop has validated — runs the test suite before and after and "
+             "reverts on regression")
     proposals_apply.add_argument("proposal_id", help="the proposal id, e.g. prop_0001")
     proposals_apply.add_argument("--force", action="store_true",
                                  help="apply even without a demonstrated improvement (still reverts "
                                       "on a regression)")
+    proposals_apply.add_argument("--slug", default=argparse.SUPPRESS,
+                                 help="project name (optional with --project)")
+    proposals_apply.add_argument("--root", default=argparse.SUPPRESS,
+                                 help="projects root (default: AgentOrg/projects)")
     proposals_apply.set_defaults(func=cmd_proposals)
 
     proposals_undo = proposals_sub.add_parser(
         "undo", parents=[common],
         help="put an applied proposal's files back, from the copy taken before it was applied")
     proposals_undo.add_argument("proposal_id", help="the proposal id, e.g. prop_0001")
+    proposals_undo.add_argument("--slug", default=argparse.SUPPRESS,
+                                help="project name (optional with --project)")
+    proposals_undo.add_argument("--root", default=argparse.SUPPRESS,
+                                help="projects root (default: AgentOrg/projects)")
     proposals_undo.set_defaults(func=cmd_proposals)
 
     pool = sub.add_parser("pool", parents=[common],
