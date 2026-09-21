@@ -93,6 +93,14 @@ struct MenuBarPanel: View {
                 Divider()
                 Label(gate.reason, systemImage: gate.canAct ? "hand.raised.fill" : "hourglass")
                     .font(.caption).foregroundStyle(gate.canAct ? .orange : .secondary).lineLimit(2)
+                // The reason, in both branches. It used to be shown only when the console could *not*
+                // act — so the panel that exists for a person whose window is closed told them a gate
+                // was waiting, offered Approve and Reject, and said nothing about why it was theirs.
+                // The engine's own refusal is in this sentence, and it is the one thing that makes
+                // the decision answerable.
+                if !gate.why.isEmpty {
+                    Text(gate.why).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                }
                 if gate.canAct {
                     HStack(spacing: 6) {
                         Button("Approve") { Task { await controller.approve() } }
@@ -100,8 +108,6 @@ struct MenuBarPanel: View {
                         Button("Reject") { Task { await controller.reject() } }
                             .accessibilityLabel("Reject this gate")
                     }
-                } else {
-                    Text(gate.why).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
                 }
             }
 

@@ -1283,8 +1283,20 @@ struct SetupPane: View {
                         KeyValueRow(key: "root", value: controller.libraryPath)
                         KeyValueRow(key: "available", value: "\(controller.skills.count) skill(s)")
                         if controller.skills.isEmpty {
+                            // Which read is outstanding, rather than only an empty figure: "0 skill(s)"
+                            // beside a button reads as a missing feature, and the list is a round trip
+                            // to the engine that this pane has simply not made yet — or cannot, with
+                            // the engine down, which is the other thing worth saying.
+                            Text(controller.engineState == .running
+                                 ? "The list has not been read from the engine yet."
+                                 : "The engine is not running, so the list cannot be read — it is a "
+                                   + "live round trip to the skill library, not a file on disk.")
+                                .font(.caption2).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                             Button("Load the list") { Task { await controller.loadRoster() } }
                                 .controlSize(.small)
+                                .accessibilityLabel("Ask the engine for the skill library")
+                                .accessibilityHint("Fills the list of skills an agent can be hired for")
                         }
                     }
                 }

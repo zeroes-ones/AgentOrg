@@ -351,6 +351,7 @@ struct HappeningSection: View {
                 EngineNotRunningView(controller: controller)
             } else {
                 headline
+                proposedPlan
                 if runIsLive { transport }
                 goalComposer
                 // The card that owns every durable-goal control — pause, resume, clear, the autonomy
@@ -386,7 +387,15 @@ struct HappeningSection: View {
                     .foregroundStyle(.green)
                     .accessibilityLabel("This is about the org \(controller.activeOrgName)")
             }
-            Label(report["headline"]?.stringValue ?? "Nothing is running yet",
+            Label(report["headline"]?.stringValue ?? (report.isEmpty
+                      // **An absent report is not a report of nothing.** The engine answers `status`
+                      // with an activity report even when nothing has ever run, so an empty one means
+                      // the first poll has not been answered yet — and saying "nothing is running yet"
+                      // there is a claim about the engine's work made from the absence of a reading,
+                      // which is the confident-wrong-output this app refuses everywhere else. The
+                      // two are distinguishable, so they are said differently.
+                      ? "Asking the engine what is happening…"
+                      : "Nothing is running yet"),
                   systemImage: controller.pendingGate != nil
                       ? "hand.raised.fill"
                       : (stop.isEmpty ? "dot.radiowaves.left.and.right" : "exclamationmark.triangle.fill"))
@@ -417,6 +426,161 @@ struct HappeningSection: View {
         .background(tone.opacity(0.08))
         .cornerRadius(8)
         .accessibilityElement(children: .combine)
+    }
+
+    // MARK: the proposed graph — what a person is being asked to approve
+
+    /// The graph the engine proposed, drawn where the decision is.
+    ///
+    /// **What was invisible.** `manifest.proposed` carries the plan the engine composed from the goal
+    /// — its node ids, its gates, its loops, and the staffing gaps that would stop it three nodes in —
+    /// and no view read the field it lands in, so the only trace of a plan on screen was the timeline
+    /// entry's node count. A person whose run is parked at `awaiting_approval` was being asked to
+    /// approve something they could not look at.
+    ///
+    /// **The button is the engine's to offer.** The console's `approve` command resolves a *gate*
+    /// (`Orchestrator.decide`) and raises for a plan, so an Approve built on that would be refused. The
+    /// engine now has the command that approves a *graph* and runs it (`approve_plan` — the route
+    /// `start` takes, minus the planning), and it says in the payload whether the plan is approvable
+    /// (`approvable`, with `reason` when it is not). The card renders that verdict: a button when the
+    /// engine will accept the command, the engine's own sentence when it will not. No control is
+    /// offered on a state this view inferred for itself.
+    @ViewBuilder
+    private var proposedPlan: some View {
+        if let plan = controller.proposedGraph {
+            let nodes = (plan["nodes"]?.arrayValue ?? []).compactMap { $0.stringValue }
+            let gates = (plan["gates"]?.arrayValue ?? []).compactMap { $0.stringValue }
+            let gaps = (plan["staffing_gaps"]?.arrayValue ?? []).compactMap { $0.objectValue }
+            let loops = (plan["loops"]?.arrayValue ?? []).compactMap { $0.objectValue }
+            VStack(alignment: .leading, spacing: 5) {
+                Label("The plan the engine proposed — \(nodes.count) step(s)",
+                      systemImage: "point.topleft.down.to.point.bottomright.curvepath")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.orange)
+                    .accessibilityLabel("The engine proposed a plan with \(nodes.count) steps")
+
+                if nodes.isEmpty {
+                    // The engine's `nodes` is the plan; a payload without it is a proposal this build
+                    // cannot draw, and saying so beats an empty heading that reads as "no steps".
+                    Text("The engine proposed a graph but sent no step list with it, so this build "
+                         + "cannot draw it. The plan is on disk — the run parked with it.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    // The node ids verbatim, in the engine's own order: they are the names the board,
+                    // the timeline and every gate sentence use, so a person reading them here can find
+                    // the same step everywhere else.
+                    Text(nodes.joined(separator: " · "))
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if !gates.isEmpty {
+                    Label("a decision is asked at: \(gates.joined(separator: ", "))",
+                          systemImage: "hand.raised")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                if !loops.isEmpty {
+                    // `id` and `max_iterations` are the two fields the engine sends, and a loop is the
+                    // one part of a plan whose bound a person may want to see before approving.
+                    Label("loops: " + loops.map { loop in
+                        let id = loop["id"]?.stringValue ?? "?"
+                        guard let bound = loop["max_iterations"]?.intValue else { return id }
+                        return "\(id) (up to \(bound))"
+                    }.joined(separator: ", "), systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                if !gaps.isEmpty {
+                    // The engine's own reason for each gap, and it is the reason a plan stops early —
+                    // the sentence the CLI prints before a run for exactly this purpose.
+                    Label("\(gaps.count) capability(ies) nobody holds: " + gaps.map { gap in
+                        let skill = gap["skill"]?.stringValue ?? "?"
+                        let reason = gap["reason"]?.stringValue ?? ""
+                        return reason.isEmpty ? skill : "\(skill) — \(reason)"
+                    }.joined(separator: "; "), systemImage: "person.crop.circle.badge.questionmark")
+                        .font(.caption2).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Text(approvalSentence(plan))
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                approveControl(plan)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.08))
+            .cornerRadius(8)
+            // **Deliberately not `children: .combine`.** This card holds the Approve button now, and
+            // combining the children into one element folds a control into a static label — readable,
+            // but not operable by VoiceOver. The heading keeps its own label, so the card still
+            // announces what it is, and the button stays a control a person can reach.
+        }
+    }
+
+    /// What the plan is, in the terms the engine is actually in.
+    ///
+    /// Two facts and no verdict: whether the plan was composed or adopted, and whether the engine
+    /// validated it. Whether it can be *approved* is a separate question, and its answer is the
+    /// engine's — rendered by `approveControl` from `approvable`/`reason` rather than guessed here from
+    /// the run's phase, which a relaunched console reports as `idle` for a plan the engine still holds.
+    private func approvalSentence(_ plan: [String: JSONValue]) -> String {
+        let adoption = plan["adopted"]?.boolValue == true
+            ? "adopted from disk" : "composed from the goal"
+        let check: String
+        switch plan["validated"]?.boolValue {
+        case .some(true): check = "it validated"
+        case .some(false): check = "the engine did not validate it"
+        case .none: check = "the engine did not say whether it validated"
+        }
+        return "\(adoption), \(check)."
+    }
+
+    /// The Approve control, or the engine's reason one is not offered.
+    ///
+    /// **A button whose only outcome is a refusal is worse than no button**, because a person learns the
+    /// app is broken rather than that the engine declined. So the engine's verdict travels in the
+    /// payload and decides which half renders: the command when the engine will accept it, the engine's
+    /// own sentence when it will not. Nothing here infers the state that decides whether a control
+    /// exists — the same rule the tool catalogue and the next-action kinds follow.
+    @ViewBuilder
+    private func approveControl(_ plan: [String: JSONValue]) -> some View {
+        if plan["approvable"]?.boolValue == true {
+            HStack(spacing: 8) {
+                Button {
+                    Task { await controller.approvePlan() }
+                } label: {
+                    Label("Approve and run", systemImage: "checkmark.seal")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(controller.engineState != .running)
+                .help("Approve this graph and execute it — the engine runs it on the run's own "
+                      + "thread, so Pause and Abort stay answerable")
+                .accessibilityLabel("Approve this plan and run it")
+
+                Text("the engine runs it on its own thread, so Pause and Abort stay answerable")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        } else {
+            Text(notApprovableReason(plan))
+                .font(.caption2).foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+    }
+
+    /// The engine's reason this plan cannot be approved — never a reason invented here.
+    ///
+    /// The engine sends `reason` whenever `approvable` is false, naming the thing that blocks it (no
+    /// plan file, an unvalidated graph, a run already in flight). Only the engine's silence — a build
+    /// that does not carry the field — falls back to a sentence of ours, and it says exactly that
+    /// rather than diagnosing a state this view cannot see.
+    private func notApprovableReason(_ plan: [String: JSONValue]) -> String {
+        let reason = plan["reason"]?.stringValue ?? ""
+        if !reason.isEmpty { return reason }
+        return "The engine has not said this plan can be approved, so the console offers no control "
+            + "it would refuse."
     }
 
     /// Pause, resume, abort and the instruction channel — shown only while a run exists.
@@ -1706,6 +1870,12 @@ struct UsageSection: View {
                 Metric(label: "Last event", value: relativeTime,
                        detail: "engine liveness")
             }
+            // **Whether this app can tell you anything at all.** The availability belongs here rather
+            // than only in the record of an attempt: a person who has never seen a banner needs to be
+            // able to find out why by looking, and the two silent states — this build cannot post one,
+            // or the app is not allowed to — have different answers. It sits with the machine facts
+            // because that is what it is: a permission of this process, not a property of the run.
+            notificationRow
             // The paths are what a support conversation needs, so they are here rather than only in
             // Settings — and they are read-only text a person can copy.
             KeyValueRow(key: "runtime", value: controller.runtimeDescription)
@@ -1734,6 +1904,40 @@ struct UsageSection: View {
         guard let last = controller.lastEventAt else { return "no events yet" }
         let seconds = Int(Date().timeIntervalSince(last))
         return seconds < 2 ? "just now" : "\(seconds)s ago"
+    }
+
+    /// Whether a banner is possible here, and what became of the last attempt — the two facts the
+    /// console never showed anywhere.
+    ///
+    /// Three states, and the middle one is the point: a person who has never seen a banner cannot tell
+    /// "the app is not allowed" from "nothing has needed me yet", and the *unavailable* case (a
+    /// `swift run` build, which has no bundle for macOS to attach a notification to) has nothing to do
+    /// with permission at all. The advice under it is the fix, in the one place a person would look
+    /// for it.
+    @ViewBuilder
+    private var notificationRow: some View {
+        let state: (sentence: String, advice: String?, attention: Bool) = {
+            if let outcome = controller.notificationOutcome {
+                return (outcome.sentence, outcome.advice, outcome.needsAttention)
+            }
+            if !controller.notificationsAvailable {
+                let unable = NotificationOutcome.unavailable()
+                return (unable.sentence, unable.advice, true)
+            }
+            return ("nothing has been sent yet — permission is asked for at the first thing worth "
+                    + "telling you", nil, false)
+        }()
+        VStack(alignment: .leading, spacing: 2) {
+            KeyValueRow(key: "notifications", value: state.sentence,
+                        tone: state.attention ? .orange : .secondary)
+            if let advice = state.advice {
+                Text(advice)
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .padding(.leading, 98)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel(advice)
+            }
+        }
     }
 }
 

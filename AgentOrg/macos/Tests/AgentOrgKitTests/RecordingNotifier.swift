@@ -31,14 +31,21 @@ final class RecordingNotifier: ConsoleNotifier, @unchecked Sendable {
     private var requests = 0
     private var authorized: Bool
     private var grantOnRequest: Bool
+    private let available: Bool
 
     /// - Parameters:
     ///   - isAuthorized: whether a banner would be delivered *now*. `false` also covers "not yet asked".
     ///   - willGrant: what `requestAuthorization` answers when it is asked.
-    init(isAuthorized: Bool = false, willGrant: Bool = true) {
+    ///   - available: whether this process could post a banner at all. Defaults to `true` — a test
+    ///     process is not the state under test unless it says so, and the `false` case is the one the
+    ///     controller must report as *unavailable* rather than as denied.
+    init(isAuthorized: Bool = false, willGrant: Bool = true, available: Bool = true) {
         self.authorized = isAuthorized
         self.grantOnRequest = willGrant
+        self.available = available
     }
+
+    var isAvailable: Bool { available }
 
     /// The plans a delivery was attempted with, in order.
     var delivered: [NotificationPlan] { lock.withLock { deliveredPlans } }

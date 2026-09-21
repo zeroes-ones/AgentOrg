@@ -115,11 +115,25 @@ public enum NotificationPlanner {
                 thread: thread)
 
         case "run.end":
-            let outcome = event.payload["outcome"]?.stringValue ?? "unknown"
-            // A run that ended *at a gate* did not finish — it parked. Telling someone "the run
-            // finished" there would be the most confusing message the app could send, because the
-            // thing they need to know is that it is waiting.
-            if outcome == "awaiting_human" || outcome == "gated" {
+            // **The fields that say how a run ended are `state`, `gated` and `termination` — not
+            // `outcome`.** The payload is `RunOutcome.as_dict()`, written by the same dataclass in
+            // `engine/host.py` and `engine/orchestrator.py`: `state` is `finished` / `failed` /
+            // `gated`, `gated` and `broken` are the booleans behind it, and `termination` is the
+            // `TERMINATION_*` word for anything that stopped the run rather than the run ending. The
+            // `outcome` key is the *runner's own summary word* and is absent whenever there was no
+            // summary — so reading it alone, as this did, meant the gated branch below could not
+            // match a real payload: every run parked at a gate was announced to the person as "the
+            // run finished", which is the most confusing message this app can send.
+            let state = event.payload["state"]?.stringValue ?? ""
+            let summary = event.payload["outcome"]?.stringValue ?? ""
+            let termination = event.payload["termination"]?.stringValue ?? ""
+            // The two old spellings are kept: an `outcome` of `awaiting_human` is the same parking
+            // seen through the runner's summary word, and a payload that carries only that must not
+            // fall through to "finished".
+            let atAGate = event.payload["gated"]?.boolValue == true
+                || state == "gated"
+                || summary == "awaiting_human" || summary == "gated" || summary == "awaiting_gate"
+            if atAGate {
                 return NotificationPlan(
                     identifier: "run.end",
                     title: "Run waiting on you",
@@ -127,10 +141,38 @@ public enum NotificationPlanner {
                     urgency: .interrupt,
                     thread: thread)
             }
+            // **A run the person or the engine stopped is not an emergency.** `aborted` is the
+            // Owner's own stop and `shutdown` is the engine going down and reaping its runner; both
+            // arrive as `state: failed` with `killed` set, and interrupting someone for a stop they
+            // pressed themselves is the noise that trains them to ignore the banner that matters.
+            // The rule is the engine's own word rather than an inference from `killed`.
+            if termination == "aborted" || termination == "shutdown" {
+                return NotificationPlan(
+                    identifier: "run.end",
+                    title: "Run stopped",
+                    body: termination == "aborted"
+                        ? "Stopped at your request — the checkpoint is kept."
+                        : "The engine stopped and took the run with it — the checkpoint is kept.",
+                    urgency: .inform,
+                    thread: thread)
+            }
+            let broken = event.payload["broken"]?.boolValue == true || state == "failed"
+            if broken {
+                // A run that broke is work that stopped with nobody watching, which is the case this
+                // whole app exists for. The body is the engine's own `error` — the same sentence the
+                // host wrote — rather than one composed here.
+                let reason = event.payload["error"]?.stringValue ?? ""
+                return NotificationPlan(
+                    identifier: "run.end",
+                    title: "Run failed",
+                    body: reason.isEmpty ? "The run stopped before it finished." : reason,
+                    urgency: .interrupt,
+                    thread: thread)
+            }
             return NotificationPlan(
                 identifier: "run.end",
                 title: "Run finished",
-                body: "Outcome: \(outcome).",
+                body: "Outcome: \(summary.isEmpty ? (state.isEmpty ? "unknown" : state) : summary).",
                 urgency: .inform,
                 thread: thread)
 
@@ -163,12 +205,113 @@ public enum NotificationPlanner {
     }
 }
 
+/// What became of one banner attempt, as a value the console can read and show.
+///
+/// **Why this is not a `Bool` and not a sentence.** The delivery already returned a `Bool` and the
+/// controller already recorded *something* — a string that said "a notification could not be
+/// delivered" whether the app had been denied, the system had refused the request, or this process
+/// had no notification centre at all. Those three are not one state and only two of them have an
+/// action behind them, so the outcome is a value: which of the four things happened, which banner it
+/// was about, the one line to show, and — where there is one — what to do about it.
+///
+/// It is also what makes the *silence* legible. A person who gets no banner has, until now, had no
+/// way to learn whether the app was denied, unable, or simply had nothing worth interrupting them
+/// for. The last two of those are "nothing to say"; this is the record that says which.
+public struct NotificationOutcome: Equatable, Sendable {
+
+    /// The four things that can happen to a banner attempt.
+    public enum Kind: String, Sendable, Equatable {
+        /// A banner was posted.
+        case delivered
+        /// The person (or an earlier prompt) refused this app permission. Changeable in System
+        /// Settings, and *not* an error: a refused notification is a decision.
+        case denied
+        /// This process cannot post a banner at all — no application bundle to own one, which is the
+        /// state a `swift run` binary is in. Nothing here is changeable; run the built app instead.
+        case unavailable
+        /// Authorised, and the request was refused or threw.
+        case failed
+    }
+
+    public let kind: Kind
+    /// The plan's own title, so a person can tell which banner this was about.
+    public let title: String
+    /// The one line the status bar and the panes show.
+    public let sentence: String
+    /// What to do about it, or nil when there is nothing to do.
+    public let advice: String?
+    /// When the attempt finished, so a stale outcome can be told from a current one.
+    public let at: Date
+
+    /// Whether this is something a person can act on — false only for a banner that went out, so a
+    /// view can show the state without showing a warning about permission nobody needs to change.
+    public var needsAttention: Bool { kind != .delivered }
+
+    private init(kind: Kind, title: String, sentence: String, advice: String?, at: Date) {
+        self.kind = kind
+        self.title = title
+        self.sentence = sentence
+        self.advice = advice
+        self.at = at
+    }
+
+    public static func delivered(_ title: String, at: Date = Date()) -> NotificationOutcome {
+        NotificationOutcome(kind: .delivered, title: title, sentence: "notified: \(title)",
+                            advice: nil, at: at)
+    }
+
+    /// Refused. The sentence is the one this console has always shown, kept verbatim so the state a
+    /// person already recognises does not change wording under them.
+    public static func denied(_ title: String, at: Date = Date()) -> NotificationOutcome {
+        NotificationOutcome(
+            kind: .denied, title: title,
+            sentence: "notifications are off (denied in System Settings)",
+            advice: "Turn them on in System Settings → Notifications → AgentOrg, then a run that needs "
+                + "you can interrupt you instead of waiting to be noticed. Until then the badge on "
+                + "Now and the menu-bar panel are what tell you.",
+            at: at)
+    }
+
+    /// This build cannot post banners at all. Say *that*, and say which builds can: the alternative
+    /// — what the console used to report for this state — was "denied in System Settings", a wrong
+    /// instruction pointing at a pane where this process does not appear.
+    public static func unavailable(at: Date = Date()) -> NotificationOutcome {
+        NotificationOutcome(
+            kind: .unavailable, title: "",
+            sentence: "this build cannot post notifications — it has no application bundle",
+            advice: "A `swift run` binary has no bundle for macOS to attach a banner to, so nothing "
+                + "can be posted from it no matter what System Settings says. Run the built "
+                + "AgentOrg.app to be notified; everything else here works the same either way.",
+            at: at)
+    }
+
+    /// Authorised, and the delivery still failed.
+    public static func failed(_ title: String, at: Date = Date()) -> NotificationOutcome {
+        NotificationOutcome(
+            kind: .failed, title: title,
+            sentence: "a notification could not be delivered",
+            advice: "The system refused the request. The console is unaffected — the spine, the "
+                + "badge and the menu-bar panel still show anything that needs you.",
+            at: at)
+    }
+}
+
 /// How the controller delivers a notification.
 ///
 /// A protocol rather than a direct call to `UNUserNotificationCenter` so the controller's *decisions*
 /// — which events notify, when authorisation is asked for, and what happens when it is refused — are
 /// assertable in a test process that has no notification centre and no way to click Allow.
 public protocol ConsoleNotifier: AnyObject, Sendable {
+    /// Whether this process can post a notification **at all**.
+    ///
+    /// Deliberately not `isAuthorized`, and the difference is the whole reason this requirement
+    /// exists. A process with no application bundle — a `swift run` binary, or a test — has no
+    /// notification centre to own a banner, so `isAuthorized` is `false` and asking for authorisation
+    /// returns `false` every time. Reporting *that* as "denied in System Settings" (which is what the
+    /// console did, because it could only see the two booleans) sends a person to a System Settings
+    /// pane where the app is not even listed. Only one of the two states has an action behind it, so
+    /// the console has to be able to tell them apart.
+    var isAvailable: Bool { get }
     /// Whether a notification would be delivered right now. `false` also covers "not yet asked".
     var isAuthorized: Bool { get async }
     /// Ask once, lazily, at the first moment a notification is actually wanted.
@@ -211,6 +354,13 @@ public final class SystemConsoleNotifier: ConsoleNotifier, @unchecked Sendable {
     public static var isAvailable: Bool {
         Bundle.main.bundleURL.pathExtension == "app"
     }
+
+    /// The same answer, as the protocol requires it — so a caller holding only `any ConsoleNotifier`
+    /// can ask the question without knowing which notifier it holds.
+    ///
+    /// Computed per read rather than cached: `Bundle.main` is a process-wide constant, so this is a
+    /// string comparison against a value that cannot change while the process runs.
+    public var isAvailable: Bool { Self.isAvailable }
 
     public var isAuthorized: Bool {
         get async {

@@ -74,6 +74,86 @@ final class ConsoleNotificationsTests: XCTestCase {
         XCTAssertEqual(plan.urgency, .inform)
     }
 
+    // MARK: - run.end, read the way the engine writes it
+
+    func testARunThatParkedIsReadFromTheStateTheEngineActuallyWrites() throws {
+        // **The bug this fixes, stated as the frame the engine sends.** `run.end` carries
+        // `RunOutcome.as_dict()`: `state` is `finished` / `failed` / `gated`, `gated` and `broken` are
+        // the booleans behind it, and `outcome` is the *runner's summary word*, absent whenever there
+        // was no summary. The planner read `outcome` alone, so its gate branch could not match a real
+        // payload — every run parked at a gate reached the person as "the run finished", which is the
+        // most misleading sentence this app can send.
+        let plan = try XCTUnwrap(NotificationPlanner.plan(
+            for: event("run.end", ["state": .string("gated"), "gated": .bool(true),
+                                   "phase": .string("awaiting_human")]),
+            gateIsWaitingOnAHuman: false))
+        XCTAssertEqual(plan.title, "Run waiting on you")
+        XCTAssertEqual(plan.urgency, .interrupt)
+    }
+
+    func testARunThatBrokeInterruptsWithTheEnginesOwnError() throws {
+        // A run that broke is work that stopped with nobody watching — the case this app exists for —
+        // and the body is the host's own `error`, not a sentence composed here.
+        let plan = try XCTUnwrap(NotificationPlanner.plan(
+            for: event("run.end", ["state": .string("failed"), "broken": .bool(true),
+                                   "exit_code": .int(1),
+                                   "error": .string("the runner exited 1")]),
+            gateIsWaitingOnAHuman: false))
+        XCTAssertEqual(plan.title, "Run failed")
+        XCTAssertEqual(plan.body, "the runner exited 1")
+        XCTAssertEqual(plan.urgency, .interrupt)
+    }
+
+    func testAStopTheOwnerAskedForDoesNotInterrupt() throws {
+        // The engine's own `termination` word decides this, rather than a guess from `killed`: a run
+        // the person aborted, and a run the engine reaped on its way down, both arrive as
+        // `state: failed` with `killed` set. Interrupting someone for a stop they pressed themselves
+        // is the noise that trains them to ignore the banner that matters.
+        for word in ["aborted", "shutdown"] {
+            let plan = try XCTUnwrap(NotificationPlanner.plan(
+                for: event("run.end", ["state": .string("failed"), "broken": .bool(true),
+                                       "killed": .bool(true), "termination": .string(word)]),
+                gateIsWaitingOnAHuman: false), word)
+            XCTAssertEqual(plan.title, "Run stopped", word)
+            XCTAssertEqual(plan.urgency, .inform, word)
+        }
+    }
+
+    // MARK: - What became of the attempt
+
+    func testTheUnavailableOutcomeDoesNotSendAnyoneToSystemSettings() {
+        // A process with no application bundle cannot be granted anything: it is not listed in
+        // System Settings at all. Saying "denied" there — which is what the console did, because it
+        // could only see two booleans — is a wrong instruction, and the advice names the build that
+        // *can* notify instead.
+        let outcome = NotificationOutcome.unavailable()
+        XCTAssertEqual(outcome.kind, .unavailable)
+        XCTAssertFalse(outcome.sentence.contains("System Settings"))
+        XCTAssertTrue(outcome.advice?.contains("AgentOrg.app") ?? false)
+        XCTAssertTrue(outcome.needsAttention)
+    }
+
+    func testEachOutcomeCarriesItsOwnAdviceAndOnlyADeliveryIsUnremarkable() {
+        XCTAssertEqual(NotificationOutcome.delivered("Goal complete").sentence,
+                       "notified: Goal complete")
+        XCTAssertNil(NotificationOutcome.delivered("Goal complete").advice)
+        XCTAssertFalse(NotificationOutcome.delivered("Goal complete").needsAttention)
+
+        // The denial is changeable, so its advice says where — and its sentence is kept word for word
+        // from what this console has always shown, so a state a person already recognises does not
+        // change wording under them.
+        let denied = NotificationOutcome.denied("Run failed")
+        XCTAssertEqual(denied.kind, .denied)
+        XCTAssertEqual(denied.sentence, "notifications are off (denied in System Settings)")
+        XCTAssertTrue(denied.advice?.contains("System Settings") ?? false)
+        XCTAssertTrue(denied.needsAttention)
+
+        let failed = NotificationOutcome.failed("Run failed")
+        XCTAssertEqual(failed.kind, .failed)
+        XCTAssertEqual(failed.title, "Run failed")
+        XCTAssertTrue(failed.needsAttention)
+    }
+
     // MARK: - The gate, and the one thing it must not do
 
     func testAGateWaitingOnAHumanInterruptsAndCarriesTheEngineWhy() throws {

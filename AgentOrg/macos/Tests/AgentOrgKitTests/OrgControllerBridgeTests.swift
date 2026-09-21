@@ -555,6 +555,185 @@ final class OrgControllerBridgeTests: XCTestCase {
         XCTAssertTrue(notifier.delivered.first?.title.contains("safety control") ?? false)
     }
 
+    // MARK: - What happened to the banner, and whether one was possible
+
+    /// A controller over no engine, for the tests that only drive events into it.
+    private func makeEventController(notifier: ConsoleNotifier) -> OrgController {
+        OrgController(
+            settings: OrgController.OrgSettings(
+                engineRoot: root, projectPath: root, credentialsPath: nil, libraryRoot: nil),
+            notifier: notifier, preferences: .ephemeral())
+    }
+
+    func testAnUnavailableNotifierIsReportedAsUnavailableRatherThanDenied() async throws {
+        // **The state a `swift run` binary is in.** There is no application bundle, so
+        // `UNUserNotificationCenter` does not exist and nothing can ever be posted — no permission
+        // the person could grant would change it. The console could only see two booleans and said
+        // "denied in System Settings", which sends someone to a pane where this process does not
+        // appear; the outcome now names the real state, and nothing is asked of a system that is not
+        // there.
+        let notifier = RecordingNotifier(isAuthorized: false, willGrant: false, available: false)
+        let controller = makeEventController(notifier: notifier)
+
+        controller.handle(event("goal.blocked", ["reason": .string("no route to a provider")]))
+        await controller.awaitNotifications()
+
+        XCTAssertFalse(controller.notificationsAvailable)
+        XCTAssertEqual(controller.notificationOutcome?.kind, .unavailable)
+        XCTAssertEqual(controller.lastNotification, NotificationOutcome.unavailable().sentence)
+        XCTAssertEqual(notifier.authorizationRequests, 0,
+                       "there is no notification centre here to ask for authorisation")
+        XCTAssertFalse(controller.lastNotification?.contains("System Settings") ?? true,
+                       "the unavailable state is not a System Settings problem")
+    }
+
+    func testADeniedNotifierRecordsTheReasonAndAPlaceToChangeIt() async throws {
+        // The state the console always described, kept word-for-word — and now carrying the fix
+        // beside it, which is the half a person who has never seen a banner needs.
+        let notifier = RecordingNotifier(isAuthorized: false, willGrant: false)
+        let controller = makeEventController(notifier: notifier)
+
+        controller.handle(event("goal.blocked", ["reason": .string("no route to a provider")]))
+        await controller.awaitNotifications()
+
+        XCTAssertEqual(controller.notificationOutcome?.kind, .denied)
+        XCTAssertEqual(controller.lastNotification, "notifications are off (denied in System Settings)")
+        XCTAssertTrue(controller.notificationOutcome?.advice?.contains("System Settings") ?? false,
+                      "a denial is changeable, so the advice has to say where")
+        XCTAssertTrue(controller.notificationOutcome?.needsAttention ?? false)
+    }
+
+    func testADeliveredBannerNamesItselfAndAsksNothingOfThePerson() async throws {
+        let notifier = RecordingNotifier(isAuthorized: true)
+        let controller = makeEventController(notifier: notifier)
+
+        controller.handle(event("human.gate", [
+            "gate_id": .string("release"), "reason": .string("Owner release approval"),
+            "waiting_on": .string("owner"),
+            "why": .string("a safety control fired (guardrail); the goal may not release this")]))
+        await controller.awaitNotifications()
+
+        XCTAssertEqual(controller.notificationOutcome?.kind, .delivered)
+        XCTAssertEqual(controller.notificationOutcome?.title, "A safety control fired — your decision")
+        XCTAssertFalse(controller.notificationOutcome?.needsAttention ?? true,
+                       "a banner that went out is not something to warn about")
+        XCTAssertNil(controller.notificationOutcome?.advice)
+    }
+
+    func testAFinishedDeliveryLeavesNothingBehindAndTheListDoesNotGrow() async throws {
+        // **The list that grew for the session.** Every delivery appended a `Task` and only the
+        // *denied* branch pruned anything — and it pruned cancelled tasks, which is none of them — so
+        // a long run's successful deliveries accumulated for as long as the app ran.
+        //
+        // Nothing here calls `awaitNotifications()` before the first assertion on purpose: that helper
+        // has always cleared the list itself, so it cannot see a leak. The leak *was* the ordinary
+        // running case, where nothing clears it — and this asserts the attempt removes itself.
+        let notifier = RecordingNotifier(isAuthorized: true)
+        let controller = makeEventController(notifier: notifier)
+
+        controller.handle(event("goal.completed", ["summary": .string("one")]))
+        let settled = await waitUntil { controller.inFlightNotificationCount == 0 }
+        XCTAssertTrue(settled, "a finished attempt must take its own entry out of the list")
+        XCTAssertFalse(controller.isDeliveringNotification,
+                       "and the in-flight flag must go false with it")
+
+        for index in 0..<25 {
+            controller.handle(event("goal.completed", ["summary": .string("round \(index)")]))
+        }
+        await controller.awaitNotifications()
+        XCTAssertEqual(controller.inFlightNotificationCount, 0)
+        XCTAssertEqual(notifier.delivered.count, 26,
+                       "every event still notified — bounded bookkeeping, not a dropped delivery")
+    }
+
+    // MARK: - The proposed graph the Now pane draws
+
+    func testAProposedGraphCarriesTheStepsAndGapsThePaneReads() async throws {
+        // **The payload the Now pane draws the plan from.** `manifest.proposed` is what
+        // `Orchestrator.prepare` and `serve._cmd_start` emit: the plan's node ids, its gates, its loops
+        // and the staffing gaps that would stop it three nodes in. The field was set and read by
+        // nothing, so the engine's own drawing of the graph reached no screen.
+        let controller = makeEventController(notifier: RecordingNotifier(isAuthorized: true))
+
+        controller.handle(event("manifest.proposed", [
+            "slug": .string("harden-auth"),
+            "validated": .bool(true),
+            "nodes": .array([.string("pm"), .string("dev"), .string("reviewer")]),
+            "gates": .array([.string("release")]),
+            "loops": .array([.object(["id": .string("review-fix-loop"),
+                                      "max_iterations": .int(3)])]),
+            "staffing_gaps": .array([.object(["node_id": .string("dev"),
+                                              "skill": .string("security"),
+                                              "reason": .string("no agent holds it")])]),
+        ]))
+
+        let plan = try XCTUnwrap(controller.proposedGraph)
+        XCTAssertEqual((plan["nodes"]?.arrayValue ?? []).compactMap { $0.stringValue },
+                       ["pm", "dev", "reviewer"], "the step list the card renders")
+        XCTAssertEqual((plan["gates"]?.arrayValue ?? []).compactMap { $0.stringValue }, ["release"])
+        XCTAssertEqual(plan["slug"]?.stringValue, "harden-auth")
+
+        // Approved takes it away again: the card is for a plan that is still waiting.
+        controller.handle(event("manifest.approved", ["slug": .string("harden-auth")]))
+        XCTAssertNil(controller.proposedGraph)
+    }
+
+    func testAPollClearsAPlanWhoseApprovalLandedWhileNobodyWasListening() async throws {
+        // The event path clears the plan, and the poll is the fallback for an event this console
+        // missed — a restart with a run in flight, a dropped frame. Without this the card would sit
+        // there offering a decision that had already been taken, for the rest of the session.
+        let controller = makeEventController(notifier: RecordingNotifier(isAuthorized: true))
+        controller.handle(event("manifest.proposed", ["nodes": .array([.string("pm")])]))
+        XCTAssertNotNil(controller.proposedGraph)
+
+        // Still parked: the plan is genuinely waiting, so it must survive the poll.
+        controller.applyStatus(["phase": .string("awaiting_approval")])
+        XCTAssertNotNil(controller.proposedGraph, "a run parked at awaiting_approval is still asking")
+
+        controller.applyStatus(["phase": .string("running"), "running": .bool(true)])
+        XCTAssertNil(controller.proposedGraph, "the run is past approval, so the plan is not waiting")
+    }
+
+    func testThePollCarriesAParkedPlanAndTheEnginesVerdictOnApprovingIt() async throws {
+        // The plan is event-sourced, so a console relaunched after a "Plan only" has no event to draw it
+        // from. The poll carries it — and the engine's own `approvable`/`reason`, so the card renders a
+        // control only when the engine would accept the command. The phase here is `idle` on purpose:
+        // that is what a relaunched console reports, so the plan must survive a phase that is not
+        // `awaiting_approval` because the proposal itself is the fact that says it is.
+        let controller = makeEventController(notifier: RecordingNotifier(isAuthorized: true))
+        controller.applyStatus([
+            "phase": .string("idle"),
+            "proposal": .object([
+                "slug": .string("harden-auth"),
+                "validated": .bool(true),
+                "nodes": .array([.string("pm"), .string("dev"), .string("reviewer")]),
+                "approvable": .bool(true),
+                "reason": .string(""),
+            ]),
+        ])
+        let plan = try XCTUnwrap(controller.proposedGraph, "the poll must carry the parked plan")
+        XCTAssertEqual(plan["slug"]?.stringValue, "harden-auth")
+        XCTAssertEqual((plan["nodes"]?.arrayValue ?? []).compactMap { $0.stringValue },
+                       ["pm", "dev", "reviewer"])
+        XCTAssertEqual(plan["approvable"]?.boolValue, true, "the engine, not the app, says yes")
+
+        // And a poll without a proposal clears it, so a plan already acted on cannot linger.
+        controller.applyStatus(["phase": .string("running"), "running": .bool(true)])
+        XCTAssertNil(controller.proposedGraph)
+    }
+
+    func testApprovePlanSendsTheCommandTheEngineReads() async throws {
+        // The plan card's control, on the wire. The command is the engine's own (`approve_plan`), and a
+        // Swift-invented name would be acknowledged by the stand-in and silently unknown to the real
+        // engine — the exact failure the instruction-key test above was written for.
+        let controller = try await launchedController()
+        await controller.approvePlan()
+
+        let sent = try commandsSent()
+        XCTAssertTrue(sent.contains { $0["type"] as? String == "approve_plan" },
+                      "the Approve control must send `approve_plan`, not a second `approve`")
+    }
+
     // MARK: - Goal outcomes reach the status bar
 
     func testEachGoalOutcomeSaysWhatHappenedInTheStatusBar() async throws {

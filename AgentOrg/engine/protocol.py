@@ -196,6 +196,13 @@ class CommandType(str, Enum):
     RESUME = "resume"
     APPROVE = "approve"
     REJECT = "reject"
+    #: Approve the plan a run is parked on and execute it — the plan card's own control.
+    #:
+    #: Distinct from :attr:`APPROVE`, which resolves a *gate* (`Orchestrator.decide`) and raises for a
+    #: plan (`Orchestrator.prepare` never sets `run.gate`). The graph `start` proposed and left parked
+    #: by a dry run has no gate, so the console had no command that approved one; this is that command,
+    #: and it is `start` minus the prepare step — same guards, same run thread, same settle-time ack.
+    APPROVE_PLAN = "approve_plan"
     INSTRUCT = "instruct"
     ASSIGN = "assign"
     SPAWN_AGENT = "spawn_agent"

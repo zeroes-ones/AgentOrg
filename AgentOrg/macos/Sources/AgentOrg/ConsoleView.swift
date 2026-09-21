@@ -288,12 +288,20 @@ struct SpineView: View {
             .accessibilityElement(children: .combine)
             .accessibilityLabel("A gate is waiting: \(gate.reason). \(gate.why)")
 
-            // The sentence explaining why the console is (or is not) about to decide this gate. Shown
-            // whether or not the buttons are, so the absence of a button is never unexplained.
-            if !gate.canAct {
-                Text(gate.why).font(.caption).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            // **The reason, always — and it was the half a person could not see.** This sentence is
+            // the console's single gate rule (`OrgController.GateDisposition`) as the model carries it,
+            // and it used to be rendered only when the buttons were *not*. So a gate the person had to
+            // answer showed Approve and Reject and no statement of why it was theirs, while the
+            // engine's own refusal is exactly what this sentence holds — "a safety control fired",
+            // "the gate's evidence is not present", "the goal is supervised". A gate that is waiting
+            // is the one place the reason is worth the line.
+            Text(gate.why)
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .help(gate.why)
+                // The row above already speaks this sentence as part of its own label, so the visible
+                // copy is hidden from VoiceOver rather than read a second time.
+                .accessibilityHidden(true)
 
             if gate.canAct {
                 HStack(spacing: 8) {
@@ -515,7 +523,15 @@ struct ConsoleView: View {
     /// shorter question, and these are the words a person would use themselves.
     private func shortQuestion(_ destination: Destination) -> String {
         switch destination {
-        case .now: return controller.spine.needsAPerson ? "needs you now" : "live · next step"
+        case .now:
+            // **The one row whose subtitle can name what is waiting, and the only place that can.**
+            // Now has two different decisions behind one badge — a gate the engine left to a person,
+            // and a graph the engine proposed — and "1" cannot say which; naming it in the row is
+            // cheaper than a second badge and answers "what needs me" before the pane is open. With
+            // nothing waiting the row describes the destination, like every other row here.
+            if controller.gateIsWaitingForHuman { return "a gate needs you" }
+            if controller.proposedGraph != nil { return "a plan needs approval" }
+            return "live · next step"
         case .runs: return "past runs · disk"
         case .org: return "people · hiring"
         // Describes the destination, like every row above it — it used to read "6/12 held", a bare
@@ -540,7 +556,14 @@ struct ConsoleView: View {
         switch destination {
         // One gate means one decision, and that is the only thing on Now worth badging: everything
         // else on the destination is information a person can read at leisure.
-        case .now: return controller.gateIsWaitingForHuman ? 1 : 0
+        //
+        // **A proposed graph is the second decision, and it was badging nothing.** `manifest.proposed`
+        // sets `proposedGraph` and the engine parks the run at `awaiting_approval` until the graph it
+        // drew is approved — a run that cannot proceed without a person, which is exactly what a badge
+        // means here. Two decisions waiting is two, so the count adds rather than masking the second.
+        case .now:
+            return (controller.gateIsWaitingForHuman ? 1 : 0)
+                + (controller.proposedGraph != nil ? 1 : 0)
         // A proposal is work waiting on a decision the app cannot make for you — the same test.
         case .runs: return controller.proposals.count
         // The Org row carries nothing: a roster needs no attention, and the old app badged panels
@@ -715,6 +738,23 @@ struct StatusBar: View {
                 Text(relative(last)).font(.caption2).foregroundStyle(.secondary)
                     .accessibilityLabel("Last engine event \(relative(last))")
             }
+            if let chip = notificationChip {
+                // **Why a banner did or did not arrive.** The app asks for notification permission
+                // only when it has something to say, so a person who has never seen one cannot tell
+                // "the app is not allowed" from "there has been no news" — and two of the three
+                // silent states have something to do about them. Shown when the last attempt was not
+                // delivered, and *also* when this process cannot post at all, which is known before
+                // any attempt: a `swift run` build that notifies nobody must not be silent about it.
+                // The full sentence and the advice are the tooltip and the spoken label, because a
+                // strip that wrapped would move the window's own content.
+                Divider().frame(height: 12)
+                Label(chip.text, systemImage: StatusTone.attention.symbol)
+                    .font(.caption2)
+                    .foregroundStyle(StatusTone.attention.colour)
+                    .lineLimit(1)
+                    .help(chip.detail)
+                    .accessibilityLabel("Notifications: \(chip.detail)")
+            }
             if let notice = controller.notice {
                 Text(notice).font(.caption).foregroundStyle(.orange).lineLimit(1)
                     .accessibilityLabel("Notice: \(notice)")
@@ -743,6 +783,33 @@ struct StatusBar: View {
     private func relative(_ date: Date) -> String {
         let seconds = Int(Date().timeIntervalSince(date))
         return seconds < 2 ? "just now" : "\(seconds)s ago"
+    }
+
+    /// The terse form of a notification outcome, for a strip with room for a phrase and not a
+    /// sentence. The full sentence and the advice behind it are the tooltip and the spoken label.
+    private func shortNotification(_ outcome: NotificationOutcome) -> String {
+        switch outcome.kind {
+        case .delivered: return "notifications on"
+        case .denied: return "notifications off"
+        case .unavailable: return "cannot notify from this build"
+        case .failed: return "no banner could be sent"
+        }
+    }
+
+    /// The notification state worth a chip here, if any.
+    ///
+    /// Two things earn one, and the second is why this is not just a read of the last outcome: **a
+    /// process that can never post a banner is known before any attempt has been made.** A `swift run`
+    /// build has no application bundle, so it notifies nobody — and a state that shows nothing until
+    /// something is attempted is exactly the silence this is meant to end.
+    private var notificationChip: (text: String, detail: String)? {
+        if let outcome = controller.notificationOutcome {
+            guard outcome.needsAttention else { return nil }
+            return (shortNotification(outcome), outcome.advice ?? outcome.sentence)
+        }
+        guard !controller.notificationsAvailable else { return nil }
+        let unable = NotificationOutcome.unavailable()
+        return (shortNotification(unable), unable.advice ?? unable.sentence)
     }
 }
 

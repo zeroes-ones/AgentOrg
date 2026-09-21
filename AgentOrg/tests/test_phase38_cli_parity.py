@@ -187,7 +187,8 @@ def test_every_new_operation_resolves_to_a_command():
                  ["agent", "update", "Alice", "--title", "x"], ["agent", "retire", "Alice"],
                  ["providers", "list"], ["providers", "add", "groq", "--base-url", "https://x/v1"],
                  ["providers", "test", "groq", "--base-url", "https://x/v1"],
-                 ["providers", "remove", "groq"], ["improve"], ["proposals"]):
+                 ["providers", "remove", "groq"], ["improve"], ["proposals"],
+                 ["run", "--approve-plan", "--slug", "s"]):
         assert parser.parse_args(argv).func is not None, f"{argv} does not resolve to a command"
 
 
@@ -213,7 +214,8 @@ def test_every_new_command_is_documented_in_usage_md():
                        "`takeover --slug s <node>`", "`discard --slug s`", "`subagents list --slug s`",
                        "`subagents result <child> --slug s`", "`agent update <name>",
                        "`agent retire <name>`", "`providers list`", "`providers add <id>",
-                       "`providers test <id>", "`providers remove <id>`", "`improve`", "`proposals`"):
+                       "`providers test <id>", "`providers remove <id>`", "`improve`", "`proposals`",
+                       "`run --approve-plan"):
         assert documented in text, f"{documented} is not in USAGE.md"
 
 
@@ -1149,7 +1151,10 @@ def test_success_is_zero_and_a_check_failure_is_one(run_project):
 def test_a_usage_error_is_two_for_every_new_command():
     """A missing required argument is usage, not a check that failed — a script branches on that."""
     for argv in (["reassign", "dev"], ["agent", "update"], ["agent", "retire"],
-                 ["providers", "add"], ["providers", "test"], ["providers", "remove"]):
+                 ["providers", "add"], ["providers", "test"], ["providers", "remove"],
+                 # `--approve-plan` acts on the parked plan, so naming a graph to build beside it is
+                 # contradictory rather than one silently winning.
+                 ["run", "--approve-plan", "--goal", "ship it"]):
         result = run_cli(*argv)
         assert result.returncode == EXIT_USAGE, f"{argv}: {result.returncode}"
 
@@ -1178,3 +1183,86 @@ def test_the_new_commands_use_the_shared_workspace_resolver(tmp_path):
     assert _resolve_workspace(args, slug).path == project.resolve()
     # `abort` reaches the same resolver, so a bare invocation refuses with the resolver's own advice.
     assert run_cli("abort").returncode == EXIT_USAGE
+
+
+# ── approving a parked plan, on both surfaces ────────────────────────────────
+
+
+def _park_a_plan(root, creds_path, slug: str = "parked") -> pathlib.Path:
+    """Leave a plan prepared and unexecuted — the state the app's "Plan only" leaves."""
+    result = run_cli("--config", str(creds_path), "run", "--goal", "ship a landing page",
+                     "--slug", slug, "--root", str(root), "--dry-run")
+    assert result.returncode == EXIT_OK, result.stderr[:400]
+    project = root / slug
+    assert project.is_dir()
+    return project
+
+
+def test_approve_plan_has_a_home_on_both_surfaces():
+    """Not one surface's private trick: a parser verb and a serve command, named the same, plus the
+    protocol value both dispatch on. A gap here is an operation a terminal could not reach."""
+    from engine.protocol import CommandType
+
+    assert build_parser().parse_args(["run", "--approve-plan", "--slug", "s"]).func is not None
+    assert hasattr(Server, "_cmd_approve_plan"), "the console's route must exist"
+    assert CommandType.APPROVE_PLAN.value == "approve_plan"
+
+
+def test_the_cli_approves_and_runs_a_parked_plan(tmp_path):
+    """A plan a person approved by eye is finished from the terminal, continuing *that* run.
+
+    `run --manifest` would also execute the graph, but it adopts the file into a *second* run and leaves
+    the parked one's checkpoint behind — a different operation, which is why the terminal gained this
+    one rather than only the manifest path it already had.
+    """
+    root = tmp_path / "projects"
+    creds_path = creds(tmp_path)
+    project = _park_a_plan(root, creds_path)
+    (project / "stub.py").write_text(_RUN_STUB)
+
+    before = cli_json("--config", str(creds_path), "status", "--slug", "parked", "--root", str(root))
+    assert before["phase"] == "awaiting_approval", "the plan is parked, nothing executing"
+
+    result = run_cli("--config", str(creds_path), "run", "--approve-plan", "--slug", "parked",
+                     "--root", str(root), "--executor", str(project / "stub.py"))
+    assert result.returncode == EXIT_OK, result.stderr[:400]
+
+    after = cli_json("--config", str(creds_path), "status", "--slug", "parked", "--root", str(root))
+    assert after["phase"] != "awaiting_approval", "the graph must actually execute"
+    assert after["run_id"] == before["run_id"], "the same run continues — not a second one"
+
+
+def test_the_console_approves_and_runs_the_same_kind_of_parked_plan(tmp_path, monkeypatch):
+    """The console's route drives the same checkpoint the CLI's route does, out of `awaiting_approval`.
+
+    Only `Orchestrator.execute` is replaced: the command dispatch, the run thread and the deferred ack
+    are the real ones, so this asserts the *route* rather than a stand-in.
+    """
+    import time
+
+    from engine.orchestrator import Orchestrator, RunPhase
+
+    root = tmp_path / "projects"
+    creds_path = creds(tmp_path)
+    project = _park_a_plan(root, creds_path, slug="srvparked")
+
+    server = server_for(creds_path, slug="srvparked", root=root)
+    executed: list[str] = []
+
+    def execute(self, run=None, **_kwargs):
+        run = self._resolve(run)
+        executed.append(run.run_id)
+        run.phase = RunPhase.DONE
+        self._persist(run)
+        return type("Outcome", (), {
+            "summary": {"outcome": "done"}, "state": type("S", (), {"value": "done"})(),
+            "gated": False})()
+
+    monkeypatch.setattr(Orchestrator, "execute", execute)
+    server._cmd_approve_plan({}, cmd_id="c-approve")
+    deadline = time.time() + 15
+    while server._run_thread is not None and time.time() < deadline:
+        time.sleep(0.02)
+    assert executed, "the console's route must execute the parked graph"
+    on_disk = json.loads((project / ".agent_state" / "run_state.json").read_text())
+    assert on_disk["phase"] != "awaiting_approval"

@@ -112,6 +112,7 @@ python3 -m engine.cli --config /path/credentials.json --json doctor
 | `run --goal "…"` | *Execute a goal.* Plans, binds, and stops only at a gate a person must decide |
 | `run --manifest f.yaml` | Execute an existing graph instead of planning a new one |
 | `run --goal "…" --dry-run` | Plan and bind, but execute nothing |
+| `run --approve-plan --slug s` | Approve and execute the plan a `--dry-run` left parked |
 | `status --slug s` | *Where is it?* Phase, gate, gaps, instructions, cost and per-node outcomes |
 | `activity --project P` | *What is happening, why, and what next?* Headline, timeline, gaps, next step |
 | `flow --project P` | *Who is working on what?* The board: each unit of work, its owner, its handoffs and what came back |
@@ -348,9 +349,17 @@ python3 -m engine.cli run --goal "Build a booking API with auth and payments" --
 # Bind and print the plan without executing anything
 python3 -m engine.cli run --goal "…" --slug booking --dry-run
 
+# Approve the plan that dry run left parked, and execute it — the same run continues
+python3 -m engine.cli run --approve-plan --slug booking
+
 # Execute a manifest you wrote with `plan --out`
 python3 -m engine.cli run --manifest booking.yaml
 ```
+
+`--dry-run` leaves a plan prepared and unexecuted, which is a decision waiting for you.
+`run --approve-plan` approves that graph and starts it — the terminal's half of the console's
+**Approve and run** button. (`run --manifest <that file>` also executes the graph, but it adopts the
+file into a *second* run; `--approve-plan` continues the run that composed the plan.)
 
 If a node needs a capability nobody holds, `run` prints the **staffing gaps** and names them rather
 than failing mid-graph — hire the agent, or amend the plan, then re-run.

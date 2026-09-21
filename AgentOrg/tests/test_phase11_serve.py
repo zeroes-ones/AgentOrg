@@ -453,6 +453,157 @@ def test_a_run_that_cannot_execute_acks_start_with_the_reason(config, library, m
     assert server._in_flight == 0, "a failed run must not leave the in-flight counter stuck"
 
 
+# ── approving the plan, not a gate ───────────────────────────────────────────
+
+
+def _recording_execute(calls: list[str]):
+    """An `Orchestrator.execute` that settles at once, so a test can watch the route, not a run."""
+
+    def execute(self, run=None, **_kwargs):
+        from engine.orchestrator import RunPhase
+
+        run = self._resolve(run)
+        calls.append(run.run_id)
+        run.phase = RunPhase.RUNNING
+        self._persist(run)
+        run.phase = RunPhase.DONE
+        run.touch()
+        self._persist(run)
+        return _Outcome(False)
+
+    return execute
+
+
+def test_approve_plan_runs_the_graph_and_is_acked_once(config, library, monkeypatch):
+    """The route the console lacked: approve the prepared graph and execute it.
+
+    `approve` is `Orchestrator.decide`, which resolves a gate and raises for a plan — so a graph parked
+    by "Plan only" had no command that could act on it. This is that command, and it is `start` minus the
+    prepare step: the ack is the run's outcome, sent once, when the graph settles on the run thread.
+    """
+    from engine.orchestrator import Orchestrator
+
+    calls: list[str] = []
+    monkeypatch.setattr(Orchestrator, "execute", _recording_execute(calls))
+    out = CapturedOut()
+
+    server, stdin, thread = _live_server(config, library, slug="approveplan", out=out)
+    try:
+        _wait_for(lambda: any(e.get("type") == "engine.ready" for e in out.events()), 20, "ready")
+        stdin.send({"cmd_id": "s1", "type": "start",
+                    "payload": {"goal": "ship a landing page", "dry_run": True}})
+        _wait_for(lambda: ack_for(out.events(), "s1") is not None, 60, "the plan to be parked")
+        parked = ack_for(out.events(), "s1")
+        assert parked["ok"] is True and parked["detail"]["phase"] == "awaiting_approval"
+
+        stdin.send({"cmd_id": "a1", "type": "approve_plan"})
+        _wait_for(lambda: ack_for(out.events(), "a1") is not None, 60, "the approval to settle")
+    finally:
+        stdin.close()
+        thread.join(timeout=15)
+
+    approved = ack_for(out.events(), "a1")
+    assert approved["ok"] is True, approved
+    assert approved["detail"]["phase"] == "done"
+    assert approved["detail"]["outcome"] == "done"
+    assert calls, "the graph the command approved must actually execute"
+    assert len([e for e in acks(out.events()) if e["payload"].get("cmd_id") == "a1"]) == 1, \
+        "a deferred ack must be sent exactly once — twice would corrupt the app's view"
+    assert any(e.get("type") == "manifest.approved" for e in out.events())
+    assert server._run_thread is None, "the liveness marker must be cleared once the run settles"
+
+
+def test_approve_plan_is_refused_while_a_run_is_in_flight(config, library, monkeypatch):
+    """Two graphs on one workspace is the failure `start`'s liveness guard exists to prevent."""
+    from engine.orchestrator import Orchestrator
+
+    timeline: list[str] = []
+    release = threading.Event()
+    monkeypatch.setattr(Orchestrator, "execute",
+                        _in_flight_execute(release=release, timeline=timeline))
+    out = CapturedOut(timeline=timeline)
+
+    server, stdin, thread = _live_server(config, library, slug="busyapprove", out=out)
+    try:
+        _wait_for(lambda: "event:engine.ready" in timeline, 20, "the engine to be ready")
+        stdin.send({"cmd_id": "s1", "type": "start",
+                    "payload": {"goal": "ship a landing page", "dry_run": True}})
+        _wait_for(lambda: ack_for(out.events(), "s1") is not None, 60, "the plan to be parked")
+        stdin.send({"cmd_id": "a1", "type": "approve_plan"})
+        _wait_for(lambda: "run-live" in timeline, 60, "the graph to be in flight")
+        stdin.send({"cmd_id": "a2", "type": "approve_plan"})
+        _wait_for(lambda: ack_for(out.events(), "a2") is not None, 20, "the refusal to be answered")
+        release.set()
+        _wait_for(lambda: ack_for(out.events(), "a1") is not None, 20, "the run to settle")
+    finally:
+        stdin.close()
+        thread.join(timeout=15)
+
+    second = ack_for(out.events(), "a2")
+    assert second["ok"] is False and "already in flight" in second["error"]
+
+
+def test_approve_plan_with_nothing_prepared_says_so(config, library):
+    """A refusal a person can act on names what is missing, not just that it is missing."""
+    _, events = drive(config, library, [{"cmd_id": "c1", "type": "approve_plan"}])
+    payload = ack_for(events, "c1")
+    assert payload["ok"] is False
+    assert "no prepared plan" in payload["error"]
+
+
+def test_status_carries_the_pending_plan_after_a_relaunch(config, library):
+    """The plan is event-sourced, so a console relaunched after "Plan only" must still have it.
+
+    A *new* server over the same workspace is the relaunch: nothing is loaded in memory, so the plan can
+    only come from the checkpoint the engine already keeps for the prepared run.
+    """
+    root = pathlib.Path(tempfile.mkdtemp())
+    workspace = Workspace.for_project("relaunch", root=root)
+    workspace.ensure()
+    out = CapturedOut()
+    stdin = io.StringIO(json.dumps({"cmd_id": "c1", "type": "start",
+                                    "payload": {"goal": "ship a landing page",
+                                                "dry_run": True}}) + "\n")
+    Server(config=config, library=library, workspace=workspace, slug="relaunch",
+           stdin=stdin, stdout=out).serve_forever()
+    parked = ack_for(out.events(), "c1")
+    assert parked["ok"] is True and parked["detail"]["phase"] == "awaiting_approval"
+
+    fresh = Server(config=config, library=library, workspace=workspace, slug="relaunch",
+                   stdin=io.StringIO(""), stdout=CapturedOut())
+    status = fresh._cmd_status({})
+    proposal = status.get("proposal")
+    assert proposal, "the parked plan must survive the restart"
+    assert proposal["nodes"], "with the step list the card draws"
+    assert proposal["slug"] == "relaunch" and proposal["run_id"] == parked["detail"]["run_id"]
+    assert proposal["approvable"] is True and proposal["reason"] == ""
+    # And the app's other clearing rule cannot apply: the run is not running and nothing executes.
+    assert status["phase"] == "idle" and status["running"] is False
+
+
+def test_the_proposal_says_why_a_plan_is_not_approvable(config, library):
+    """The engine's verdict, so the card renders no control the engine would refuse."""
+    root = pathlib.Path(tempfile.mkdtemp())
+    workspace = Workspace.for_project("unvalid", root=root)
+    workspace.ensure()
+    server = Server(config=config, library=library, workspace=workspace, slug="unvalid",
+                    stdin=io.StringIO(""), stdout=CapturedOut())
+    # The state `prepare` leaves, with a graph the validator refused — the one case where the engine's
+    # `approve` raises rather than executing.
+    server.workspace.save_checkpoint({
+        "run_id": "run_unvalid", "slug": "unvalid", "goal": "g", "phase": "awaiting_approval",
+        "manifest_path": str(workspace.path / "unvalid.yaml"),
+        "plan": {"manifest": {"name": "unvalid", "nodes": [{"id": "a"}]},
+                 "validation": {"valid": False, "errors": ["no end node"]}},
+        "staffing_gaps": [],
+    })
+
+    proposal = server._cmd_status({})["proposal"]
+    assert proposal["approvable"] is False
+    assert "did not validate" in proposal["reason"]
+    assert "no end node" in proposal["reason"], "the engine's own error text must reach the card"
+
+
 # ── the app's real path: a subprocess ────────────────────────────────────────
 
 

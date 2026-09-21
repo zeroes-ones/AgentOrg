@@ -66,8 +66,8 @@ class ServerError(RuntimeError):
 
 
 #: Returned by a handler that has taken over its own acknowledgement for a command, so the command
-#: worker must not send one. Only `start` does this: it hands the graph to a run thread (see
-#: `_start_run`) and the ack is that run's outcome, sent when the graph settles.
+#: worker must not send one. `start` does this, and so does `approve_plan`: both hand the graph to a run
+#: thread (see `_start_run`) and the ack is that run's outcome, sent when the graph settles.
 _ACK_DEFERRED = object()
 
 
@@ -823,15 +823,15 @@ class Server:
     def handle(self, command: Command) -> Any:
         """Dispatch one command. Returns the ack's detail, or raises to report a refusal.
 
-        `start` may instead return `_ACK_DEFERRED`, meaning "this command will acknowledge itself": its
-        work outlives the call and its ack is the run's outcome, so the worker must not send one and the
-        handler is handed the `cmd_id` to send it on.
+        `start` and `approve_plan` may instead return `_ACK_DEFERRED`, meaning "this command will
+        acknowledge itself": their work outlives the call and their ack is the run's outcome, so the
+        worker must not send one and the handler is handed the `cmd_id` to send it on.
         """
         kind = command.type_value
         handler: Callable[..., Any] | None = getattr(self, f"_cmd_{kind}", None)
         if handler is None:
             raise ServerError(f"unknown command {kind!r}")
-        if kind == "start":
+        if kind in ("start", "approve_plan"):
             return handler(command.payload or {}, cmd_id=command.cmd_id)
         return handler(command.payload or {})
 
@@ -862,6 +862,13 @@ class Server:
             journey = self._journey()
             if journey is not None:
                 idle["journey"] = journey
+            # A plan parked before the last restart is still on disk, and the *event* that announced it
+            # happened in the previous process — so the poll carries it from the checkpoint. This is the
+            # state the console starts in after a relaunch, so the card must appear here or the person
+            # would have to re-plan a graph the engine already composed.
+            proposal = self._pending_proposal()
+            if proposal is not None:
+                idle["proposal"] = proposal
             return idle
         status = self.orchestrator.status()
         # The roster is what the Org panel renders, so it travels with every snapshot rather than
@@ -912,6 +919,13 @@ class Server:
         journey = self._journey()
         if journey is not None:
             status["journey"] = journey
+        # The plan a person can still approve travels with the snapshot too, read from the checkpoint the
+        # engine already keeps for the prepared run rather than a second copy of it. This is what makes
+        # the card survive a restart: `proposedGraph` is event-sourced and the app can miss the event, so
+        # the poll — the fallback for a missed event everywhere else — carries the plan as well.
+        proposal = self._pending_proposal()
+        if proposal is not None:
+            status["proposal"] = proposal
         return status
 
     def _journey(self) -> dict[str, Any] | None:
@@ -938,6 +952,73 @@ class Server:
         except Exception as exc:  # noqa: BLE001
             _log(f"serve: could not render the setup journey: {exc}")
             return None
+
+    def _pending_proposal(self) -> dict[str, Any] | None:
+        """The plan a person can still approve, read from the run's checkpoint — or `None`.
+
+        **Why the checkpoint and not a field on the server.** A prepared run is already persisted
+        (`prepare` writes `run.plan.manifest` and the phase into `run_state.json`), so the poll reads
+        *that* rather than the engine keeping a second copy that could disagree with the run it
+        describes. It is also what makes the plan survive a restart: `proposedGraph` in the app is
+        event-sourced, so a console relaunched after a "Plan only" would otherwise have no plan to draw.
+
+        Only the state a person can act on is reported — `awaiting_approval`, nothing executing — so an
+        already-running or already-settled run is not offered as something to approve. `approvable` and
+        `reason` are the engine's own verdict on the *command* that would follow, so the app renders no
+        control the engine would refuse.
+        """
+        from .orchestrator import RunPhase
+
+        workspace = self.workspace
+        if workspace is None:
+            return None
+        # A cheap in-memory guard before touching the disk: when an orchestrator is loaded and its run
+        # is past approval, there is nothing to offer, and the poll then does no file read at all. The
+        # read is only for the state the card exists for — parked, or a run this process has not loaded
+        # yet (a relaunch), where the checkpoint is the only copy of the plan.
+        live_run = getattr(self.orchestrator, "_run", None) if self.orchestrator is not None else None
+        if live_run is not None and live_run.phase.value != RunPhase.AWAITING_APPROVAL.value:
+            return None
+        try:
+            raw = workspace.read_checkpoint_raw()
+        except Exception as exc:  # noqa: BLE001 - an unreadable checkpoint is "no plan", not a failure
+            _log(f"serve: could not read the run checkpoint for a pending plan: {exc}")
+            return None
+        if not isinstance(raw, dict):
+            return None
+        # The *orchestrator's* checkpoint, in the one state that has a plan to approve. A runner
+        # checkpoint has no `phase`, and a settled run has a terminal one, so both fall through.
+        if str(raw.get("phase") or "") != RunPhase.AWAITING_APPROVAL.value:
+            return None
+        plan = raw.get("plan") if isinstance(raw.get("plan"), dict) else {}
+        manifest = plan.get("manifest") if isinstance(plan.get("manifest"), dict) else {}
+        validation = plan.get("validation") if isinstance(plan.get("validation"), dict) else {}
+        approvable, reason = self._proposal_verdict(validation, raw.get("manifest_path"))
+        return _proposal_document(
+            run_id=str(raw.get("run_id") or ""), slug=str(raw.get("slug") or self.slug),
+            goal=str(raw.get("goal") or ""), manifest=manifest, validation=validation,
+            staffing_gaps=list(raw.get("staffing_gaps") or []),
+            manifest_path=raw.get("manifest_path"), adopted=not bool(plan),
+            approvable=approvable, reason=reason)
+
+    def _proposal_verdict(self, validation: dict[str, Any],
+                          manifest_path: Any) -> tuple[bool, str]:
+        """Whether the parked plan can be approved now, and the engine's reason when it cannot.
+
+        The verdict mirrors what `approve_plan` itself would answer, so the card and the command cannot
+        disagree: a plan with no manifest file cannot be approved; an unvalidated graph is refused by
+        `Orchestrator.approve`; and a run already in flight is refused by the same liveness guard `start`
+        uses. `True` with an empty reason is the ordinary parked state.
+        """
+        if not manifest_path:
+            return False, "there is no plan file to approve; the run was parked without one"
+        if validation.get("valid") is False:
+            errors = ", ".join(str(e) for e in (validation.get("errors") or []))
+            return False, (f"the engine did not validate this graph: {errors}" if errors
+                           else "the engine did not validate this graph")
+        if self._run_is_live():
+            return False, "a run is already in flight; pause or abort it before approving another"
+        return True, ""
 
     def _cmd_activity(self, payload: dict[str, Any]) -> dict[str, Any]:
         """The activity timeline: what the org is doing, why it stopped, and what is next.
@@ -1643,16 +1724,61 @@ class Server:
                            max_iterations=int(payload.get("max_iterations") or 3),
                            auto_staff=None if auto_staff is None else bool(auto_staff))
         self._forward_bus(orch)
+        # The plan event and the `status` payload carry the **same** document (`_proposal_document`), so
+        # the card cannot read one shape from the event and a different one from the two-second poll.
+        # `approvable` is decided here rather than inferred by the app: a dry run parks the graph for
+        # approval, while an ordinary `start` is already handing it to the run thread — so the card
+        # offers no control for the case where the engine would refuse it.
+        approvable = bool(payload.get("dry_run"))
         self.emit(Event(seq=0, type=EventType.MANIFEST_PROPOSED,
-                        payload={"run_id": run.run_id, "slug": run.slug, "goal": goal,
-                                 "validated": True,
-                                 "nodes": [n.get("id") for n in
-                                           (run.plan.manifest.get("nodes") if run.plan else [])]}))
+                        payload=_proposal_document(
+                            run_id=run.run_id, slug=run.slug, goal=goal,
+                            manifest=run.plan.manifest if run.plan else {},
+                            validation=run.plan.validation.as_dict() if run.plan else {},
+                            staffing_gaps=run.staffing_gaps,
+                            manifest_path=run.manifest_path, adopted=run.plan is None,
+                            approvable=approvable,
+                            reason="" if approvable else "the engine is already starting this plan")))
         detail = {"run_id": run.run_id, "slug": run.slug, "phase": run.phase.value}
 
         if payload.get("dry_run"):
             return detail
 
+        self._start_run(cmd_id, orch, run, detail)
+        return _ACK_DEFERRED
+
+    def _cmd_approve_plan(self, payload: dict[str, Any], *, cmd_id: str = "") -> Any:
+        """Approve the graph a run is parked on and execute it.
+
+        The route the console lacked. `approve` is `Orchestrator.decide`, which resolves a **gate**, and
+        `Orchestrator.prepare` never sets `run.gate` — so a plan parked by a dry run ("Plan only") had no
+        command that could approve it, and the app could show the graph but not act on it. This is
+        `start` minus the prepare step: the prepared run goes to the very same `_start_run`, so the graph
+        executes on the run's own thread, `status` and `pause`/`abort` stay answerable, and the ack is the
+        run's outcome sent when it settles — the convention `start` already follows.
+
+        The guards are `start`'s and `resume`'s, reused rather than restated: a second graph on one
+        workspace is the failure `_run_is_live` exists to prevent. `approve`'s own refusals (an invalid
+        graph, a missing manifest) are left to `Orchestrator.approve`, which the run thread calls — so
+        the reason on the wire is the engine's, not a second copy of it written here.
+        """
+        from .orchestrator import RunPhase
+
+        if self._run_is_live():
+            raise ServerError(
+                "a run is already in flight; pause or abort it before approving another")
+        if self.orchestrator is None:
+            # After a restart the prepared run is on disk and nothing is loaded yet, so build the
+            # orchestrator the same way `start` does; `_current_run` then reads the checkpoint.
+            self._orchestrator(self.slug)
+        orch, run = self._current_run()
+        if run is None:
+            raise ServerError(
+                "there is no prepared plan to approve; `start` with `dry_run` parks one")
+        if run.phase != RunPhase.AWAITING_APPROVAL:
+            raise ServerError(
+                f"the run is {run.phase.value}, not awaiting approval, so there is nothing to approve")
+        detail = {"run_id": run.run_id, "slug": run.slug, "phase": run.phase.value}
         self._start_run(cmd_id, orch, run, detail)
         return _ACK_DEFERRED
 
@@ -3163,6 +3289,36 @@ def _is_hired(spec: Any) -> bool:
     """
     return (str(getattr(spec, "origin", "")) == "owner"
             and str(getattr(spec, "id", "")) != "ag_owner")
+
+
+def _proposal_document(*, run_id: str, slug: str, goal: str, manifest: dict[str, Any],
+                       validation: dict[str, Any], staffing_gaps: Iterable[dict[str, Any]],
+                       manifest_path: Any, adopted: bool, approvable: bool,
+                       reason: str) -> dict[str, Any]:
+    """The proposed graph, in the one shape `manifest.proposed` and `status`'s `proposal` both carry.
+
+    **One document, two carriers.** The card is fed by an event (`manifest.proposed`, emitted by
+    `_cmd_start`) and by the poll (`status.proposal`, read from the checkpoint), and it must not be able
+    to read one shape from one and a different shape from the other. So both go through here: the event
+    passes the run it just prepared, the poll passes what the checkpoint holds. `nodes`, `gates` and
+    `loops` are reduced to what the card draws (ids, and each loop's bound), and `approvable`/`reason`
+    are the engine's verdict so the app never has to infer whether its Approve control would be refused.
+    """
+    return {
+        "run_id": run_id, "slug": slug, "goal": goal,
+        "validated": validation.get("valid"),
+        "adopted": adopted,
+        "nodes": [str(n.get("id")) for n in (manifest.get("nodes") or [])
+                  if isinstance(n, dict)],
+        "loops": [{"id": loop.get("id"), "max_iterations": loop.get("max_iterations")}
+                  for loop in (manifest.get("loops") or []) if isinstance(loop, dict)],
+        "gates": [str(g.get("id")) for g in (manifest.get("gates") or [])
+                  if isinstance(g, dict)],
+        "staffing_gaps": [dict(gap) for gap in staffing_gaps],
+        "manifest_path": str(manifest_path) if manifest_path else None,
+        "approvable": bool(approvable),
+        "reason": reason,
+    }
 
 
 def _now() -> str:

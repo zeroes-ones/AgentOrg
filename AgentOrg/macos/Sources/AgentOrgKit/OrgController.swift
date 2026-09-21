@@ -70,12 +70,24 @@ public final class OrgController: ObservableObject {
     /// one id because only the gate currently on screen matters — a set of every gate a long run ever
     /// answered would grow without bound to answer a question about one row.
     private var lastGoalDecidedGateId: String?
-    /// Why the console is (or is not) going to decide a gate, as the engine reported it. Shown beside
-    /// the gate so the person is told the reason rather than inferring it from a missing button.
+    /// Why the console is (or is not) going to decide a gate, as the engine reported it.
+    ///
+    /// Rendered beside the gate in the spine and in the menu-bar panel, in both cases whether or not
+    /// the decision buttons are shown: the engine's own refusal ("a safety control fired", "the gate's
+    /// evidence is not present") is what makes the decision answerable, and leaving it to be inferred
+    /// from the presence of a control is how a person ends up pressing Approve to find out.
     @Published public private(set) var gateNote: String?
     /// Node outcomes for the current run.
     @Published public private(set) var nodes: [[String: JSONValue]] = []
-    /// The proposed graph, when one is awaiting approval.
+    /// The graph the engine proposed, when one is awaiting approval.
+    ///
+    /// The payload is the engine's one plan document: the plan's step ids, its gates, its loops, the
+    /// staffing gaps that would stop it three nodes in, and the engine's own verdict on whether it can
+    /// be approved (`approvable`, and `reason` when not). Set by the `manifest.proposed` event, by the
+    /// poll's `proposal` key — so a console relaunched after a "Plan only" still has the plan, because
+    /// the event happened in the previous process — and cleared by `manifest.approved` or by a poll
+    /// that finds the run past `awaiting_approval`. The Now pane draws it, since a run parked at
+    /// `awaiting_approval` is asking a person to approve a graph and no view used to read this field.
     @Published public private(set) var proposedGraph: [String: JSONValue]?
     /// Model choices, from the live catalog.
     @Published public private(set) var models: [[String: JSONValue]] = []
@@ -344,8 +356,30 @@ public final class OrgController: ObservableObject {
     /// the content is being retained.
     @Published public private(set) var engineIsGone: Bool = true
 
-    /// When a notification was last sent, so the console can show that it did (or could not).
-    @Published public private(set) var lastNotification: String?
+    /// What became of the last banner attempt, so the console can show that it happened — or say why
+    /// nothing appeared on screen.
+    ///
+    /// **This is the fix for a silence with three possible causes.** `notify(plan:)` always recorded
+    /// *something*, and no view ever read it — so a person who got no banner had no way to learn
+    /// whether notifications were denied, impossible in this build, or simply not warranted, and the
+    /// "impossible" case was recorded as "denied in System Settings", which points at a pane where
+    /// this process does not appear. The value carries which of the four happened, the line to show,
+    /// and what to do about it.
+    @Published public private(set) var notificationOutcome: NotificationOutcome?
+
+    /// The last attempt as one line, for a caller that only wants the sentence.
+    ///
+    /// Derived rather than stored, so it cannot disagree with `notificationOutcome` — the same rule
+    /// the panes follow for every other engine-derived figure.
+    public var lastNotification: String? { notificationOutcome?.sentence }
+
+    /// Whether this process can post a banner **at all**, readable before anything is attempted.
+    ///
+    /// The availability must be visible *before* the first attempt and not only in its record: under
+    /// a bare `swift run` the app notifies nobody, and a person who never sees a banner should be
+    /// able to find that out by looking rather than by reading the absence as "nothing has needed me
+    /// yet".
+    public var notificationsAvailable: Bool { notifier.isAvailable }
 
     /// Where the launch has got to, while one is in flight.
     ///
@@ -1235,36 +1269,67 @@ public final class OrgController: ObservableObject {
     /// Deliver a plan, tolerating every way it can fail.
     ///
     /// The plan is decided by `NotificationPlanner` (a pure function, exhaustively testable); this
-    /// only performs it. Three things are deliberately swallowed: authorisation being refused, the
-    /// request failing, and the system not being there at all. A notification is a courtesy on top of
-    /// a working console, so *nothing* about it may break the console — the failure mode of a missing
-    /// banner is that the person looks at the window, while the failure mode of a throwing notifier is
-    /// that the event handler dies and the UI stops updating entirely.
+    /// only performs it. Four things are deliberately swallowed: authorisation being refused, the
+    /// request failing, the process having no notification centre at all, and — the case worth naming
+    /// — there being nothing to say. A notification is a courtesy on top of a working console, so
+    /// *nothing* about it may break the console: the failure mode of a missing banner is that the
+    /// person looks at the window, while the failure mode of a throwing notifier is that the event
+    /// handler dies and the UI stops updating entirely.
+    ///
+    /// Swallowed is not the same as hidden, though, and that is what changed here. Each attempt
+    /// records its outcome in `notificationOutcome`, so the console can *say* that a banner did not
+    /// go out and why — see `NotificationOutcome` for the four states and `performNotification` for
+    /// the order they are checked in.
     private func notify(plan: NotificationPlan) {
+        let attempt = nextNotificationAttempt
+        nextNotificationAttempt += 1
         let task = Task { [weak self] in
             guard let self else { return }
-            // Ask lazily, at the first moment a banner is actually wanted. Asking on launch would cost
-            // a modal to someone who opened the app to read a roster, and a denial is permanent.
-            var authorized = await self.notifier.isAuthorized
-            if !authorized {
-                authorized = await self.notifier.requestAuthorization()
-            }
-            guard authorized else {
-                await MainActor.run { [weak self] in
-                    self?.lastNotification = "notifications are off (denied in System Settings)"
-                    self?.notificationTasks.removeAll { $0.isCancelled }
-                }
-                return
-            }
-            let delivered = await self.notifier.deliver(plan)
+            await self.performNotification(plan)
+            // **The attempt leaves the list by itself, and that is the fix for its growth.** The list
+            // was appended to on every delivery and pruned only in the *denied* branch — and it pruned
+            // `isCancelled` tasks, which is none of them — so a long run's successful deliveries
+            // accumulated for the whole session. `Task` exposes no "is it finished", so an array
+            // cannot be swept of completed work; an entry that removes itself can, and it needs a name
+            // to remove itself by.
             await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.lastNotification = delivered
-                    ? "notified: \(plan.title)"
-                    : "a notification could not be delivered"
+                _ = self?.notificationTasks.removeValue(forKey: attempt)
             }
         }
-        notificationTasks.append(task)
+        notificationTasks[attempt] = task
+    }
+
+    /// One attempt, from the availability check to the recorded outcome.
+    ///
+    /// Four states, checked in the order they matter, and each is recorded distinctly because each
+    /// has a different answer for the person:
+    ///
+    /// 1. **This process cannot post at all** (`isAvailable`) — a `swift run` binary has no bundle to
+    ///    own a notification. Nothing the person changes will help, so reporting it as "denied" (which
+    ///    is what the console did, because it could only see two booleans) is a wrong instruction.
+    /// 2. **The app is not allowed** (`isAuthorized`, asked for lazily at the first moment a banner
+    ///    is actually wanted — a denial is permanent, so the prompt has to arrive with its own reason).
+    /// 3. **The system refused the request** (`deliver`).
+    /// 4. Otherwise it went out.
+    ///
+    /// Nothing here can throw: a notification is a courtesy on top of a working console, and the
+    /// failure mode of a missing banner is that a person looks at the window, while the failure mode
+    /// of a throwing notifier is that the event handler dies and the UI stops updating.
+    private func performNotification(_ plan: NotificationPlan) async {
+        guard notifier.isAvailable else {
+            await MainActor.run { [weak self] in self?.notificationOutcome = .unavailable() }
+            return
+        }
+        var authorized = await notifier.isAuthorized
+        if !authorized { authorized = await notifier.requestAuthorization() }
+        guard authorized else {
+            await MainActor.run { [weak self] in self?.notificationOutcome = .denied(plan.title) }
+            return
+        }
+        let delivered = await notifier.deliver(plan)
+        await MainActor.run { [weak self] in
+            self?.notificationOutcome = delivered ? .delivered(plan.title) : .failed(plan.title)
+        }
     }
 
     /// Wait for every in-flight notification attempt to finish.
@@ -1272,11 +1337,14 @@ public final class OrgController: ObservableObject {
     /// Production never needs this — the attempts are intentionally detached. A test does, because the
     /// interesting outcome (denied, delivered, or silently impossible) is the *result* of an async
     /// attempt, and polling for it would be a race dressed as an assertion.
+    ///
+    /// Terminates because each attempt removes its own entry as its last act: awaiting an entry's
+    /// value returns only once the task has finished, and the removal is inside the task, so the list
+    /// cannot stay non-empty for an attempt that is done. An attempt made *while* this waits is picked
+    /// up by the next pass, which is what it should do.
     public func awaitNotifications() async {
         while !notificationTasks.isEmpty {
-            let tasks = notificationTasks
-            notificationTasks = []
-            for task in tasks { await task.value }
+            for task in Array(notificationTasks.values) { await task.value }
         }
     }
 
@@ -1302,7 +1370,21 @@ public final class OrgController: ObservableObject {
     /// handler — so "did it try, and what happened" is otherwise unobservable without a sleep.
     public var isDeliveringNotification: Bool { !notificationTasks.isEmpty }
 
-    private var notificationTasks: [Task<Void, Never>] = []
+    /// How many attempts are in flight, so a test can assert the list is *bounded* rather than only
+    /// that it is non-empty. The growth this replaced was invisible to `isDeliveringNotification`,
+    /// which reads the same either way once an attempt has finished.
+    var inFlightNotificationCount: Int { notificationTasks.count }
+
+    /// The attempts in flight, keyed by a name each attempt removes itself by.
+    ///
+    /// A dictionary rather than an array because a *finished* `Task` cannot be told from a running
+    /// one: `Task` exposes `isCancelled` and nothing that answers "is it done", so an array can only
+    /// ever be pruned of work somebody cancelled — and nothing cancels a notification. Each attempt is
+    /// therefore named, and takes its own entry out when it finishes.
+    private var notificationTasks: [Int: Task<Void, Never>] = [:]
+    /// The name the next attempt takes. A counter rather than anything derived, so two attempts cannot
+    /// collide even when the first is still in flight when the second is made.
+    private var nextNotificationAttempt = 0
 
     // MARK: - Commands
 
@@ -1378,6 +1460,22 @@ public final class OrgController: ObservableObject {
         }
         await refresh()
         return ok
+    }
+
+    /// Approve the graph the engine proposed and execute it — the plan card's own control.
+    ///
+    /// **Separate from `approve` on purpose.** That one answers a *gate* (`serve._cmd_approve` →
+    /// `Orchestrator.decide`), and a prepared plan has no gate — `Orchestrator.prepare` never sets
+    /// `run.gate`, so the engine refuses it with "there is no gate to decide". `approve_plan` is the
+    /// command that approves a *graph* and runs it, on the run's own thread: the route `start` takes,
+    /// minus the planning. The card offers it only when the engine's payload says the plan is
+    /// approvable (`proposal["approvable"]`), so it is never a control the engine would refuse.
+    ///
+    /// The acknowledgement arrives when the graph **settles** — the engine's convention for a command
+    /// that starts a run — inside the caller's `Task`, so nothing in the console is blocked by it.
+    public func approvePlan() async {
+        await send("approve_plan")
+        await refresh()
     }
 
     @discardableResult
@@ -2817,6 +2915,23 @@ public final class OrgController: ObservableObject {
             assignIfChanged(\.pendingGate, nil)
             assignIfChanged(\.gateNote, nil)
         }
+        // **The proposed graph is carried by the poll as well as by the event.** `manifest.proposed`
+        // announces a plan; the engine also carries the plan a person can still approve under
+        // `proposal`, read from the run's checkpoint, so a console relaunched after a "Plan only" still
+        // has the plan to draw — the event that announced it happened in the previous process. The
+        // event's shape and the poll's are the engine's one document (`serve._proposal_document`), so
+        // reading either into the same field cannot make them disagree.
+        //
+        // The poll is also the fallback for a missed *clear*: an approval that landed while this console
+        // was not listening (a restart with a run in flight, a frame dropped) would leave the plan on
+        // screen for the rest of the session, describing a decision already taken. The run's own phase
+        // is the fact that settles it, and it is read rather than inferred. Guarded on the key being
+        // present, so a payload from a build that does not carry it clears nothing.
+        if let proposal = payload["proposal"]?.objectValue {
+            assignIfChanged(\.proposedGraph, proposal)
+        } else if let phase = payload["phase"]?.stringValue, phase != "awaiting_approval" {
+            assignIfChanged(\.proposedGraph, nil)
+        }
         let nodeRows = (payload["outcome"]?.objectValue?["nodes"]?.objectValue ?? [:])
             .map { key, value -> [String: JSONValue] in
                 var entry = value.objectValue ?? [:]
@@ -3238,7 +3353,22 @@ public final class OrgController: ObservableObject {
         case "leak.detected":
             notice = "a key-shaped string was found in the run state"
         case "run.end":
-            notice = "run finished: \(event.payload["outcome"]?.stringValue ?? "unknown")"
+            // **The engine's own fields, read the way the notification planner reads them.** `outcome`
+            // is the runner's summary word and is absent for a run that broke or was killed, so the
+            // one line this used to write — "run finished: unknown" — was what a person saw for
+            // exactly the runs they most need to know about. `state` is the field that says how it
+            // ended (`finished` / `failed` / `gated`).
+            let state = event.payload["state"]?.stringValue ?? ""
+            let summary = event.payload["outcome"]?.stringValue ?? ""
+            if event.payload["gated"]?.boolValue == true || state == "gated" {
+                notice = "the run stopped at a gate and is waiting for a decision"
+            } else if state == "failed" || event.payload["broken"]?.boolValue == true {
+                let reason = event.payload["error"]?.stringValue ?? ""
+                notice = reason.isEmpty ? "the run failed" : "the run failed: \(reason)"
+            } else {
+                notice = "run finished: "
+                    + (summary.isEmpty ? (state.isEmpty ? "unknown" : state) : summary)
+            }
             // The stream is over, so the durable state is now the better picture — and it is the one
             // that will still be there if the engine never comes back.
             Task { await refreshOfflineState() }

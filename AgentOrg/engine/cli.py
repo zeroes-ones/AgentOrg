@@ -1237,12 +1237,68 @@ class _NullStream:
         return None
 
 
+def _approve_prepared_plan(args: argparse.Namespace) -> int:
+    """Approve the plan already prepared on disk and execute it — the CLI's half of `approve_plan`.
+
+    The **same engine calls the console's command makes** (`Orchestrator.approve` then
+    `Orchestrator.execute`), applied to the run a previous `run --dry-run` parked rather than to a graph
+    planned in this process. That run's checkpoint is the plan: `orch.load(slug)` reads it, so the
+    terminal continues the *same* run instead of re-adopting the manifest through `run --manifest`,
+    which would start a second run and leave the parked one's checkpoint behind. A plan prepared by the
+    console is the same file in the same place, so either surface finishes it.
+    """
+    slug = _slug_for(args)
+    orch, _ = _orchestrator(args, slug)
+    run = orch.load(slug)
+    if run is None:
+        _warn(f"no prepared plan for {slug!r}; `engine.cli run --goal '…' --dry-run` parks one")
+        return EXIT_CHECK_FAILED
+    if run.phase != RunPhase.AWAITING_APPROVAL:
+        _warn(f"the run is {run.phase.value}, not awaiting approval, so there is nothing to approve")
+        return EXIT_CHECK_FAILED
+    try:
+        orch.approve(run)
+    except OrchestratorError as exc:
+        _warn(f"cannot approve this plan: {exc}")
+        return EXIT_CHECK_FAILED
+    if not args.json:
+        print(f"Approved {run.run_id}. Executing...")
+    outcome = orch.execute(run, executor=args.executor)
+    if args.json:
+        print(json.dumps({"run": run.as_dict(), "outcome": outcome.as_dict()},
+                         indent=2, sort_keys=True, default=str))
+    else:
+        summary = outcome.summary or {}
+        print(f"  outcome   : {summary.get('outcome') or outcome.state.value}")
+        print(f"  phase     : {run.phase.value}")
+        if run.stop_reason:
+            # The single most important line: *why* the run is not done.
+            print(f"  stopped   : {run.stop_reason}")
+        if run.gate:
+            print()
+            print(f"  GATE: {run.gate.gate_id} — {run.gate.reason[:70]}")
+            print(f"    decide with: engine.cli decide --slug {slug} --approve")
+    return EXIT_OK
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Run a goal or an existing manifest, and report where it ended up.
 
     With `--goal` the graph is planned and shown before execution; with `--manifest` an existing graph
-    is adopted. Either way the run stops at a gate rather than proceeding past one.
+    is adopted; with `--approve-plan` the graph a previous `run --dry-run` left parked is approved and
+    executed. Either way the run stops at a gate rather than proceeding past one.
     """
+    # The terminal's half of the console's `approve_plan`: a plan parked on disk is a decision waiting
+    # for a person, and every CLI command is a new process — so the run that composed it is gone and
+    # this one must load it rather than plan it again. `--goal`/`--manifest` name a graph to build,
+    # which is the opposite of "act on the one already parked", so the two together is a usage error
+    # rather than one silently winning.
+    if getattr(args, "approve_plan", False):
+        if args.goal or args.manifest:
+            _warn("--approve-plan acts on the plan already prepared on disk; drop --goal/--manifest")
+            return EXIT_USAGE
+        return _approve_prepared_plan(args)
+
     slug = args.slug or (Path(args.manifest).stem if args.manifest else _slug_from_goal(args.goal))
     orch, workspace = _orchestrator(args, slug)
 
@@ -4263,6 +4319,9 @@ def build_parser() -> argparse.ArgumentParser:
                          help="plan and execute a goal, or execute an existing manifest")
     run.add_argument("--goal", help="what you want built (plans the graph)")
     run.add_argument("--manifest", help="an existing manifest to adopt and run")
+    run.add_argument("--approve-plan", action="store_true", dest="approve_plan",
+                     help="approve the plan `run --dry-run` left parked and execute it; "
+                          "name it with --slug")
     run.add_argument("--slug", help="project name (default: derived from the goal or filename)")
     run.add_argument("--root", help="projects root (default: AgentOrg/projects)")
     run.add_argument("--max-iterations", type=int, default=3, dest="max_iterations",
