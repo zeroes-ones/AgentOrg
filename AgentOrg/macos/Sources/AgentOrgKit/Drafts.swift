@@ -174,22 +174,22 @@ public struct AgentDraft: Sendable, Equatable {
 /// Kept in the Kit rather than in a view so the vocabulary has one definition: the toggle, the help
 /// text, and any test all read from here.
 ///
-/// **The machine half is derived; the project half is written out, and the difference is deliberate.**
-/// The six `system:` grants this used to list by hand were half the twelve the engine declares —
-/// `system:notify`, `:search`, `:power`, `:network`, `:shortcuts` and `:softwareupdate` could not be
-/// granted from the app at all, and nothing caught it, because a hand-written list is the only thing
-/// that can decide which grants it omits. So the system group now comes from `SystemTools.grants` —
-/// the grants the tool catalogue backs, which is exactly the twelve `SystemConfig.CAPABILITIES`
-/// declares — and the wording below is a lookup *keyed by* those grants rather than the source of
-/// them. A grant with no wording still appears, with a placeholder, which is louder than the silence
-/// a missing list entry produced. The project grants stay written out: `read:`/`write:`/`exec:` are
-/// the sandbox's vocabulary, there is no catalogue to derive them from, and there are four of them.
+/// **The machine half is derived from the engine's reply; the project half is written out, and the
+/// difference is deliberate.** The six `system:` grants this used to list by hand were half the twelve
+/// the engine declares — `system:notify`, `:search`, `:power`, `:network`, `:shortcuts` and
+/// `:softwareupdate` could not be granted from the app at all, and nothing caught it, because a
+/// hand-written list is the only thing that can decide which grants it omits. The system group now
+/// takes the grants the *caller* read from the `system` reply (`OrgController.systemCapabilities`,
+/// which decodes `syscap.console_payload`'s `capabilities`), and the wording below is a lookup *keyed
+/// by* those grants rather than the source of them. A grant with no wording still appears, with a
+/// placeholder, which is louder than the silence a missing list entry produced. The project grants stay
+/// written out: `read:`/`write:`/`exec:` are the sandbox's vocabulary, declared in no engine module,
+/// and there are four of them.
 ///
-/// The residual gap, stated rather than left to be discovered: the derivation source is the *tool*
-/// catalogue, so a grant added to `SystemConfig.CAPABILITIES` with **no tool yet** would still be
-/// absent from this form. Closing it needs the form to take the engine's live list —
-/// `CapabilityChoice.groups(syscap:)` plus a one-line change where the hire form renders it — which is
-/// a change in a file this one does not own. Today all twelve have tools, so the two lists are equal.
+/// Taking the list as an argument is what closes the gap the previous version left open: it derived
+/// them from the tool *catalogue*, so a grant added to `SystemConfig.CAPABILITIES` with no tool yet
+/// would have been absent from this form. The declared list is the one that grows first, and it is now
+/// the one this reads.
 ///
 /// Grouped by *what it reaches*, because that is what a person is deciding. File grants stay inside the
 /// project; system grants act on the machine, and the ones that change state (`open`, `automation`,
@@ -257,9 +257,12 @@ public enum CapabilityChoice {
                                   "listing is safe; installing can reboot the Mac"),
     ]
 
-    /// The machine grants, in the catalogue's order, one choice each.
-    public static var systemChoices: [Choice] {
-        SystemTools.grants.map { grant in
+    /// The machine grants, in the engine's order, one choice each.
+    ///
+    /// `systemGrants` is the caller's decode of the engine's reply (`OrgController.systemCapabilities`
+    /// and its `grant`s), not a list read here — see the note on this type.
+    public static func systemChoices(_ systemGrants: [String]) -> [Choice] {
+        systemGrants.map { grant in
             let wording = systemWording[grant]
             return Choice(grant: grant,
                           label: wording?.label ?? placeholderLabel(grant),
@@ -276,10 +279,14 @@ public enum CapabilityChoice {
         return scope.replacingOccurrences(of: "_", with: " ").capitalized
     }
 
-    public static var groups: [Group] {
+    /// Both groups, with the machine half built from the grants the engine declared.
+    ///
+    /// Empty `systemGrants` is the honest rendering of "the engine has not answered" — an empty
+    /// "On this Mac" group rather than a list the app supplied from memory.
+    public static func groups(systemGrants: [String]) -> [Group] {
         [
             Group(title: "In the project", isSystem: false, choices: projectChoices),
-            Group(title: "On this Mac", isSystem: true, choices: systemChoices),
+            Group(title: "On this Mac", isSystem: true, choices: systemChoices(systemGrants)),
         ]
     }
 }

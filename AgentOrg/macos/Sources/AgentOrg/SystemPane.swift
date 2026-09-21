@@ -37,7 +37,7 @@
 //  ----------------------------------------------------------
 //  It counted "granted" and left the person asking what 6 of 12 wanted them to do. Three readings of
 //  one machine were behind that word — the engine's own `summary` (computed for no holder, so it reads
-//  "0 of 12 granted": `syscap.py:281`), the served roster's six, and the CLI's twelve for the Owner —
+//  "0 of 12 granted": `syscap.py:324`), the served roster's six, and the CLI's twelve for the Owner —
 //  and the pane printed the first as a headline above the second as a figure. So the figure now says
 //  *held by an agent*, the headline is derived from the switches, the sentence beneath states the rule
 //  that makes the number matter (a capability nobody holds is one no run can use), and the figure is
@@ -182,7 +182,7 @@ struct SystemPane: View {
     ///
     /// **The headline used to be the engine's `summary` field, and that field is about nobody.**
     /// `syscap.console_payload` assembles the capability *set* and calls `summary([])`
-    /// (`engine/syscap.py:281`), so the sentence it hands a console reads "0 of 12 system capabilities
+    /// (`engine/syscap.py:324`), so the sentence it hands a console reads "0 of 12 system capabilities
     /// granted" — measured on this machine, where the served roster holds six of the twelve and the
     /// CLI's own holder holds all twelve. A headline saying 0 above a figure saying 6, with the terminal
     /// saying 12, is the report this rewrite answers: three numbers, one word, no subject. So the
@@ -486,7 +486,9 @@ struct CapabilityRow: View {
 
     /// The tools under this grant the engine will refuse until the Owner approves one, for one agent.
     /// Named rather than counted, so the row says *what* would ask rather than that something would.
-    private var consentTools: [SystemTool] { SystemTools.forGrant(capability.grant).filter(\.consentRequired) }
+    private var consentTools: [SystemTool] {
+        controller.systemToolCatalog.forGrant(capability.grant).filter(\.consentRequired)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -501,7 +503,7 @@ struct CapabilityRow: View {
             // what the grant reaches and what it changes; this is the sentence a person cannot get from
             // prose — what it actually returns — and the engine's refusal, when it is one, is the
             // useful part.
-            if let tool = SystemTools.tryable(capability.grant), capability.available {
+            if let tool = controller.systemToolCatalog.tryable(capability.grant), capability.available {
                 TryItRow(controller: controller, tool: tool)
             }
         }
@@ -610,10 +612,10 @@ struct ScopesSection: View {
     /// Which grant each list narrows.
     ///
     /// Three entries, and they are the engine's own pairing rather than the panel's opinion: the
-    /// handlers name the list they read (`SystemTools.allowed_apps` reads `allow_apps` for `open_app`,
-    /// `automation_prefixes` reads `allow_automation`, `allowed_shortcuts` reads `allow_shortcuts`).
-    /// Having the grant lets the editor show the engine's sentence for it beside the list instead of a
-    /// sentence written here.
+    /// handlers name the list they read (`SystemTools.allowed_apps` in `engine/sysctl_tools.py` reads
+    /// `allow_apps` for `open_app`, `automation_prefixes` reads `allow_automation`,
+    /// `allowed_shortcuts` reads `allow_shortcuts`). Having the grant lets the editor show the engine's
+    /// sentence for it beside the list instead of a sentence written here.
     static func grant(forAllowlist key: String) -> String {
         switch key {
         case "allow_apps": return "system:open"
@@ -938,8 +940,9 @@ struct TryItRow: View {
 ///
 /// This is the mechanism the panel used to *mention* — the words consent, ledger and approval appeared
 /// once, in a closing paragraph, with no data behind them and no way to give one. The set is
-/// `sysctl_tools.CONSENT_REQUIRED`, read from the same mirror the Try-it buttons use, so a tool that
-/// starts asking for an approval appears here without a second list being maintained.
+/// `sysctl_tools.CONSENT_REQUIRED`, carried in the engine's own `system` reply (`syscap.tools_payload`)
+/// and read from there, so a tool that starts asking for an approval appears here with no second list
+/// to maintain — the app has no tool names of its own to go stale.
 struct ConsentSection: View {
     @ObservedObject var controller: OrgController
 
@@ -962,7 +965,7 @@ struct ConsentSection: View {
                  + "`engine.cli system consent list` prints the ledger.")
                 .font(.caption2).foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
-            ForEach(SystemTools.consentRequired) { tool in
+            ForEach(controller.systemToolCatalog.consentRequired) { tool in
                 ConsentRow(controller: controller, tool: tool)
             }
         }
@@ -1227,7 +1230,7 @@ struct NextStepCard: View {
             }
         }
         if controller.systemGrantedCount == 0 { return .grantSomeone }
-        if SystemTools.all.contains(where: { $0.isSafeToTry }) { return .tryARead }
+        if controller.systemToolCatalog.all.contains(where: { $0.isSafeToTry }) { return .tryARead }
         return .review
     }
 }

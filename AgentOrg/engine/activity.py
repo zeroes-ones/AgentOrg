@@ -55,7 +55,7 @@ from typing import Any, Iterable
 # where the board's `blocked_by` is built from the same entries. Importing it is deliberate: the board
 # and this timeline describe one run, and a second reading of the same log actions would be a second
 # answer to "why did it stop". `flow` imports nothing from this module, so this is a leaf.
-from .flow import clip, is_stuck, recovery_command, stop_report, why_stopped
+from .flow import clip, is_stuck, recovery_command, stop_report, stop_words, why_stopped
 
 __all__ = ["ActivityEntry", "build_activity", "ACTIVITY_VERSION"]
 
@@ -416,6 +416,46 @@ def _headline(run: dict[str, Any], goal: dict[str, Any], nodes: dict[str, Any],
     return f"Nothing is running in {workspace_name}. Set a goal to start."
 
 
+#: What *performing* a next action asks of the surface that shows it, keyed by the kind — or absent,
+#: which means no surface performs it and the action's `command` is how a person takes it.
+#:
+#: The engine names the action; whether a console may carry it out itself is the surface's problem, and
+#: the one thing that must not happen is the surface answering that by listing the kinds: it did exactly
+#: that (`macos/Sources/AgentOrgKit/Spine.swift`, `NextLine.canPerform`), and a Swift list of engine
+#: kinds goes stale silently every time a kind is added — the day `retry` appeared the app had no
+#: opinion about it until someone widened the switch. So the answers live here, beside the kinds they
+#: describe, and travel with the action.
+#:
+#: `""` means nothing beyond the engine's own report: the surface has a real destination for it (a hire
+#: form, the goal's own resume, the composer's start, the runs list) and can offer to do it. `"gate"`
+#: means the offer is the person's only while the gate is still theirs to answer — the one condition a
+#: surface holds and this function cannot see, because the checkpoint says a gate is waiting but not
+#: whether the engine has since answered it itself or the goal's posture lets it. A kind absent from the
+#: table is one no surface performs, which is the safe reading of a kind this build has not seen.
+_NEXT_PERFORMABLE: dict[str, str] = {
+    "decide": "gate",
+    "hire": "",
+    "investigate": "",
+    "resume": "",
+    "start": "",
+}
+
+
+def _action(kind: str, label: str, detail: str, command: str) -> dict[str, Any]:
+    """One next action, with the surface question answered rather than left to be re-derived.
+
+    `performable` is the answer where it is unconditional; `needs` names what is still required when it
+    is not. Both are always present, so a surface reads two fields instead of enumerating the kinds —
+    and a kind added here tomorrow is handled by whatever surface reads it, without a second edit.
+    """
+    needs = _NEXT_PERFORMABLE.get(kind)
+    return {
+        "kind": kind, "label": label, "detail": detail, "command": command,
+        "performable": needs == "",
+        "needs": needs or "",
+    }
+
+
 def _next_action(run: dict[str, Any], goal: dict[str, Any],
                  staffing: list[dict[str, Any]], stuck: dict[str, str] | None = None,
                  state_dir: Path | None = None) -> dict[str, Any]:
@@ -432,34 +472,30 @@ def _next_action(run: dict[str, Any], goal: dict[str, Any],
     """
     gate = run.get("gate") if isinstance(run.get("gate"), dict) else None
     if gate is not None:
-        return {"kind": "decide", "label": f"Decide gate {gate.get('gate_id')!r}",
-                "detail": clip(str(gate.get("reason") or ""), 200),
-                "command": f"engine.cli decide --slug {run.get('slug', '')} --approve --note \"...\""}
+        return _action("decide", f"Decide gate {gate.get('gate_id')!r}",
+                       clip(str(gate.get("reason") or ""), 200),
+                       f"engine.cli decide --slug {run.get('slug', '')} --approve --note \"...\"")
     if staffing:
-        return {"kind": "hire", "label": f"Hire for {len(staffing)} unstaffed capabilit(ies)",
-                "detail": "; ".join(str(g.get("skill")) for g in staffing[:6]),
-                "command": str((staffing[0] or {}).get("hire") or "")}
+        return _action("hire", f"Hire for {len(staffing)} unstaffed capabilit(ies)",
+                       "; ".join(str(g.get("skill")) for g in staffing[:6]),
+                       str((staffing[0] or {}).get("hire") or ""))
     stop = str(run.get("stop_reason") or "")
     if stop:
-        return {"kind": "investigate", "label": "Investigate why the run stopped",
-                "detail": clip(stop, 200),
-                "command": f"engine.cli status --slug {run.get('slug', '')}"}
+        return _action("investigate", "Investigate why the run stopped", clip(stop, 200),
+                       f"engine.cli status --slug {run.get('slug', '')}")
     if stuck:
         node = next(iter(stuck))
         recovery = recovery_command(str(run.get("slug") or ""), run, state_dir, node=node)
         if recovery["command"]:
-            return {"kind": "retry",
-                    "label": f"Re-run the graph so {node} gets another attempt",
-                    "detail": stuck[node] or recovery["why"], "command": recovery["command"]}
+            return _action("retry", f"Re-run the graph so {node} gets another attempt",
+                           stuck[node] or recovery["why"], recovery["command"])
     if goal.get("objective") and not goal.get("live") and goal.get("open"):
-        return {"kind": "resume", "label": "Resume the goal to continue",
-                "detail": str(goal.get("pause_reason") or "paused"),
-                "command": "engine.cli goal resume"}
+        return _action("resume", "Resume the goal to continue",
+                       str(goal.get("pause_reason") or "paused"), "engine.cli goal resume")
     if goal.get("objective") and not run.get("run_id"):
-        return {"kind": "start", "label": "Start a run for this goal",
-                "detail": clip(str(goal.get("objective")), 200),
-                "command": "engine.cli run --goal \"...\""}
-    return {"kind": "none", "label": "Nothing needs you", "detail": "", "command": ""}
+        return _action("start", "Start a run for this goal",
+                       clip(str(goal.get("objective")), 200), "engine.cli run --goal \"...\"")
+    return _action("none", "Nothing needs you", "", "")
 
 
 # ── the report ───────────────────────────────────────────────────────────────
@@ -658,6 +694,11 @@ def build_activity(workspace: Any, *, run_status: dict[str, Any] | None = None,
         },
         "going": going,
         "next_action": next_action,
+        # The wording for every stop token this build knows. `stop_reason` above is sometimes a bare
+        # verdict token rather than a sentence (`orchestrator._derive_stop_reason` glosses most, not
+        # all), and this is what lets the surface that renders it say what *this* engine means by the
+        # token instead of keeping its own copy of the sentence — see `flow.stop_words`.
+        "stop_words": stop_words(),
         "counts": counts,
         "staffing_gaps": [dict(g) for g in staffing],
         "nodes": [

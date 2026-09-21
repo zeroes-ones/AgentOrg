@@ -53,7 +53,7 @@ public struct RunSummary: Identifiable, Sendable, Equatable {
     /// Whether any node ended stopped short, which is the one thing a person scanning the list needs.
     ///
     /// The predicate is the engine's own, mirrored in `BoardStop` so it has one home in this app: a
-    /// node that has not finished whose status *or* verdict names a stop (`engine/flow.py:258`,
+    /// node that has not finished whose status *or* verdict names a stop (`engine/flow.py:278`,
     /// `is_stuck`, and the sets at `:130-131`). It was `status == "blocked" || verdict ==
     /// "guardrail-blocked"`, which missed the stops that are not called "blocked" — a node stopped by
     /// its completion contract (`needs_review`) or parked at a human gate (`awaiting_owner`) — so this
@@ -63,7 +63,7 @@ public struct RunSummary: Identifiable, Sendable, Equatable {
     /// The verdict clause is kept as the engine keeps it, and so is the guard in front of it: a
     /// *finished* node is never stopped whatever verdict it still carries, because a released gate
     /// keeps its `awaiting_owner` verdict after its status becomes `done` (see `Orchestrator
-    /// ._detect_gate`, and `engine/flow.py:258`'s own note about it).
+    /// ._detect_gate`, and `engine/flow.py:278`'s own note about it).
     public var blockedCount: Int {
         nodes.filter { BoardStop.isStuck(status: $0.status, verdict: $0.verdict) }.count
     }

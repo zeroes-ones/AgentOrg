@@ -383,3 +383,111 @@ def test_an_adopted_runs_node_list_does_not_break_the_board(workspace):
     board = build_flow(workspace)
     assert [row["node_id"] for row in board["rows"]] == ["pm", "dev"]
     assert board["counts"]["waiting"] == 2
+
+
+# ── whether a surface can perform the next action ────────────────────────────
+
+
+def test_the_next_action_says_whether_a_surface_can_perform_it(workspace):
+    """The app used to answer this itself, from a Swift list of the engine's kinds.
+
+    `SpineModel.NextLine.canPerform` switched over `_next_action`'s kinds — `decide`, `hire`,
+    `investigate`, `retry`, `resume`, `start`, `none` — so every kind the engine gained was a kind the
+    app silently had no opinion about until someone widened the switch. `retry` was the one that proved
+    it. The engine now answers with the action: `performable`, and `needs` for the one condition it
+    cannot see for itself.
+
+    Driven through the states rather than asserted as a table, because the *states* are what the engine
+    resolves — a gate, a staffing gap, a stop, a paused goal, an idle one — and a table written here
+    would be the second list this change removes.
+    """
+    from engine.activity import _next_action
+
+    def action(run=None, goal=None, staffing=None, stuck=None):
+        return _next_action(run or {}, goal or {}, staffing or [], stuck=stuck)
+
+    cases = [
+        ({"gate": {"gate_id": "release", "reason": "Owner release approval"}, "slug": "s"},
+         {}, [], "decide", False, "gate"),
+        ({}, {}, [{"skill": "ceo-strategist", "hire": "engine.cli hire <name> --skill x"}],
+         "hire", True, ""),
+        ({"stop_reason": "pm: refused at the edge", "slug": "s"}, {}, [],
+         "investigate", True, ""),
+        ({}, {"objective": "keep going", "live": False, "open": True}, [], "resume", True, ""),
+        ({}, {"objective": "keep going"}, [], "start", True, ""),
+        ({}, {}, [], "none", False, ""),
+    ]
+    for run, goal, staffing, kind, performable, needs in cases:
+        result = action(run, goal, staffing)
+        assert result["kind"] == kind, result
+        assert result["performable"] is performable, (
+            f"{kind}: the engine said performable={result['performable']}")
+        assert result["needs"] == needs, f"{kind}: the engine said needs={result['needs']!r}"
+
+    # `retry` needs a recovery command that actually applies, so it is driven through the report the
+    # board and the app both read.
+    _guardrail_workspace(workspace)
+    retry = build_activity(workspace)["next_action"]
+    assert retry["kind"] == "retry"
+    assert retry["performable"] is False, "no `serve` command re-runs a graph"
+    assert retry["needs"] == "", "and nothing would make it performable later"
+
+
+def test_a_kind_the_engine_has_no_answer_for_is_not_performable():
+    """The safe reading of a kind this build has not seen: show the command, offer no button.
+
+    Derived from the engine's own table rather than restating it: what is asserted is the *relationship*
+    (`needs` empty means performable, anything else does not) and that a kind outside the table is
+    carried with an honest "no". A future kind that a surface *can* do is then a one-line engine change
+    plus nothing at all in Swift — which is the point of sending this at all.
+    """
+    from engine.activity import _NEXT_PERFORMABLE, _action
+
+    assert _NEXT_PERFORMABLE, "the engine must answer for the kinds it knows"
+    for kind, needs in _NEXT_PERFORMABLE.items():
+        result = _action(kind, "a label", "a detail", "a command")
+        assert result["kind"] == kind
+        assert result["needs"] == needs
+        assert result["performable"] is (needs == ""), kind
+
+    unknown = _action("a-kind-from-a-later-engine", "a label", "a detail", "engine.cli whatever")
+    assert unknown["performable"] is False
+    assert unknown["needs"] == ""
+    assert unknown["kind"] == "a-kind-from-a-later-engine", "the kind itself is never dropped"
+    assert unknown["command"] == "engine.cli whatever", "so the fallback line still says what to run"
+
+
+# ── the stop vocabulary travels ──────────────────────────────────────────────
+
+
+def test_both_reports_carry_the_engines_own_wording_for_a_stop(workspace):
+    """One token, one sentence — and it is the engine's, sent, rather than rewritten in Swift.
+
+    The app glossed `guardrail-blocked` and `contract-violation` with its own copy of the engine's
+    sentences, worded identically *on purpose* so one token would not be described two ways on one
+    screen. Two homes kept in step by hand is one home too many: the copy is the one that goes stale,
+    and nothing would have caught it. So the table travels in the reports that render tokens — the
+    board's rows carry a bare `verdict`, and the Now pane shows the run's `stop_reason` — and the app
+    decodes it (`StopWords`).
+
+    Compare against `_STOP_WORDS` itself, so this cannot become a second copy of the wording.
+    """
+    from engine.flow import _STOP_WORDS, stop_words
+
+    vocabulary = stop_words()
+    assert vocabulary == _STOP_WORDS, "the accessor answers with the engine's table"
+    assert vocabulary is not _STOP_WORDS, "a copy, so a caller cannot edit the vocabulary for everyone"
+    vocabulary["a-token-from-a-test"] = "edited"
+    assert "a-token-from-a-test" not in _STOP_WORDS
+
+    _guardrail_workspace(workspace)
+    board = build_flow(workspace)
+    activity = build_activity(workspace)
+    assert board["stop_words"] == _STOP_WORDS
+    assert activity["stop_words"] == _STOP_WORDS
+    # The token a row carries is one the vocabulary answers for, which is what the app glosses from.
+    row = next(r for r in board["rows"] if r["node_id"] == "pm")
+    assert _STOP_WORDS[row["verdict"]] == _GLOSS
+    # And a token the engine does not know is absent rather than invented — the app keeps the token.
+    assert "awaiting_owner" not in board["stop_words"], (
+        "the engine has no sentence for it; the app's own gloss for that state is the app's")

@@ -4,26 +4,24 @@
 //
 //  What the agents may do on this machine, in the engine's own words.
 //
-//  WHY NOTHING HERE IS A LIST OF CAPABILITIES
-//  ------------------------------------------
-//  The engine already answers this question twice over: `engine.config.SystemConfig.CAPABILITIES`
-//  declares which grants exist, `engine.sysctl_tools.CATALOGUE` declares which of them have a tool
-//  behind them, and `engine.syscap.describe()` writes the prose a person reads. `serve._cmd_system`
-//  returns all three, and its own docstring says why: "the prose living in Swift as well — drifts the
-//  first time a capability changes, and the failure mode is a console confidently describing a grant
-//  it does not enforce".
+//  WHY NOTHING HERE IS A LIST OF CAPABILITIES, TOOLS OR SENTENCES
+//  --------------------------------------------------------------
+//  The engine answers this question three times over: `engine.config.SystemConfig.CAPABILITIES`
+//  declares which grants exist, `engine.sysctl_tools.CATALOGUE` and `CONSENT_REQUIRED` say which tools
+//  sit behind them and which ask the Owner first, and `engine.syscap.describe()` writes the prose a
+//  person reads. `syscap.console_payload` — which `serve._cmd_system` returns — sends all of it,
+//  including the tool table; a payload that did not carry one is why a hand-written mirror of the
+//  catalogue lived at the bottom of this file, and it is gone now that it does.
 //
-//  So this file contains **no grant names, no descriptions and no ordering of its own**. It decodes
-//  what the engine sent. The one thing it does add is the question the engine cannot answer for a
-//  single panel — *which agent holds this* — and it derives that from the roster with the same rule
-//  the tool registry enforces (`system:*` or an exact match), so the panel cannot show a grant as
-//  held while `ToolRegistry.call` would refuse it.
+//  So this file contains **no grant names, no tool names, no descriptions and no ordering of its own**.
+//  It decodes what the engine sent, and its own docstring says why: "the prose living in Swift as well —
+//  drifts the first time a capability changes, and the failure mode is a console confidently describing
+//  a grant it does not enforce".
 //
-//  **One exception, at the bottom of the file, and it is an exception because the reply is
-//  incomplete.** `SystemTools` mirrors `sysctl_tools.CATALOGUE` and `CONSENT_REQUIRED`, because
-//  `syscap.console_payload` sends no tool names at all — so "run this capability once" and "approve
-//  this tool once" have nowhere to read one from. It is documented there as a stopgap with the engine
-//  change that deletes it, rather than being quietly presented as decoded data.
+//  The one thing it does add is the question the engine cannot answer for a single panel — *which agent
+//  holds this* — and it derives that from the roster with the same rule the tool registry enforces
+//  (`system:*` or an exact match), so the panel cannot show a grant as held while `ToolRegistry.call`
+//  would refuse it.
 //
 //  `available == false` is carried, not filtered. **All twelve declared capabilities have a tool
 //  behind them today**, so nothing is in that state right now — the flag stays because the config and
@@ -32,7 +30,7 @@
 //
 //  A SECOND GAP, AND IT IS THE ONE THE PANEL'S FIRST FIGURE RESTS ON. `serve._cmd_system` answers with
 //  `syscap.console_payload`, which describes the capability *set*: it names no holder, so its own
-//  `summary` reads "0 of 12 system capabilities granted" on every machine (measured, `syscap.py:281`
+//  `summary` reads "0 of 12 system capabilities granted" on every machine (measured, `syscap.py:324`
 //  passes `[]`). The CLI's `system list` can say "12 of 12 granted" for the same machine because it
 //  adds a holder itself (`systemcli.py:628`, the Owner, holding `system:*`), and the served roster can
 //  say six, because six are on a named agent's entry. Three numbers, one machine, one phrase, no
@@ -197,7 +195,7 @@ public struct SystemHolder: Sendable, Equatable {
 /// under one phrase — "granted" — and it meant three things on one machine:
 ///
 /// - the engine's own `summary`, computed for no holder at all, so it reads "0 of 12 … granted"
-///   (`engine/syscap.py:281` calls `summary([])`);
+///   (`engine/syscap.py:324` calls `summary([])`);
 /// - the roster's answer, which is **six** — six of the twelve are on a named agent's entry;
 /// - the console holder's answer, which is **twelve** — the owner of the machine acts with `system:*`,
 ///   which is why `engine.cli system list` says "12 of 12 granted".
@@ -293,117 +291,86 @@ public struct SystemTool: Sendable, Equatable, Identifiable {
     /// than inventing a second one.
     public var isSafeToTry: Bool { runsWithoutArguments && !mutates }
 
-    public init(name: String, grant: String, mutates: Bool,
-                runsWithoutArguments: Bool, consentRequired: Bool = false) {
+    /// Decoded from one entry of the payload's `tools`.
+    ///
+    /// Total by construction, like `SystemCapability`: only `name` is required, because a tool row with
+    /// no name is not a row — `system_invoke` takes the name and nothing else identifies one. A field
+    /// the payload omits reads as the conservative value rather than failing to decode, so an older
+    /// engine's reply draws a shorter row instead of an empty panel.
+    public init?(payload: [String: JSONValue]) {
+        guard let name = payload["name"]?.stringValue, !name.isEmpty else { return nil }
         self.name = name
-        self.grant = grant
-        self.mutates = mutates
-        self.runsWithoutArguments = runsWithoutArguments
-        self.consentRequired = consentRequired
+        self.grant = payload["grant"]?.stringValue ?? ""
+        self.mutates = payload["mutates"]?.boolValue ?? false
+        // The engine derives this from the entry's own JSON schema, which is what the tool layer
+        // enforces; re-deriving it here would be a second rule to keep true.
+        self.runsWithoutArguments = payload["runs_without_arguments"]?.boolValue ?? false
+        self.consentRequired = payload["consent_required"]?.boolValue ?? false
+    }
+
+    /// Every tool the engine's reply carries, in the catalogue's order.
+    ///
+    /// Order is the engine's and is not re-sorted: `sysctl_tools.CATALOGUE`'s order is the grant order,
+    /// so a panel that groups by grant reads in the order `syscap` deliberately chose (reads, then
+    /// state changes, then the powerful ones).
+    public static func list(from payload: [String: JSONValue]) -> [SystemTool] {
+        (payload["tools"]?.arrayValue ?? [])
+            .compactMap { $0.objectValue }
+            .compactMap(SystemTool.init(payload:))
     }
 }
 
-/// The catalogue and the consent set, mirrored — **and this mirror is a known defect, not a design.**
+/// The tool catalogue and the ask-once set, **decoded** from the engine's reply.
 ///
-/// Everything else in this file is decoded from the engine's reply. This is not, and it cannot be:
-/// `serve._cmd_system` answers with `syscap.console_payload`, whose shape is grant-level prose only.
-/// It carries no tool name, no `mutates`, no consent flag. But the two things an *actionable* panel
-/// needs are exactly those: `system_invoke` takes a **tool name** (so "try this capability" has
-/// nowhere to read one from), and the ask-once gate applies to **tools** (`CONSENT_REQUIRED`), not to
-/// grants, so the approvals section has no list to render either.
+/// `syscap.console_payload` carries `tools` for exactly this: every `CatalogEntry` reduced to the four
+/// facts a control surface acts on. The two questions an *actionable* panel asks are answered from it —
+/// `system_invoke` takes a tool name, and the ask-once gate applies to tools (`CONSENT_REQUIRED`)
+/// rather than to grants.
 ///
-/// The fix belongs in the engine, and it is small: `engine/syscap.py` `console_payload` (the function
-/// whose docstring already freezes the key set for this decoder) should carry the catalogue — `name`,
-/// `capability`, `mutates`, whether the schema requires an argument, and whether the tool is in
-/// `CONSENT_REQUIRED`. Then this type is deleted and the entries are decoded like `SystemCapability`
-/// is, which is the only version of this file that cannot go stale.
+/// This type used to be an 18-entry hand-written list, with a docstring calling itself "a known defect,
+/// not a design" and reporting that the fix belonged in the engine. It did, and it is there now; the
+/// list is deleted rather than kept in step, which is the only version of it that cannot go stale.
 ///
-/// Until then the copy is kept honest by naming its source line in every entry, and by a test that
-/// should exist and does not: `SystemPanelTests` already parses `engine/sysctl_tools.py` with the
-/// small-regex-over-a-stable-block technique (`grantsWithTools`, its lines 88-97), so a drift guard
-/// for `all` below is a dozen lines in a file this change does not own. Reported as a gap rather than
-/// quietly adding a second hand-maintained list.
-public enum SystemTools {
+/// An empty catalog is a real state, not a failure: before the first reply, and on a machine whose
+/// `system` read failed, there is nothing to offer rather than a guessed list.
+public struct SystemToolCatalog: Sendable, Equatable {
 
-    /// Every catalogue entry, in the catalogue's own order — which is also the capability order, so a
-    /// panel that groups by grant reads in the order `syscap` deliberately chose (reads, then state
-    /// changes, then the powerful ones).
-    public static let all: [SystemTool] = [
-        // ── system:state ── sysctl_tools.py:362
-        SystemTool(name: "system_state", grant: "system:state",
-                   mutates: false, runsWithoutArguments: true),
-        // ── system:clipboard ── sysctl_tools.py:372, :382
-        SystemTool(name: "read_clipboard", grant: "system:clipboard",
-                   mutates: false, runsWithoutArguments: true),
-        SystemTool(name: "write_clipboard", grant: "system:clipboard",
-                   mutates: true, runsWithoutArguments: false, consentRequired: true),
-        // ── system:screenshot ── sysctl_tools.py:398
-        SystemTool(name: "take_screenshot", grant: "system:screenshot",
-                   mutates: true, runsWithoutArguments: true),
-        // ── system:media ── sysctl_tools.py:408, :415, :431
-        SystemTool(name: "get_volume", grant: "system:media",
-                   mutates: false, runsWithoutArguments: true),
-        SystemTool(name: "set_volume", grant: "system:media",
-                   mutates: true, runsWithoutArguments: false, consentRequired: true),
-        SystemTool(name: "set_mute", grant: "system:media",
-                   mutates: true, runsWithoutArguments: false, consentRequired: true),
-        // ── system:open ── sysctl_tools.py:446
-        SystemTool(name: "open_app", grant: "system:open",
-                   mutates: true, runsWithoutArguments: false, consentRequired: true),
-        // ── system:automation ── sysctl_tools.py:463
-        SystemTool(name: "run_automation", grant: "system:automation",
-                   mutates: true, runsWithoutArguments: false, consentRequired: true),
-        // ── system:notify ── sysctl_tools.py:484, :504
-        SystemTool(name: "say_message", grant: "system:notify",
-                   mutates: true, runsWithoutArguments: false, consentRequired: true),
-        SystemTool(name: "post_notification", grant: "system:notify",
-                   mutates: true, runsWithoutArguments: false),
-        // ── system:search ── sysctl_tools.py:527
-        SystemTool(name: "spotlight_search", grant: "system:search",
-                   mutates: false, runsWithoutArguments: false),
-        // ── system:power ── sysctl_tools.py:553, :573
-        SystemTool(name: "keep_awake", grant: "system:power",
-                   mutates: true, runsWithoutArguments: true, consentRequired: true),
-        SystemTool(name: "sleep_now", grant: "system:power",
-                   mutates: true, runsWithoutArguments: true, consentRequired: true),
-        // ── system:network ── sysctl_tools.py:583
-        SystemTool(name: "network_status", grant: "system:network",
-                   mutates: false, runsWithoutArguments: true),
-        // ── system:shortcuts ── sysctl_tools.py:600
-        SystemTool(name: "run_shortcut", grant: "system:shortcuts",
-                   mutates: true, runsWithoutArguments: false, consentRequired: true),
-        // ── system:softwareupdate ── sysctl_tools.py:619, :635
-        SystemTool(name: "list_os_updates", grant: "system:softwareupdate",
-                   mutates: false, runsWithoutArguments: true),
-        SystemTool(name: "install_os_updates", grant: "system:softwareupdate",
-                   mutates: true, runsWithoutArguments: true, consentRequired: true),
-    ]
+    /// Every catalogue entry, in the engine's own order.
+    public let all: [SystemTool]
+
+    public init(_ payload: [String: JSONValue]) {
+        self.all = SystemTool.list(from: payload)
+    }
+
+    /// Whether the engine has told this console about any tools yet.
+    public var isEmpty: Bool { all.isEmpty }
 
     /// The tools that act under one grant, in catalogue order.
-    public static func forGrant(_ grant: String) -> [SystemTool] {
+    public func forGrant(_ grant: String) -> [SystemTool] {
         all.filter { $0.grant == grant }
     }
 
     /// The tools the engine refuses until the Owner approves them once, for one agent.
-    public static var consentRequired: [SystemTool] {
+    public var consentRequired: [SystemTool] {
         all.filter(\.consentRequired)
     }
 
     /// The one tool worth offering a "try it" for, or nil where every tool needs an argument or
     /// changes something. Nil is the common case and is not an error: most of these grants are
     /// decisions, and a decision has no safe demonstration.
-    public static func tryable(_ grant: String) -> SystemTool? {
+    public func tryable(_ grant: String) -> SystemTool? {
         all.first { $0.grant == grant && $0.isSafeToTry }
     }
 
     /// The grants the catalogue backs, in catalogue order, each appearing once.
     ///
-    /// This is what lets the hire form *derive* its list of machine grants instead of restating it:
-    /// the twelve grants the engine declares are exactly the twelve its tools name, so a grant added
-    /// to the config with no tool yet still appears (with a placeholder), and the six that were
-    /// missing from the form before this were the six whose absence nothing caught.
-    public static var grants: [String] {
+    /// Note that this is *not* what the hire form offers any more. That form is built from the
+    /// capabilities the engine **declares** (`SystemCapability.list`), so a grant added to the config
+    /// with no tool yet still appears there; this answers the narrower question "which grants have
+    /// something behind them", which is what a panel offering to run one needs.
+    public var grants: [String] {
         var seen = Set<String>()
         return all.compactMap { seen.insert($0.grant).inserted ? $0.grant : nil }
     }
 }
+

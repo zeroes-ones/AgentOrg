@@ -229,35 +229,62 @@ final class SpineTests: XCTestCase {
                       model.next?.label ?? "nil")
     }
 
-    func testTheAppOnlyOffersToPerformWhatItActuallyCan() {
-        // A button that silently does nothing is worse than a line telling you what to run, so the
-        // engine's own command is shown for everything the app cannot do itself — and each kind that
-        // *is* offered has a real destination behind it: Org for a hire, Runs for a stopped run, the
-        // goal's own resume, and the composer's start for a start.
-        let resume = SpineModel.NextLine(kind: "resume", label: "Resume", detail: "", command: "")
-        XCTAssertTrue(resume.canPerform(gateIsWaitingForHuman: false))
+    func testTheAppOffersExactlyWhatTheEngineSaidItCouldPerform() {
+        // A button that silently does nothing is worse than a line telling you what to run, so the app
+        // must not decide for itself what it can do — it reads `performable` and `needs`, which the
+        // engine sends with every action (`engine/activity.py::_action`).
+        //
+        // This test used to construct `NextLine`s from *kind* names and assert the app's own answer for
+        // each. That is the enumeration this change removes: the engine's kinds were a list in Swift,
+        // and the day `retry` was added the app's opinion about it was stale until someone widened the
+        // switch. So the input here is the *payload*, exactly as `_next_action` writes it.
+        func line(_ action: [String: JSONValue]) -> SpineModel.NextLine? {
+            var input = base()
+            input.activity = ["next_action": .object(action)]
+            return spine(input).next
+        }
 
-        let decide = SpineModel.NextLine(kind: "decide", label: "Decide", detail: "", command: "")
-        XCTAssertTrue(decide.canPerform(gateIsWaitingForHuman: true))
-        XCTAssertFalse(decide.canPerform(gateIsWaitingForHuman: false),
+        // An action the engine marks performable is offerable, whatever its kind is — including a kind
+        // this build has never seen, which is the property the whole change exists for.
+        let hire = line(["kind": .string("hire"), "label": .string("Hire"),
+                         "detail": .string(""), "command": .string("engine.cli hire"),
+                         "performable": .bool(true), "needs": .string("")])
+        XCTAssertEqual(hire?.canPerform(gateIsWaitingForHuman: false), true)
+        let unknown = line(["kind": .string("a-kind-from-a-later-engine"),
+                            "label": .string("Something new"), "detail": .string(""),
+                            "command": .string("engine.cli whatever"),
+                            "performable": .bool(true), "needs": .string("")])
+        XCTAssertEqual(unknown?.canPerform(gateIsWaitingForHuman: false), true,
+                       "the app must not need an edit to offer a kind the engine added")
+
+        // The one conditional the engine names: the gate is the person's only while the gate still is.
+        // The engine cannot answer it — whether it has since decided the gate itself is not in the
+        // checkpoint it reads — so it says what performing the action needs and the app supplies the
+        // state from `GateDisposition`.
+        let decide = line(["kind": .string("decide"), "label": .string("Decide gate 'release'"),
+                           "detail": .string(""), "command": .string("engine.cli decide"),
+                           "performable": .bool(false), "needs": .string("gate")])
+        XCTAssertEqual(decide?.canPerform(gateIsWaitingForHuman: true), true)
+        XCTAssertEqual(decide?.canPerform(gateIsWaitingForHuman: false), false,
                        "a gate that is not the person's must not be offerable")
 
-        // Every action kind `engine/activity.py::_next_action` can emit, other than `decide` and
-        // `none`. Each one leads somewhere in the app, so each is offerable; the test is written
-        // against the engine's own list so the two cannot drift about which of them has a destination.
-        for kind in ["hire", "start", "investigate"] {
-            let line = SpineModel.NextLine(kind: kind, label: kind, detail: "", command: "cmd")
-            XCTAssertTrue(line.canPerform(gateIsWaitingForHuman: false),
-                          "\(kind) leads somewhere in the app, so it is offerable")
+        // `retry` is the engine's own `false`: no `serve` command re-runs a graph, so the command is
+        // shown instead. A payload from a build that predates these two fields reads as not-performable
+        // rather than as a dead button — the safe direction for a field the engine did not send.
+        let notOfferable: [[String: JSONValue]] = [
+            ["kind": .string("retry"), "label": .string("Re-run the graph"),
+             "detail": .string(""), "command": .string("engine.cli run"),
+             "performable": .bool(false), "needs": .string("")],
+            ["kind": .string("decide"), "label": .string("Decide")],
+        ]
+        for action in notOfferable {
+            XCTAssertEqual(line(action)?.canPerform(gateIsWaitingForHuman: true), false,
+                           "\(action["kind"]?.stringValue ?? "?") is not offerable")
         }
-
-        // `none` is the absence of a next step, and an unrecognised kind is one this build has no
-        // destination for: both fall back to the engine's own command rather than a dead button.
-        for kind in ["none", "a-kind-from-a-later-engine"] {
-            let line = SpineModel.NextLine(kind: kind, label: kind, detail: "", command: "cmd")
-            XCTAssertFalse(line.canPerform(gateIsWaitingForHuman: true),
-                           "\(kind) has no destination, so the command is shown instead")
-        }
+        // `none` is the absence of a next step, so there is no line at all — asserted by
+        // `testNoNextActionMeansNoNextRowRatherThanAnEmptyOne` above, and repeated here because this
+        // test's own list must not depend on that one staying.
+        XCTAssertNil(line(["kind": .string("none"), "label": .string("Nothing needs you")]))
     }
 
     // MARK: - The first-run hint
@@ -357,15 +384,18 @@ final class SpineTests: XCTestCase {
     }
 
     func testTheSpinesRetryActionIsShownAsTheEnginesCommandNotAButton() {
-        // The engine's newest next-action kind, captured from the real report with:
+        // The engine's `retry` kind, whose payload is transcribed from the real report with:
         //
         //     engine.cli activity --project /tmp/boardproof2 --json
         //
         // over the same guardrail-blocked node and *no* `stop_reason`, which is the state where the
-        // retry rather than "investigate" is the engine's answer. The app cannot perform it — no
-        // `serve` command runs a graph (`engine/serve.py:1168`'s `start` plans a new one) — so the
-        // spine must carry it through and the view falls back to the engine's command, which is the
-        // honest thing to show rather than a button that would come back "unknown command".
+        // retry rather than "investigate" is the engine's answer. The two fields at the end are the
+        // engine's own verdict on it: `performable: false` — no `serve` command runs a graph
+        // (`engine/serve.py:1168`'s `start` plans a new one) — and no condition under which it would
+        // be true. So the spine carries it through and the view falls back to the engine's command,
+        // which is the honest thing to show rather than a button that would come back "unknown
+        // command". Note the *detail* is the engine's own sentence for the stop token, which
+        // `flow.stop_words` also sends separately for a report that carries only the token.
         var input = base()
         input.activity = ["next_action": .object([
             "kind": .string("retry"),
@@ -373,7 +403,9 @@ final class SpineTests: XCTestCase {
             "detail": .string("the work finished, but what it handed on was refused at the edge — "
                               + "a contract failure, not a crash"),
             "command": .string("engine.cli run --slug boardproof2 --manifest "
-                               + "/tmp/boardproof2/manifest.yaml")])]
+                               + "/tmp/boardproof2/manifest.yaml"),
+            "performable": .bool(false),
+            "needs": .string("")])]
         let next = spine(input).next
         XCTAssertEqual(next?.kind, "retry")
         XCTAssertEqual(next?.label, "Re-run the graph so pm gets another attempt")

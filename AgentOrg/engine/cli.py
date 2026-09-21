@@ -40,7 +40,7 @@ from typing import Any
 from .bus import EventBus
 from .catalog import ModelCatalog
 from .completion import SUPPORTED_SHELLS
-from .config import ConfigError, load, scan_for_leaks
+from .config import ConfigError, SystemConfig, load, scan_for_leaks
 from .library import LibraryError, resolve
 from .org import Binder, HiringDesk, PolicyResolver, Router, default_company
 from .org.binding import BindingError
@@ -4075,6 +4075,26 @@ def Org_free():
 # ── parser ───────────────────────────────────────────────────────────────────
 
 
+def capability_help() -> str:
+    """The `hire --capability` help, with the machine grants read from the config that declares them.
+
+    **Why this is not a sentence with six names in it.** It was, and it named half of them: the list
+    said `system:state, system:clipboard, system:screenshot, system:media, system:open,
+    system:automation`, while `SystemConfig.CAPABILITIES` declared twelve. A person reading `--help` to
+    find out what they could grant was told about six grants and no others — and the six missing ones
+    included `system:softwareupdate`, the grant whose own prose calls it the heaviest here. The same
+    6-of-12 staleness had already been fixed in the app's hire form; this is the other surface.
+
+    The project grants stay written out: `read:`/`write:`/`exec:` are the sandbox's vocabulary, declared
+    in no config module, and there are three of them. The `system:` half is derived, so a thirteenth
+    grant is documented the moment it is declared rather than the next time someone remembers this line.
+    """
+    grants = ", ".join(SystemConfig.CAPABILITIES)
+    return ("what this agent may reach, repeatable: read:*, write:src/**, exec:*, "
+            f"{grants}. Given, it REPLACES the skill's default least-privilege set rather than adding "
+            "to it, so revoking is expressible.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The argument surface, with help text that explains rather than restates.
 
@@ -4600,10 +4620,7 @@ def build_parser() -> argparse.ArgumentParser:
     hire.add_argument("--team", help="the team it joins")
     hire.add_argument("--concurrency", type=int, help="how many tasks it may run at once")
     hire.add_argument("--capability", action="append", dest="capabilities", metavar="GRANT",
-                      help="what this agent may reach, repeatable: read:*, write:src/**, exec:*, "
-                           "system:state, system:clipboard, system:screenshot, system:media, "
-                           "system:open, system:automation. Given, it REPLACES the skill's default "
-                           "least-privilege set rather than adding to it, so revoking is expressible.")
+                      help=capability_help())
     hire.add_argument("--root", help="project root to find .agentorg in (default: walk up)")
     hire.add_argument("--roster-root", help="write the roster here (default: the project root)")
     hire.set_defaults(func=cmd_hire)

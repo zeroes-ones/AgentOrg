@@ -101,6 +101,77 @@ def test_available_reflects_whether_a_tool_exists():
         assert capability.available == (capability.grant in with_tools), capability.grant
 
 
+# ── the tool table the console acts through ──────────────────────────────────
+
+
+def test_the_tool_table_travels_with_the_capabilities():
+    """The console must be able to *act*, not only describe, and that needs the catalogue.
+
+    The app used to keep its own copy of `CATALOGUE` and `CONSENT_REQUIRED` — eighteen hand-written
+    rows with the line number each came from — because the reply carried no tool names at all. A copy
+    is right until the first tool is added and the console offers a set the engine does not have, so
+    the table travels instead, and every field here is computed from the engine's own declarations
+    rather than written out: a tool added to the catalogue is one the console can act on the moment it
+    is added, and a tool moved into `CONSENT_REQUIRED` starts asking for approval with no edit on the
+    Swift side.
+
+    `runs_without_arguments` is the one field that is *derived* rather than declared: it is the entry's
+    own JSON schema, which is what the tool layer enforces — a flag set by hand could disagree with the
+    schema and offer "run it with no arguments" for a call that cannot be made.
+    """
+    from engine.syscap import console_payload, tools_payload
+    from engine.sysctl_tools import CONSENT_REQUIRED
+
+    expected = [{
+        "name": entry.name,
+        "grant": entry.capability,
+        "mutates": bool(entry.mutates),
+        "runs_without_arguments": not (entry.parameters or {}).get("required"),
+        "consent_required": entry.name in CONSENT_REQUIRED,
+    } for entry in CATALOGUE]
+    assert expected, "the catalogue should declare tools"
+    # Order included: it is the order the engine advertises in, which is the order the console's rows
+    # read in, and a re-ordering would be a visible change that nothing else would catch.
+    assert tools_payload() == expected
+    payload = console_payload(SystemConfig())
+    assert payload["tools"] == expected
+
+
+def test_the_reply_gained_a_key_without_losing_or_renaming_one():
+    """The app's decoder reads `capabilities`, `enabled`, `full_access`, `unavailable` and `summary`.
+
+    Adding a key is how a surface stops needing a copy of the engine's data; renaming or retyping one
+    is how a shipped console breaks silently, so the pre-existing keys are pinned here beside the new
+    one.
+    """
+    from engine.syscap import console_payload
+
+    payload = console_payload(SystemConfig())
+    for key in ("capabilities", "enabled", "full_access", "allow_apps", "allow_automation",
+                "allow_shortcuts", "unavailable", "summary", "tools"):
+        assert key in payload, f"{key} is missing from the console payload"
+    assert isinstance(payload["capabilities"], list)
+    assert isinstance(payload["tools"], list)
+    assert all(isinstance(entry, dict) for entry in payload["tools"])
+
+
+def test_every_tool_is_filed_under_a_grant_the_config_declares():
+    """A tool naming a grant nobody declared would be advertised and then refused.
+
+    `ToolRegistry` decides what to offer from the holder's grants, and the console's rows are keyed by
+    the grants the config declares — so a catalogue entry under an undeclared grant is a row with no
+    home, which is the shape a copy of the catalogue had to get wrong.
+    """
+    from engine.syscap import tools_payload
+
+    declared = set(SystemConfig.CAPABILITIES)
+    for entry in tools_payload():
+        assert entry["grant"] in declared, entry
+    # And every one of them is a *system* grant: filing a machine tool under a project scope would put
+    # it in the panel's project half, where the switches that govern it are not shown.
+    assert all(entry["grant"].startswith("system:") for entry in tools_payload())
+
+
 # ── the status agrees with what is actually enforced ─────────────────────────
 
 

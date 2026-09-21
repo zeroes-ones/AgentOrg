@@ -58,7 +58,7 @@ from typing import Any, Iterable
 from .systemcli import NEXT_SEP
 
 __all__ = ["FlowRow", "FlowHandoff", "build_flow", "is_stuck", "why_stopped", "stop_report",
-           "recovery_command", "FLOW_VERSION"]
+           "recovery_command", "stop_words", "FLOW_VERSION"]
 
 #: Bumped when the board's shape changes incompatibly, so a cached consumer can tell.
 FLOW_VERSION = "1.0.0"
@@ -151,11 +151,16 @@ _CAUSE_ACTIONS: dict[str, str] = {
 #:
 #: Keyed by both spellings because the two arrive independently — a verdict on the node record
 #: (`guardrail-blocked`) and an action on the log entry (`guardrail`) — and a reader must get the same
-#: sentence whichever of the two was written. This is the Python counterpart of the app's `EngineWord`
-#: (`macos/Sources/AgentOrg/NowPane.swift:83`), and it follows the same rule: a short phrase per token,
-#: and **nothing** for a token this build does not know. An invented word would be the confident-wrong
-#: output the rest of the engine avoids, and `FlowRow.verdict` still carries the token itself, so an
-#: unmapped one shows through rather than being lost.
+#: sentence whichever of the two was written. This is the one home for the wording: the app used to
+#: carry its own copy of the first two entries
+#: (`macos/Sources/AgentOrg/NowPane.swift`, `EngineWord.stop`) so that one token was not described two
+#: ways on one screen, and the way to *keep* one copy is to send this table rather than to rewrite it in
+#: Swift — see `stop_words` below, which is what the reports carry.
+#:
+#: It follows the same rule the app's `EngineWord` follows for every other token: a short phrase per
+#: token, and **nothing** for a token this build does not know. An invented word would be the
+#: confident-wrong output the rest of the engine avoids, and `FlowRow.verdict` still carries the token
+#: itself, so an unmapped one shows through rather than being lost.
 #:
 #: `guardrail-blocked` is the token this exists for. It is not self-explanatory: the node *finished its
 #: work* and the artifact it produced was refused at the handoff because it did not satisfy the
@@ -169,6 +174,21 @@ _STOP_WORDS: dict[str, str] = {
     "error": "the node raised an error",
     "escalate": "the step was escalated instead of finishing",
 }
+
+
+def stop_words() -> dict[str, str]:
+    """The gloss for every stop token this build knows, as data a surface can carry.
+
+    **Why the table travels.** A token is glossed in three places — `why_stopped` folds one into a
+    row's `blocked_by`, `stop_report` writes one into the timeline, and a surface that finds only a bare
+    token has to say what it means itself. The third is where a second copy of the wording appears, and
+    the failure is subtle rather than loud: two surfaces phrasing one token slightly differently reads
+    as two different states. Sending the table is what makes the app's gloss *this* table, so there is
+    one wording and it changes when this one does.
+
+    A copy, not the dict itself, so a caller cannot edit the vocabulary for everyone else.
+    """
+    return dict(_STOP_WORDS)
 
 
 @dataclass
@@ -749,6 +769,10 @@ def build_flow(workspace: Any, *, run_status: dict[str, Any] | None = None,
         # `next` field — one line, command first, so the app and `serve` show one sentence rather than
         # each inventing its own. Empty when there is nothing a person needs to do.
         "next": _next_line(rows, checkpoint, state_dir),
+        # The wording for every stop token this build knows, so a surface that finds a bare `verdict`
+        # on a row says what *this* engine means by it rather than keeping its own copy of the sentence
+        # (`stop_words` above explains why the table travels).
+        "stop_words": stop_words(),
         "rows": [row.as_dict() for row in rows],
         "handoffs": [h.as_dict() for h in handoffs],
         "counts": counts,

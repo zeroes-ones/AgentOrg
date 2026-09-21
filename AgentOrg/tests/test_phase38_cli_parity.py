@@ -39,7 +39,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from engine.cli import EXIT_CHECK_FAILED, EXIT_OK, EXIT_USAGE, build_parser, main
-from engine.config import load
+from engine.config import SystemConfig, load
 from engine.library import resolve
 from engine.serve import Server, ServerError
 from engine.state import Workspace
@@ -234,6 +234,35 @@ def test_the_improver_commands_say_nothing_is_applied():
         line = _help_line(text, prog)
         lowered = line.lower()
         assert "never applies" in lowered or ("nothing" in lowered and "applied" in lowered), line
+
+
+def test_the_hire_help_names_every_capability_the_config_declares():
+    """`hire --capability` is how a person finds out what they can grant, and it named six of twelve.
+
+    The line listed `system:state, system:clipboard, system:screenshot, system:media, system:open,
+    system:automation` while `SystemConfig.CAPABILITIES` declared twelve — so a person reading
+    `--help` was told about half the grants and no others, and the missing half included
+    `system:softwareupdate`, whose own prose calls it the heaviest grant here. The same 6-of-12
+    staleness had already been fixed in the app's hire form; this was the other surface.
+
+    The grants are read from the config rather than asserted as a list, so a thirteenth grant is
+    documented the moment it is declared rather than the next time someone remembers this line.
+    """
+    declared = SystemConfig.CAPABILITIES
+    assert len(declared) > 6, "the config's own list is what this checks against"
+
+    result = run_cli("hire", "--help")
+    assert result.returncode == EXIT_OK, result.stderr
+    line = _help_line(result.stdout, "--capability")
+    for grant in declared:
+        assert grant in line, f"{grant} is declared by the config but not documented in `hire --help`"
+    # The project grants have no config to be read from — `read:`/`write:`/`exec:` are the sandbox's
+    # vocabulary — so they stay written out, and they must stay in the line.
+    for grant in ("read:*", "write:src/**", "exec:*"):
+        assert grant in line, f"{grant} is offered by every hire and must be documented"
+    # And the sentence that explains the *shape* of the flag, which no list can carry: giving one
+    # replaces the skill's default rather than adding to it.
+    assert "REPLACES" in line
 
 
 def _help_line(help_text: str, prog: str) -> str:

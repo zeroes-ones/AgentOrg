@@ -2171,6 +2171,18 @@ public final class OrgController: ObservableObject {
         (flow["handoffs"]?.arrayValue ?? []).compactMap { $0.objectValue }
     }
 
+    /// The engine's wording for its stop tokens, read from whichever report carries it.
+    ///
+    /// Both reports carry the same table (`flow.stop_words`, sent by `build_flow` and by
+    /// `build_activity`) because both render tokens a person has to read: the board shows a row's bare
+    /// `verdict`, and the Now pane shows the run's `stop_reason`, which is sometimes a token rather
+    /// than a sentence. Merged rather than picked between, so a report that is missing for any reason
+    /// still costs nothing — an empty vocabulary degrades to showing the token itself, which is what
+    /// the engine actually recorded.
+    public var stopWords: StopWords {
+        StopWords(flow, activity)
+    }
+
     /// Ask the engine for the board now, rather than waiting for the next poll.
     ///
     /// The board travels with status, so this is only needed when a person opens the panel and wants it
@@ -2325,6 +2337,15 @@ public final class OrgController: ObservableObject {
     /// Every declared capability, with the engine's own prose for each.
     public var systemCapabilities: [SystemCapability] {
         SystemCapability.list(from: system)
+    }
+
+    /// The tool catalogue behind those capabilities, as the engine reports it.
+    ///
+    /// Read from the same reply as the capabilities, so a panel offering to run a tool and the row
+    /// describing the grant cannot disagree: both come from one `system` answer. Empty before the first
+    /// reply, which is the honest state — nothing is offered rather than a list from the app.
+    public var systemToolCatalog: SystemToolCatalog {
+        SystemToolCatalog(system)
     }
 
     /// Whether the section is switched on at all. Off means the list below is inert: no grant here

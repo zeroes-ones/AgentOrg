@@ -521,8 +521,12 @@ struct HireForm: View {
             }
             // Grouped so the consequence of each grant is legible before it is made. The system group
             // is the one that reaches outside the project, and the label says which of them change
-            // state on the person's own machine.
-            ForEach(CapabilityChoice.groups, id: \.title) { group in
+            // state on the person's own machine. Its grants are the ones the engine's own reply
+            // declares, read here rather than listed in the form: a grant this app has never heard of
+            // is offerable the moment the engine declares it, and none can be dropped by a stale copy.
+            ForEach(CapabilityChoice.groups(
+                systemGrants: controller.systemCapabilities.map(\.grant)),
+                    id: \.title) { group in
                 VStack(alignment: .leading, spacing: 3) {
                     Text(group.title).font(.caption2.weight(.semibold))
                         .foregroundStyle(group.isSystem ? .orange : .secondary)

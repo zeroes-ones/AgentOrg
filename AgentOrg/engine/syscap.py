@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 __all__ = ["Capability", "CAPABILITIES", "describe", "summary", "granted_in", "unmet",
-           "console_payload"]
+           "console_payload", "tools_payload"]
 
 #: What each capability lets loose, in the order a person would want to read it: the harmless reads
 #: first, the state changes next, the powerful ones last. Order is deliberate and load-bearing — a
@@ -220,6 +220,45 @@ def _grants_with_tools() -> set[str]:
         return set()
 
 
+def tools_payload() -> list[dict[str, Any]]:
+    """The tool catalogue, reduced to the facts a control surface acts on.
+
+    **Why a describe-layer carries the tool table.** The capability list answers "what may an agent
+    reach"; a console that offers to *act* needs "which tool would do it" — a tool name to pass to an
+    invocation, whether the call changes anything, whether a bare name is a complete call, and whether
+    the call will be refused until the Owner approves it once. None of those is a fact about a grant,
+    so a surface that could only read the grants had to keep its own copy of the catalogue — and a
+    second copy of a catalogue is a surface that goes stale the first time a tool is added.
+
+    Four facts per entry, each read off `CatalogEntry` rather than restated:
+
+    - `mutates` — whether the call changes something the person already had.
+    - `runs_without_arguments` — whether the entry's own JSON schema declares no required argument, so
+      a bare name is a complete call. Read from the schema rather than from a hand-set flag, because
+      the schema is what the tool layer enforces.
+    - `consent_required` — whether `CONSENT_REQUIRED` names it: the ask-once gate, per agent, per tool.
+
+    The entry's `description` is deliberately **not** carried. It is written for a model choosing a
+    tool, and every person-facing sentence here already comes from `_DESCRIPTIONS`; shipping the
+    model's copy to the console would give it two things to say about one tool.
+
+    A catalogue that will not import costs the tools and nothing else, the same rule `_grants_with_tools`
+    follows: the description of the grants is still worth sending on a machine whose tool module is
+    broken.
+    """
+    try:
+        from .sysctl_tools import CATALOGUE, CONSENT_REQUIRED
+    except Exception:  # noqa: BLE001 - an unimportable tool module is not a reason to send nothing
+        return []
+    return [{
+        "name": entry.name,
+        "grant": entry.capability,
+        "mutates": bool(entry.mutates),
+        "runs_without_arguments": not (entry.parameters or {}).get("required"),
+        "consent_required": entry.name in CONSENT_REQUIRED,
+    } for entry in CATALOGUE]
+
+
 # Built once at import. Cheap (two small tuples), and every caller wants the same list.
 CAPABILITIES = _build()
 
@@ -267,11 +306,15 @@ def console_payload(section: Any) -> dict[str, Any]:
     a named holder never leak into the description an unrelated reader compares against.
 
     Shape is fixed by the app's decoder (`macos/Sources/AgentOrgKit/OrgController.swift` reads
-    `capabilities`, `enabled`, `full_access`, `unavailable`, `summary`), so the keys are frozen.
+    `capabilities`, `enabled`, `full_access`, `unavailable`, `summary`), so the keys are frozen: a key
+    that exists is not renamed or retyped. `tools` was **added** rather than changed — it is what let
+    the console stop keeping its own copy of the catalogue (see `tools_payload`), and a surface that
+    wants only the grants can ignore it.
     """
     entries = [c.as_dict() for c in describe()]
     return {
         "capabilities": entries,
+        "tools": tools_payload(),
         "enabled": bool(getattr(section, "enabled", False)),
         "full_access": bool(getattr(section, "allow_full_access", False)),
         "allow_apps": list(getattr(section, "allow_apps", None) or []),

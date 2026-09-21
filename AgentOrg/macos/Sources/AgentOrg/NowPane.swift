@@ -116,11 +116,12 @@ enum EngineWord {
 
     /// Why a step stopped, when the engine recorded the why as a verdict and nothing else.
     ///
-    /// A board row's reason is `blocked_by`, which `engine/flow.py:296` (`why_stopped`) folds from the
-    /// node record's `summary`, then the node's own `log` entry, then this very gloss. The two tokens
-    /// that fold knows are worded here **exactly as the engine words them**
-    /// (`engine/flow.py:163-171`, `_STOP_WORDS`) so one token is never described two ways on one
-    /// screen; the rest are this build's, for a stop the engine has no sentence for.
+    /// A board row's reason is `blocked_by`, which `engine/flow.py:316` (`why_stopped`) folds from the
+    /// node record's `summary`, then the node's own `log` entry, then the engine's gloss for the token.
+    /// The two tokens that fold knows are glossed **from the engine's own table**, which travels in the
+    /// payload the board was built from (`engine/flow.py`'s `stop_words` → `StopWords`): they are not
+    /// written here, so `guardrail-blocked` cannot be described one way in the engine and another on
+    /// this screen. The rest are this build's, for a stop the engine has no sentence for.
     ///
     /// This is the degradation path, not the main one: a payload from a build whose `blocked_by` is
     /// empty — a workspace written before the fold, or a node whose log entry is not one of the causes
@@ -132,18 +133,16 @@ enum EngineWord {
     /// The vocabulary is the *stopped node's* own, read from the two producers that write one: the
     /// runner (the library's `scripts/workflow-runner.py`: `guardrail-blocked` at `_apply_guardrail`,
     /// `contract-violation` at `_apply_contract`) and this repository's executor (`awaiting_owner` and
-    /// `missing_prerequisites`, `engine/executor.py:566` and `:581`). An empty string means "no gloss
-    /// for this token" — the caller keeps the token rather than printing an invented sentence, which is
-    /// the rule the rest of this enum follows.
-    static func stop(_ verdict: String) -> String {
-        switch verdict {
-        case "guardrail-blocked":
-            return "the work finished, but what it handed on was refused at the edge — "
-                 + "a contract failure, not a crash"
-        case "contract-violation":
-            return "its result did not satisfy the node's completion contract"
+    /// `missing_prerequisites`, `engine/executor.py:566` and `:581`). The engine glosses the first pair
+    /// and not the second pair, which is why only the second is spelled out below. An empty string
+    /// means "no gloss for this token" — the caller keeps the token rather than printing an invented
+    /// sentence, which is the rule the rest of this enum follows.
+    static func stop(_ verdict: String, words: StopWords) -> String {
+        let engine = words.gloss(verdict)
+        if !engine.isEmpty { return engine }
         // Below here the engine has no sentence of its own, so these are this build's — said as what
         // the state *is*, and kept short enough to read in a row.
+        switch verdict {
         case "awaiting_owner":
             return "a decision point: this step is waiting for you"
         case "missing_prerequisites":
@@ -405,10 +404,10 @@ struct HappeningSection: View {
                 // hand-off payload was blocked by the edge guardrail — …"), and then this line is the
                 // engine's own words. One state is not a sentence: a checkpoint whose only record of
                 // the stop is a bare verdict token, which is the state the board's rows used to be in.
-                // There the token is glossed — the same mapping the row uses, so one thing is said one
-                // way — and the token itself stays in the line rather than being replaced by a
-                // paraphrase of it.
-                let gloss = EngineWord.stop(stop)
+                // There the token is glossed — from the engine's own vocabulary, the same table the
+                // board's rows use, so one token is said one way — and the token itself stays in the
+                // line rather than being replaced by a paraphrase of it.
+                let gloss = EngineWord.stop(stop, words: controller.stopWords)
                 Text(gloss.isEmpty ? stop : "\(stop) — \(gloss)")
                     .font(.caption).foregroundStyle(.red).textSelection(.enabled)
             }
@@ -618,9 +617,9 @@ struct HappeningSection: View {
     /// How many steps stopped — the board's own figure, so the number and the place it leads agree.
     ///
     /// The board's `counts.stuck` is the engine's own tally of stopped rows
-    /// (`engine/flow.py:1036`, over the single predicate at `:258`), and this figure is what sends a
+    /// (`engine/flow.py:1060`, over the single predicate at `:278`), and this figure is what sends a
     /// person to the board, so the two have to be the same number. It used to read the activity
-    /// report's `counts.blocked`, which `engine/activity.py:604` still computes as `status == "blocked"`
+    /// report's `counts.blocked`, which `engine/activity.py:640` still computes as `status == "blocked"`
     /// alone: a step stopped by its completion contract (`needs_review`) or parked at a human gate
     /// (`awaiting_owner`) was counted by the board and not by this figure — so the figure could read 0
     /// while the board read 1, and the sentence under it, which points at the board, would not even be
@@ -1275,7 +1274,7 @@ struct FlowSection: View {
                 // under `id: \.offset` every row after a gate was re-identified when the toggle moved.
                 ForEach(visibleRows.map { (key: $0["node_id"]?.stringValue ?? "", row: $0) },
                         id: \.key) { item in
-                    FlowRowView(row: item.row)
+                    FlowRowView(row: item.row, words: controller.stopWords)
                 }
                 if !handoffs.isEmpty { handoffSection }
             }
@@ -1298,7 +1297,7 @@ struct FlowSection: View {
     /// The first stopped step, in the order the board reads — so the header names the row a person
     /// scrolling down would reach first, rather than one the engine counted and this view hides.
     ///
-    /// `BoardStop` is the engine's own predicate (`engine/flow.py:258`), so "the first stopped row" here is
+    /// `BoardStop` is the engine's own predicate (`engine/flow.py:278`), so "the first stopped row" here is
     /// the same row the engine picked when it wrote the board's `next`.
     private var firstStuck: [String: JSONValue]? {
         visibleRows.first { BoardStop.isStuck($0) }
@@ -1306,7 +1305,7 @@ struct FlowSection: View {
 
     /// The move the engine named for this board, or nil when the engine named none.
     ///
-    /// One per board, not one per row: `_next_line` (`engine/flow.py:408`) runs the recovery for the
+    /// One per board, not one per row: `_next_line` (`engine/flow.py:428`) runs the recovery for the
     /// *run* — re-running the graph gives the stopped node another attempt at the refused payload — and
     /// names the first stopped step in its sentence. So it is shown once, where the board names that
     /// step, rather than repeated under every stopped row naming a node that is not the one above it.
@@ -1326,7 +1325,7 @@ struct FlowSection: View {
             VStack(alignment: .leading, spacing: 3) {
                 if let stuck = firstStuck {
                     let node = stuck["node_id"]?.stringValue ?? "a step"
-                    let reason = boardStopReason(stuck)
+                    let reason = boardStopReason(stuck, words: controller.stopWords)
                     // The reason is present for every stop this build knows (`boardStopReason`), and
                     // the sentence is still the node and the fact when it is not — what is never done
                     // is inventing a meaning for a token this build does not recognise.
@@ -1450,7 +1449,7 @@ private struct BoardStopReason {
 
 /// Why a board row is not done, as one sentence, with the raw token kept for the tooltip.
 ///
-/// The order is the engine's own — `engine/flow.py:296` (`why_stopped`) reads the same three sources
+/// The order is the engine's own — `engine/flow.py:316` (`why_stopped`) reads the same three sources
 /// in the same order — and each step is used only when the one before it said nothing:
 ///
 /// 1. `blocked_by`, which is what the engine folded for this row.
@@ -1467,17 +1466,17 @@ private struct BoardStopReason {
 ///
 /// Both the row and the board's header use it, so the same step cannot be described two ways on one
 /// screen.
-private func boardStopReason(_ row: [String: JSONValue]) -> BoardStopReason? {
-    if let reason = row["blocked_by"]?.stringValue, !reason.isEmpty {
+private func boardStopReason(_ payload: [String: JSONValue], words: StopWords) -> BoardStopReason? {
+    if let reason = payload["blocked_by"]?.stringValue, !reason.isEmpty {
         return BoardStopReason(text: reason,
                                help: "the run's own recorded reason for this step",
                                isStop: true)
     }
-    if let summary = row["summary"]?.stringValue, !summary.isEmpty {
-        return BoardStopReason(text: summary, help: summary, isStop: BoardStop.isStuck(row))
+    if let summary = payload["summary"]?.stringValue, !summary.isEmpty {
+        return BoardStopReason(text: summary, help: summary, isStop: BoardStop.isStuck(payload))
     }
-    let verdict = row["verdict"]?.stringValue ?? ""
-    let gloss = EngineWord.stop(verdict)
+    let verdict = payload["verdict"]?.stringValue ?? ""
+    let gloss = EngineWord.stop(verdict, words: words)
     guard !gloss.isEmpty else { return nil }
     return BoardStopReason(
         text: gloss,
@@ -1490,12 +1489,27 @@ private func boardStopReason(_ row: [String: JSONValue]) -> BoardStopReason? {
 ///
 /// The reason is the row's job rather than the board's: a person reads rows, and "guardrail-blocked"
 /// on one of them was unanswerable without it. The move that resolves it is the *board's*, because the
-/// engine names one per board (`engine/flow.py:408`), so it is stated once at the top of the board
+/// engine names one per board (`engine/flow.py:428`), so it is stated once at the top of the board
 /// where the engine names the step it is about.
 struct FlowRowView: View {
     let row: [String: JSONValue]
+    /// The engine's stop-token vocabulary, from the report this row came out of (`controller.stopWords`).
+    let words: StopWords
 
     private var tone: String { row["tone"]?.stringValue ?? "muted" }
+
+    /// The row as one spoken sentence: who, what state, and why it stopped when it did.
+    ///
+    /// A property rather than an expression in the view: the chain of `??` fallbacks inside the
+    /// `.accessibilityLabel` argument defeated the type checker ("unable to type-check this expression in
+    /// reasonable time"), and the label is a value the row has, not a layout decision.
+    private var accessibilityText: String {
+        let reason = boardStopReason(row, words: words)
+        return "\(row["node_id"]?.stringValue ?? "work"), "
+            + "\(row["agent_name"]?.stringValue ?? "unassigned"), "
+            + "\(EngineWord.board(row["status"]?.stringValue ?? "unknown"))"
+            + (reason.map { ", \($0.text)" } ?? "")
+    }
 
     private var colour: Color {
         switch tone {
@@ -1551,11 +1565,11 @@ struct FlowRowView: View {
                 }
                 // Why it stopped. This is the row's half of the answer to "guardrail-blocked on pm":
                 // the token means nothing on its own, and the engine's own reason for the row
-                // (`blocked_by`) or this build's gloss of the verdict is what says what happened. The
+                // (`blocked_by`) or its own gloss of the verdict is what says what happened. The
                 // raw verdict stays in the column on the right, so the token is never lost — only
                 // explained. What resolves it is the board's (`stuckNote`), because the engine names
                 // one recovery per board rather than one per row.
-                if let reason = boardStopReason(row) {
+                if let reason = boardStopReason(row, words: words) {
                     Text(reason.text)
                         .font(.caption)
                         .foregroundStyle(reason.isStop ? colour : .secondary)
@@ -1581,11 +1595,7 @@ struct FlowRowView: View {
         .background(colour.opacity(0.06))
         .cornerRadius(6)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(
-            "\(row["node_id"]?.stringValue ?? "work"), "
-            + "\(row["agent_name"]?.stringValue ?? "unassigned"), "
-            + "\(EngineWord.board(row["status"]?.stringValue ?? "unknown"))"
-            + (boardStopReason(row).map { ", \($0.text)" } ?? ""))
+        .accessibilityLabel(accessibilityText)
     }
 }
 

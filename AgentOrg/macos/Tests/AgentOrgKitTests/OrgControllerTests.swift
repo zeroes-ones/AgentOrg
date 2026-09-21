@@ -523,74 +523,50 @@ final class OrgControllerTests: XCTestCase {
                              "a refused ack must be logged — it explains the dead button")
     }
 
-    func testEverySystemGrantOfferedMatchesTheEnginesVocabulary() {
-        // The toggle list and the engine's `SystemConfig.CAPABILITIES` must agree. If they drift, the
-        // UI offers a grant the engine does not recognise — which reads as a checkbox that does
-        // nothing — or hides one it does, which reads as a missing feature. Pinned here because the
-        // two live in different languages and nothing else would catch it.
+    func testTheHireFormOffersWhateverTheEngineDeclared() {
+        // The form takes the grants as an argument and renders them; it holds no vocabulary of its own.
+        // That is the change that closed the old gap — the list it used to carry was hand-written, and
+        // the six grants it omitted were omitted silently, because a hand-written list is the only
+        // thing that can decide what it leaves out.
         //
-        // The engine side is *read from `engine/config.py`* rather than written out here. It used to be
-        // a hand-written list of six, and when the engine grew to twelve the guard did not fire — it
-        // was asserting the old vocabulary against itself. A drift guard with a copy of one side
-        // hardcoded is the drift it exists to catch, so this parses the declaration instead.
-        let offered = CapabilityChoice.groups
-            .flatMap { $0.choices.map(\.grant) }
-            .filter { $0.hasPrefix("system:") }
-        let engine = Self.declaredSystemGrants()
-        XCTAssertFalse(engine.isEmpty,
-                       "could not read SystemConfig.CAPABILITIES from engine/config.py — the guard is "
-                       + "not testing anything until that parse works again")
-        XCTAssertEqual(Set(offered), Set(engine),
-                       "the console and the engine must offer the same system grants")
+        // Where the caller gets them from (`controller.systemCapabilities`, decoded from the engine's
+        // `system` reply) is asserted against the live engine in `SystemPanelTests`, which can read
+        // `engine/config.py` and compare the two. What is pinned here is the *property* that makes that
+        // comparison possible: nothing is dropped, nothing is invented, and a grant no one has written
+        // wording for still appears.
+        let declared = ["system:state", "system:media", "system:hologram"]
+        let groups = CapabilityChoice.groups(systemGrants: declared)
+        let offered = groups.flatMap { $0.choices.map(\.grant) }.filter { $0.hasPrefix("system:") }
+        XCTAssertEqual(offered, declared, "the form must render the grants it was given, in order")
         XCTAssertEqual(offered.count, Set(offered).count,
                        "the console must not offer the same grant twice")
 
+        // A grant the app has never heard of appears with a placeholder rather than being dropped: an
+        // engine that adds a thirteenth grant must show up here before anyone writes its wording, and
+        // the placeholder is deliberately ugly so it reads as "no wording yet".
+        let unknown = CapabilityChoice.groups(systemGrants: ["system:hologram"])
+            .first { $0.isSystem }?.choices.first
+        XCTAssertEqual(unknown?.label, "Hologram")
+        XCTAssertFalse(unknown?.detail.isEmpty ?? true, "an unknown grant still says something")
+
         // System grants are grouped apart from file grants, because "may edit code" is not "may act on
         // my desktop" and the UI must not present them as one undifferentiated list.
-        let system = CapabilityChoice.groups.filter(\.isSystem)
+        let system = groups.filter(\.isSystem)
         XCTAssertEqual(system.count, 1, "system grants belong in exactly one group")
         XCTAssertTrue(system[0].choices.allSatisfy { $0.grant.hasPrefix("system:") })
-        XCTAssertFalse(CapabilityChoice.groups.filter { !$0.isSystem }
+        XCTAssertFalse(groups.filter { !$0.isSystem }
             .flatMap { $0.choices }.contains { $0.grant.hasPrefix("system:") })
 
         // Every choice explains itself: a grant with no stated consequence is one nobody can judge.
-        for group in CapabilityChoice.groups {
+        for group in groups {
             for choice in group.choices {
                 XCTAssertFalse(choice.label.isEmpty)
                 XCTAssertFalse(choice.detail.isEmpty, "\(choice.grant) must say what it reaches")
             }
         }
-    }
-
-    /// The `system:*` grants the engine declares, read from `engine/config.py`.
-    ///
-    /// Deliberately parsed rather than written out: the previous version of this guard carried a
-    /// hand-written copy of the engine's six-grant vocabulary, so when the engine grew to twelve the
-    /// guard still passed — it was comparing one stale list with another. Reading the declaration is
-    /// what makes this a guard rather than a restatement.
-    static func declaredSystemGrants() -> [String] {
-        let repository = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()   // AgentOrgKitTests
-            .deletingLastPathComponent()   // Tests
-            .deletingLastPathComponent()   // macos
-            .deletingLastPathComponent()   // AgentOrg
-        let config = repository.appendingPathComponent("engine/config.py")
-        guard let source = try? String(contentsOf: config, encoding: .utf8),
-              let start = source.range(of: "CAPABILITIES: tuple[str, ...] = ("),
-              // Bounded at the tuple's own closing line rather than the first `)`, because every
-              // entry carries a trailing comment and one of them mentions a parenthesis.
-              let end = source.range(of: "\n    )", range: start.upperBound..<source.endIndex)
-        else { return [] }
-        let body = String(source[start.upperBound..<end.lowerBound])
-        // `system:softwareupdate` has no digits and `system:state` no uppercase, so a lowercase-only
-        // class is enough; the grant grammar is fixed by the engine.
-        return body.split(separator: "\n").compactMap { line in
-            guard let open = line.firstIndex(of: "\""),
-                  let close = line[line.index(after: open)...].firstIndex(of: "\"")
-            else { return nil }
-            let grant = String(line[line.index(after: open)..<close])
-            return grant.hasPrefix("system:") ? grant : nil
-        }
+        // And an engine that has not answered yet offers the project grants only — nothing invented.
+        XCTAssertTrue(CapabilityChoice.groups(systemGrants: [])
+            .first { $0.isSystem }?.choices.isEmpty ?? false)
     }
 
     func testAGrantPayloadOmitsAnEmptyCapabilityList() {

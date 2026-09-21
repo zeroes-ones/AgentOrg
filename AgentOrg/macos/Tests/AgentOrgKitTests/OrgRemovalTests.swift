@@ -100,14 +100,46 @@ final class OrgRemovalTests: XCTestCase {
         return folder
     }
 
+    /// A credentials file inside the throwaway home, seeded with two keyless providers.
+    ///
+    /// **This test used to run against the developer's own `credentials.json`.** `credentialsPath` was
+    /// `nil`, so the engine discovered the real file — and `removeProvider`, which is precisely what
+    /// this test exists to exercise, *wrote* to it. It destroyed the owner's live config twice: once
+    /// taking an inline API key with it, and once leaving a single keyless provider, after which the
+    /// engine could not boot at all. The test's own comment admitted the mechanism ("the throwaway home
+    /// has no credentials file, so the engine resolves from the one it was launched with") and treated
+    /// it as acceptable. `AGENTORG_HOME` was never enough: that protects the *register*, not the config.
+    ///
+    /// Two providers, because removing the default must leave a different one to resolve — the property
+    /// the test asserts. Both are `ollama`-kind so no key is needed and the child can always build them.
+    private func seedCredentials(in home: URL) throws -> URL {
+        let path = home.appendingPathComponent("credentials.json")
+        let document: [String: Any] = [
+            "providers": [
+                "alpha": ["kind": "ollama", "base_url": "http://127.0.0.1:11434"],
+                "beta": ["kind": "ollama", "base_url": "http://127.0.0.1:11434"],
+            ],
+            "defaults": ["provider": "alpha", "model": "qwen2.5-coder:7b"],
+            "models": ["known": ["qwen2.5-coder:7b": ["context_window": 32768]]],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: document,
+                                              options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+        return path
+    }
+
     private func makeController(project: URL) throws -> OrgController {
         guard let engineRoot else {
             throw XCTSkip("the engine package is not available from this checkout")
         }
+        let credentials = try seedCredentials(in: home)
         let settings = OrgController.OrgSettings(
             engineRoot: engineRoot,
             projectPath: project,
-            credentialsPath: nil,
+            // The throwaway file this test seeds. Without it the engine discovers the developer's real
+            // config and every removal below edits it — see `seedCredentials`.
+            credentialsPath: credentials,
             libraryRoot: nil,
             // The one thing that keeps a test from editing the user's real register.
             extraEnvironment: ["AGENTORG_HOME": home.path])

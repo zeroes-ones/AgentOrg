@@ -73,38 +73,65 @@ public struct SpineModel: Equatable, Sendable {
         public let detail: String
         /// The CLI command the engine named, for the cases the app cannot perform itself.
         public let command: String
+        /// Whether the engine says a console can carry this action out itself.
+        ///
+        /// **The engine's answer, not a list of kinds kept here.** This used to be a `switch` over the
+        /// kinds `_next_action` can emit, which meant every kind the engine gained was a kind this app
+        /// had no opinion about until someone widened the switch — the day `retry` appeared, the app's
+        /// silence on it was correct only by accident. The engine now answers with the action
+        /// (`activity._NEXT_PERFORMABLE`, sent as `performable`), and this reads it.
+        public let performable: Bool
+        /// What performing it still needs, in the engine's vocabulary — `""` when nothing does.
+        ///
+        /// One token is in play: `NextLine.gate`, meaning the offer is the person's only while the gate
+        /// is still theirs to answer. That is the one condition the *app* holds — whether the engine has
+        /// since answered the gate itself, and what the goal's posture allows, are read from payloads
+        /// this line does not carry — so the engine names it and `canPerform` supplies the state.
+        public let needs: String
+
+        /// The engine's word for "this is the person's only while the gate still is theirs".
+        ///
+        /// A constant rather than a literal in two places, and a *read* of the engine's vocabulary
+        /// rather than a second definition of it: `activity._NEXT_PERFORMABLE` is where the token is
+        /// written, and the payload carries whatever it says.
+        public static let gate = "gate"
+
+        /// No defaults on the two engine answers: they are what the engine said, and a default would let
+        /// a caller produce a confident `false` the engine never gave.
+        public init(kind: String, label: String, detail: String, command: String,
+                    performable: Bool, needs: String) {
+            self.kind = kind
+            self.label = label
+            self.detail = detail
+            self.command = command
+            self.performable = performable
+            self.needs = needs
+        }
 
         /// Whether the console can honestly offer to do this action itself.
         ///
-        /// Each kind that returns true has a real destination behind it, so no button here is one that
-        /// silently does nothing:
+        /// Two fields and one local fact, so no button here is one that silently does nothing:
         ///
-        /// * `resume` — the goal is paused and the console resumes it.
-        /// * `decide` — only when the gate is *this person's*; the gate row above carries the buttons.
-        /// * `hire` — opens Org, where a hire is made. The console does not re-implement the hire form.
-        /// * `start` — starts a run for the goal the engine is holding, through the same
-        ///   `OrgController.startRun` the composer's own Start button calls.
-        /// * `investigate` — opens Runs, which is where a stopped run's nodes, verdicts and handoffs are
-        ///   read.
+        /// * `performable` — the engine's own answer, true for the kinds that lead somewhere in this
+        ///   app: `resume` (the goal is paused and the console resumes it), `hire` (opens Org, where a
+        ///   hire is made — the console does not re-implement the hire form), `start` (the composer's
+        ///   own Start, through `OrgController.startRun`), `investigate` (opens Runs, which is where a
+        ///   stopped run's nodes, verdicts and handoffs are read), and `decide` (the gate row above
+        ///   carries the buttons).
+        /// * `needs == NextLine.gate` — the offer is conditional on the gate being the person's, which
+        ///   is `GateDisposition`'s reading of the engine's own refusal, not a rule invented here.
         ///
-        /// The kinds are the ones `engine/activity.py::_next_action` can emit (`:419`, in that order:
-        /// `decide`, `hire`, `investigate`, `retry`, `resume`, `start`), and one of them is answered
-        /// `false` on purpose:
-        ///
-        /// * `retry` — the engine's answer for a node that cannot advance: "re-run the graph so <node>
-        ///   gets another attempt", with `flow.recovery_command`'s command (`engine/activity.py:451`,
-        ///   `engine/flow.py:367`). The console **cannot** perform it: no `serve` command runs a graph,
-        ///   and its `start` *plans* a goal and points a new run at a new graph (`engine/serve.py:1168`),
-        ///   which is a different run and a new spend. The command is shown instead, as it is for any
-        ///   kind this build does not know — and the board's own header shows the same move, taken from
-        ///   `flow.next` (`BoardNext`).
+        /// Everything else is answered `false`, which is the engine's answer too: `retry` names a move
+        /// only a command makes — "re-run the graph so <node> gets another attempt", with
+        /// `flow.recovery_command`'s command (`engine/activity.py:490`, `engine/flow.py:387`). The
+        /// console **cannot** perform it: no `serve` command runs a graph, and its `start` *plans* a
+        /// goal and points a new run at a new graph (`engine/serve.py:1168`), which is a different run
+        /// and a new spend. The command is shown instead — as it is for a kind this build has never
+        /// seen, which is what makes an engine that adds one tomorrow work without an edit here. The
+        /// board's own header shows the same move, taken from `flow.next` (`BoardNext`).
         public func canPerform(gateIsWaitingForHuman: Bool) -> Bool {
-            switch kind {
-            case "resume", "hire", "start", "investigate": return true
-            case "decide": return gateIsWaitingForHuman
-            case "retry": return false
-            default: return false
-            }
+            if performable { return true }
+            return needs == Self.gate && gateIsWaitingForHuman
         }
     }
 
@@ -152,7 +179,7 @@ public struct SpineModel: Equatable, Sendable {
 
 /// Whether a board row stopped short — the engine's own predicate, mirrored so it has one home here.
 ///
-/// `engine/flow.py:258` (`is_stuck`) is the rule the engine itself uses for the board's `Stuck`
+/// `engine/flow.py:278` (`is_stuck`) is the rule the engine itself uses for the board's `Stuck`
 /// figure, the row's tone, the headline's sentence and the board's `next`: a node that has not
 /// finished, and whose status *or* whose verdict names a stop (`engine/flow.py:130-131`). It is asked
 /// before the working/waiting tallies there, "because a row can be *both*" — a checkpoint carrying a
@@ -179,7 +206,7 @@ public enum BoardStop {
     /// The statuses that mean a node is finished, which outrank any verdict left on the record.
     public static let finishedStatuses: Set<String> = ["done", "pass", "skipped"]
 
-    /// Whether a node with this status and verdict stopped short — `engine/flow.py:258`, mirrored.
+    /// Whether a node with this status and verdict stopped short — `engine/flow.py:278`, mirrored.
     public static func isStuck(status: String, verdict: String) -> Bool {
         if finishedStatuses.contains(status) { return false }
         return stuckStatuses.contains(status) || stuckVerdicts.contains(verdict)
@@ -194,13 +221,13 @@ public enum BoardStop {
 /// The move the engine names for what the board is showing, taken apart so a person can read it.
 ///
 /// `flow.next` is **one line**, by design: the command, then `systemcli.NEXT_SEP`, then why that
-/// command is the one (`engine/flow.py:408`, `_next_line`). The engine shapes it that way so the
+/// command is the one (`engine/flow.py:428`, `_next_line`). The engine shapes it that way so the
 /// `--json` value and the terminal line are the same sentence, and so "a caller that wants only the
 /// command takes the text before the separator" (`engine/systemcli.py:40`). This is that caller.
 ///
 /// **Why this is text and not a button.** The console may only offer an action it can deliver, and it
 /// cannot deliver this one: the engine's recovery for a stopped board is `engine.cli run --slug …
-/// --manifest …` (`engine/flow.py:367`, `recovery_command`), and `engine/serve.py` has no command that
+/// --manifest …` (`engine/flow.py:387`, `recovery_command`), and `engine/serve.py` has no command that
 /// runs a graph — its `start` *plans* a goal and points a new run at a new graph (`_cmd_start`, `:1168`),
 /// which is a different run and a new spend, not a re-run of this manifest. So the command is rendered
 /// as selectable text, the way this app already renders a path it cannot open, and it is run where it
@@ -382,6 +409,9 @@ extension SpineModel {
     /// When a gate is the person's, the gate row *is* the next action and saying it twice would be
     /// noise — so the engine's `decide` label is kept as the sentence (it is the engine's own words
     /// and names the gate) while the buttons live on the gate row, where the evidence is.
+    ///
+    /// `performable` and `needs` are read straight from the action: they are the engine's answer to
+    /// whether a console can do this, which is the one thing this app must not work out for itself.
     private static func nextLine(_ input: SpineInput, gate: GateLine?) -> NextLine? {
         let action = input.activity["next_action"]?.objectValue
         let kind = action?["kind"]?.stringValue ?? ""
@@ -390,13 +420,17 @@ extension SpineModel {
             // No engine report yet (the engine may be down, or nothing has run). If a gate is on
             // screen it is still the next thing, and saying so is better than saying nothing.
             if let gate, gate.canAct {
+                // Built here rather than decoded, so it carries the same two fields the engine's own
+                // `decide` action does — the gate row's `canAct` *is* the condition `needs` names.
                 return NextLine(kind: "decide", label: "Decide \(gate.reason)", detail: gate.why,
-                                command: "")
+                                command: "", performable: false, needs: NextLine.gate)
             }
             return nil
         }
         return NextLine(kind: kind, label: label,
                         detail: action?["detail"]?.stringValue ?? "",
-                        command: action?["command"]?.stringValue ?? "")
+                        command: action?["command"]?.stringValue ?? "",
+                        performable: action?["performable"]?.boolValue ?? false,
+                        needs: action?["needs"]?.stringValue ?? "")
     }
 }

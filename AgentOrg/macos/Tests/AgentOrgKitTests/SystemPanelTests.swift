@@ -110,6 +110,42 @@ final class SystemPanelTests: XCTestCase {
         return out
     }
 
+    /// Every tool name in `CATALOGUE`, in the catalogue's order and including repeats.
+    ///
+    /// The order matters here — it is the order the engine advertises tools in, and the reason the
+    /// console's rows read as `syscap` intends — so this one does *not* deduplicate: comparing it with
+    /// what the payload carries checks the sequence, not just the set.
+    static func toolNames(in source: String) -> [String] {
+        guard let start = source.range(of: "CATALOGUE: tuple[CatalogEntry, ...] = ("),
+              let end = source.range(of: "\nMUTATING_TOOLS", range: start.upperBound..<source.endIndex)
+        else { return [] }
+        return ordered(in: String(source[start.lowerBound..<end.lowerBound]),
+                       pattern: "name=\"([a-z_]+)\"")
+    }
+
+    /// The tools `CONSENT_REQUIRED` names — the ask-once set, read from its own declaration.
+    ///
+    /// A separate parse rather than a filter over the catalogue, because the two are separate
+    /// declarations in `sysctl_tools.py` and it is their *agreement* with the payload that is being
+    /// checked. Bounded at the closing `})` of the frozenset, which is the only `})` on its own line
+    /// in that block.
+    static func consentNames(in source: String) -> [String] {
+        guard let start = source.range(of: "CONSENT_REQUIRED: frozenset[str] = frozenset({"),
+              let end = source.range(of: "\n})", range: start.upperBound..<source.endIndex)
+        else { return [] }
+        return literals(in: String(source[start.lowerBound..<end.lowerBound]),
+                        pattern: "\"([a-z_]+)\"")
+    }
+
+    /// First captures of `pattern`, in order, repeats kept.
+    private static func ordered(in text: String, pattern: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let full = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.matches(in: text, range: full).compactMap { match in
+            Range(match.range(at: 1), in: text).map { String(text[$0]) }
+        }
+    }
+
     // MARK: - Decoding, with no engine required
 
     private func payload(_ entries: [[String: JSONValue]]) -> [String: JSONValue] {
@@ -380,5 +416,57 @@ final class SystemPanelTests: XCTestCase {
         await controller.loadSystem()
         XCTAssertFalse(controller.system.isEmpty, "the engine answered the `system` command")
         XCTAssertFalse(controller.systemCapabilities.isEmpty)
+    }
+
+    // MARK: - The catalogue and the grants the app acts on, checked against the engine's sources
+
+    func testTheToolListTheAppHoldsIsTheEnginesCatalogue() async throws {
+        // The guard for the deleted mirror. `SystemTools.all` was eighteen hand-written rows pointing at
+        // `sysctl_tools.py` line numbers, which meant a tool added to the catalogue was a row the app
+        // did not have until someone copied it across. The rows now arrive in the `system` reply, and
+        // this compares them with the catalogue *as the engine declares it* — names in the catalogue's
+        // own order, and the ask-once set read from `CONSENT_REQUIRED`'s own block.
+        let source = try engineSource("engine/sysctl_tools.py")
+        let names = Self.toolNames(in: source)
+        let consent = Set(Self.consentNames(in: source))
+        XCTAssertFalse(names.isEmpty, "could not read `CATALOGUE` — this guard is not testing anything")
+        XCTAssertFalse(consent.isEmpty, "could not read `CONSENT_REQUIRED`")
+
+        let controller = try await launchedController()
+        defer { controller.stop() }
+        await controller.loadSystem()
+
+        let catalog = controller.systemToolCatalog
+        XCTAssertEqual(catalog.all.map(\.name), names,
+                       "the console's tool list must be the catalogue, in the catalogue's order")
+        XCTAssertEqual(Set(catalog.consentRequired.map(\.name)), consent,
+                       "the approvals section must list exactly what `CONSENT_REQUIRED` names")
+        // A tool that no longer exists is refused by `system_invoke`, so a row for one is a button that
+        // can only fail — and the tools are grouped under the grants the *same* reply declared.
+        let declared = Set(Self.declaredGrants(in: try engineSource("engine/config.py")))
+        for tool in catalog.all {
+            XCTAssertTrue(declared.contains(tool.grant),
+                          "\(tool.name) is filed under \(tool.grant), which the config does not declare")
+        }
+        XCTAssertGreaterThan(catalog.all.count, 3, "the catalogue should declare tools")
+    }
+
+    func testTheHireFormIsOfferedExactlyTheGrantsTheEngineDeclares() async throws {
+        // The end-to-end version of the guard that used to live in `OrgControllerTests` with the
+        // engine's list hardcoded beside it. The form takes its grants as an argument and the caller
+        // reads them from this reply, so the two halves are now checked against `engine/config.py`
+        // itself — a thirteenth grant is offerable the moment the config declares it, tools or no tools.
+        let declared = Self.declaredGrants(in: try engineSource("engine/config.py"))
+        XCTAssertEqual(declared.count, 12, "the config declares twelve capabilities")
+
+        let controller = try await launchedController()
+        defer { controller.stop() }
+        await controller.loadSystem()
+
+        let offered = CapabilityChoice.groups(systemGrants: controller.systemCapabilities.map(\.grant))
+            .flatMap { $0.choices.map(\.grant) }
+            .filter { $0.hasPrefix("system:") }
+        XCTAssertEqual(offered, declared,
+                       "the hire form and the engine must not disagree about which grants exist")
     }
 }
