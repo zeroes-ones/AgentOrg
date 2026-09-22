@@ -852,6 +852,28 @@ def test_the_provider_list_names_the_config_file(tmp_path):
     assert server._cmd_providers({})["config_path"] == str(creds)
 
 
+def test_the_provider_kinds_are_the_configs_own_tuple(tmp_path):
+    """The console's kind picker is built from this reply, so a dialect the engine accepts cannot be
+    missing from it and one it refuses cannot appear. `SetupPane` used to spell the three by hand,
+    which is a second copy of `config.SUPPORTED_KINDS` — the copy the reply replaces."""
+    from engine.config import SUPPORTED_KINDS
+
+    server, _ = _server_with_creds(tmp_path)
+    assert server._cmd_providers({})["kinds"] == list(SUPPORTED_KINDS)
+
+
+def test_the_agents_reply_carries_the_levels_and_roles_a_hire_may_name(tmp_path):
+    """The hire form's pickers read these. The form listed five of `people.LEVELS`' six names, so
+    `mid` could not be chosen from the app; the reply now carries the engine's own tables instead."""
+    from engine.people import HIRE_ROLES, LEVELS
+
+    server, _ = _server_with_creds(tmp_path)
+    reply = server._cmd_agents({})
+    assert reply["levels"] == list(LEVELS)
+    assert "mid" in reply["levels"]
+    assert reply["roles"] == list(HIRE_ROLES)
+
+
 def test_provider_add_saves_and_reloads_in_place(tmp_path):
     server, creds = _server_with_creds(tmp_path)
     server._cmd_provider_add({"provider_id": "groq", "kind": "openai",

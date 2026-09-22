@@ -168,6 +168,44 @@ final class EngineDerivationTests: XCTestCase {
                        "one token is described one way even if two reports somehow disagree")
     }
 
+    // MARK: - The hire and provider vocabularies, decoded
+
+    func testTheHireLevelsAreDecodedFromTheReplyNotListedInSwift() {
+        // `people.LEVELS` resolves six names; the hire form spelled five of them, so `mid` — which the
+        // engine accepts for `hire --level` — could not be chosen from the app at all. The decode keeps
+        // whatever the engine sent, in the engine's order.
+        let vocabulary = HireVocabulary([
+            "levels": .array(["junior", "practitioner", "mid", "senior", "staff", "principal"]
+                .map { .string($0) }),
+            "roles": .array(["worker", "reviewer"].map { .string($0) }),
+        ])
+        XCTAssertEqual(vocabulary.levels,
+                       ["junior", "practitioner", "mid", "senior", "staff", "principal"])
+        XCTAssertTrue(vocabulary.levels?.contains("mid") == true,
+                      "the level the app used to make unreachable")
+        XCTAssertEqual(vocabulary.roles, ["worker", "reviewer"])
+    }
+
+    func testAVocabularyThatHasNotArrivedIsNilAndNotEmpty() {
+        // The distinction the forms draw: a reply with no `levels` (or `kinds`) key is "the engine has
+        // not answered", which must not render as an empty picker claiming there are none. An empty
+        // array *is* the engine's own answer and is kept as one.
+        XCTAssertNil(HireVocabulary([:]).levels)
+        XCTAssertNil(HireVocabulary(["levels": .null]).levels)
+        XCTAssertNil(ProviderKindVocabulary([:]).kinds)
+        XCTAssertEqual(HireVocabulary(["levels": .array([])]).levels, [])
+        XCTAssertEqual(ProviderKindVocabulary(["kinds": .array([])]).kinds, [])
+    }
+
+    func testTheProviderKindsAreDecodedFromTheReply() {
+        // The editor's three tags (`openai`/`anthropic`/`ollama`) were a second copy of
+        // `config.SUPPORTED_KINDS`. The reply's `kinds` is the only source now, so a fourth dialect the
+        // engine accepts appears without an edit here.
+        let vocabulary = ProviderKindVocabulary(
+            ["kinds": .array(["openai", "anthropic", "ollama", "gemini"].map { .string($0) })])
+        XCTAssertEqual(vocabulary.kinds, ["openai", "anthropic", "ollama", "gemini"])
+    }
+
     // MARK: - The source guards
 
     func testTheCapabilityFileHasNoToolListAndNoGrantListOfItsOwn() throws {
@@ -276,5 +314,21 @@ final class EngineDerivationTests: XCTestCase {
                        "the deleted mirror is still being read")
         XCTAssertFalse(contains("static (var|let) (systemChoices|groups)\\b", in: text),
                        "the form must take the grants as an argument, not hold a list of its own")
+    }
+
+    func testTheHireFormSpellsNoLevelListAndTheProviderFormNoKindList() throws {
+        // The two copies this change deletes, in the shape they took. `SetupPane.kindWording` *does*
+        // contain the three kind names and they are allowed — they are the labels a tag is shown with,
+        // keyed by the engine's list, the same allowance `CapabilityChoice.systemWording` takes. What
+        // may not appear is a `.tag("openai")` (a kind *offered* from Swift) or a level array (a level
+        // offered from Swift).
+        let hire = try source("macos/Sources/AgentOrg/OrgPane.swift")
+        XCTAssertFalse(contains("\\[\"junior\"", in: hire),
+                       "a hand-written level list: the levels are the engine's to declare")
+        let setup = try source("macos/Sources/AgentOrg/SetupPane.swift")
+        for kind in ["openai", "anthropic", "ollama"] {
+            XCTAssertFalse(contains("\\.tag\\(\"\(kind)\"\\)", in: setup),
+                           ".tag(\"\(kind)\") offers a kind from Swift; decode the reply's `kinds`")
+        }
     }
 }

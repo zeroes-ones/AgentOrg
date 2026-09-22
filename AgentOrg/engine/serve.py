@@ -1132,8 +1132,15 @@ class Server:
         **No key is ever returned.** `has_key` and `api_key_env` are what the UI shows; the value
         itself stays in the file, because a secret that crosses the socket is a secret in a log, a
         screenshot and a crash report.
+
+        **`kinds` is the engine's own list of provider dialects.** It travels here rather than the form
+        spelling them out: `config.SUPPORTED_KINDS` is the set a write is accepted for, and the app's
+        picker is built from this reply, so a fourth dialect appears in the console the moment the
+        engine declares it — the same "one copy" rule `serve._cmd_system` follows for the capability
+        list (`syscap.console_payload`) and `_cmd_agents` for the hire levels.
         """
         from .catalog import ModelCatalog
+        from .config import SUPPORTED_KINDS
         from .providers.registry import build_providers
 
         _, skipped = build_providers(self.config)
@@ -1179,7 +1186,8 @@ class Server:
         return {
             "providers": entries,
             "skipped": list(skipped),
-            "kinds": ["openai", "anthropic", "ollama"],
+            # Derived, never restated: this is the same tuple `config.load` validates a write against.
+            "kinds": list(SUPPORTED_KINDS),
             # Tell the console which file an edit will touch, so the panel can show the path rather
             # than the operator having to guess which of the candidates was loaded.
             "config_path": str(self.config.path) if self.config.path else "",
@@ -1371,14 +1379,18 @@ class Server:
         Shared by test and add so the two cannot disagree about what a valid entry is — a provider
         that tests green and then fails to save is worse than one that fails both.
         """
-        from .config import ProviderConfig
+        from .config import ProviderConfig, SUPPORTED_KINDS
 
         pid = str(payload.get("provider_id") or payload.get("id") or "").strip()
         if not pid:
             raise ServerError("a provider needs an id")
-        kind = str(payload.get("kind") or "openai").strip().lower()
-        if kind not in ("openai", "anthropic", "ollama"):
-            raise ServerError(f"unsupported provider kind {kind!r}; use openai, anthropic or ollama")
+        kind = str(payload.get("kind") or SUPPORTED_KINDS[0]).strip().lower()
+        # The accepted set is `config.SUPPORTED_KINDS`, not a tuple written here: a dialect added to the
+        # config must be writable from the console without a second edit, and a second copy is a copy
+        # that can refuse what the loader would accept.
+        if kind not in SUPPORTED_KINDS:
+            raise ServerError(f"unsupported provider kind {kind!r}; use "
+                              f"{', '.join(SUPPORTED_KINDS)}")
         base_url = str(payload.get("base_url") or "").strip()
         if not base_url:
             raise ServerError("a provider needs a base_url")
@@ -1569,6 +1581,7 @@ class Server:
         value must be refused at the write, not discovered as a broken engine afterwards.
         """
         from .config import ConfigError, set_autonomy
+        from .goal import Posture
 
         if not self.config.path:
             raise ServerError("this engine was started without a credentials file")
@@ -1583,9 +1596,13 @@ class Server:
             goal["auto_hire_max_tier"] = int(payload["auto_hire_max_tier"])
         posture = str(payload.get("posture") or "").strip().lower()
         if posture:
-            if posture not in ("unattended", "supervised"):
+            # The accepted set is `goal.Posture`, the enum that decides what each posture means — not
+            # the two words written here. A third posture would otherwise be refused by this guard
+            # while `GoalPolicy` accepted it, which is the drift the CLI's `--posture` was cured of.
+            accepted = {p.value for p in Posture}
+            if posture not in accepted:
                 raise ServerError(
-                    f"unknown posture {posture!r}; expected 'unattended' or 'supervised'")
+                    f"unknown posture {posture!r}; expected one of {', '.join(sorted(accepted))}")
             goal["default_posture"] = posture
         if not goal:
             raise ServerError("autonomy_set needs at least one setting")
@@ -1984,7 +2001,15 @@ class Server:
         The built-ins are included, because they *are* the org until the Owner changes it — a panel
         that listed only hired agents would look empty on a fresh install while seven agents were
         actually running. `origin` distinguishes them, and `editable` says which can be changed.
+
+        **`levels` and `roles` are the vocabularies a hire may name.** They travel with this reply —
+        the one the hire form already fetches for the roster and the skills — so the form's pickers are
+        built from `people.LEVELS` and `people.HIRE_ROLES` rather than spelling them out. That was not
+        cosmetic: the app listed five of `LEVELS`' six names, so `mid` could not be chosen from the
+        console at all. `levels` is the dict's own order (the declared order) and `roles` the tuple's.
         """
+        from .people import HIRE_ROLES, LEVELS
+
         people = self._people()
         org = people.load(project=self._project_dir())
         agents: list[dict[str, Any]] = []
@@ -2013,6 +2038,10 @@ class Server:
                          if a["origin"] == "owner" and a.get("id") != "ag_owner"),
             "roster_path": str(self._roster_file()),
             "skills": self._skill_names(),
+            # The hire vocabulary, from the engine's own constants. `levels` is every name `hire`
+            # resolves `--level` through — including the `mid` alias the app used to drop.
+            "levels": list(LEVELS),
+            "roles": list(HIRE_ROLES),
         }
 
     def _cmd_agent_update(self, payload: dict[str, Any]) -> dict[str, Any]:

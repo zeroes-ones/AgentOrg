@@ -95,6 +95,12 @@ public final class OrgController: ObservableObject {
     @Published public private(set) var providers: [[String: JSONValue]] = []
     /// The file a provider edit writes, so the panel can show it rather than describe it vaguely.
     @Published public private(set) var providersConfigPath: String = ""
+    /// The provider kinds the engine accepts, as it reported them (`ProviderKindVocabulary`).
+    ///
+    /// Empty (nil kinds) until the first `providers` reply, so the editor says "the engine has not
+    /// sent its kinds" rather than drawing a picker with nothing in it — the state a hand-written
+    /// list would have hidden by always having something to show.
+    @Published public private(set) var providerKindVocabulary = ProviderKindVocabulary([:])
     /// The result of the most recent provider test: reachable, why not, and what models it offered.
     @Published public private(set) var providerTest: [String: JSONValue] = [:]
     /// The engine's reply to the most recent provider save: the base it actually stored, and its note
@@ -130,6 +136,12 @@ public final class OrgController: ObservableObject {
     @Published public private(set) var roster: [[String: JSONValue]] = []
     /// The file a hire writes.
     @Published public private(set) var rosterPath: String = ""
+    /// The levels and roles a hire may name, as the engine reported them (`HireVocabulary`).
+    ///
+    /// Empty (nil lists) until the first `agents` reply. The form reads the *engine's* list rather than
+    /// spelling one out — it listed five of `people.LEVELS`' six names, so `mid` was unreachable from
+    /// the app.
+    @Published public private(set) var hireVocabulary = HireVocabulary([:])
     /// The durable goal: objective, state, whether the loop will continue, and what it has spent.
     @Published public private(set) var goal: [String: JSONValue] = [:]
     /// The activity report: the one ordered story of what the org is doing, why it stopped, and what
@@ -2681,6 +2693,9 @@ public final class OrgController: ObservableObject {
     // MARK: - Providers
 
     /// Load every configured provider, its discovery status and its models.
+    ///
+    /// The reply also carries `kinds` — the dialects a write is accepted for — so the editor's picker
+    /// is built from the engine's answer rather than from a list spelled in Swift.
     public func loadProviders() async {
         await fetch("providers") { [weak self] payload in
             guard let self else { return }
@@ -2688,6 +2703,7 @@ public final class OrgController: ObservableObject {
                 self.providers = list.compactMap { $0.objectValue }
             }
             self.providersConfigPath = payload["config_path"]?.stringValue ?? ""
+            self.providerKindVocabulary = ProviderKindVocabulary(payload)
         }
     }
 
@@ -2848,7 +2864,11 @@ public final class OrgController: ObservableObject {
 
     // MARK: - Agents
 
-    /// Load the editable roster and the skills an agent can be hired for.
+    /// Load the editable roster, the skills an agent can be hired for, and the hire vocabulary.
+    ///
+    /// The reply also carries `levels` and `roles` — the names a hire may use — so the level picker is
+    /// built from the engine's `people.LEVELS` rather than from a list spelled in Swift. That list had
+    /// five of the six names, which made `mid` unreachable from the app.
     public func loadRoster() async {
         await fetch("agents") { [weak self] payload in
             guard let self else { return }
@@ -2859,6 +2879,7 @@ public final class OrgController: ObservableObject {
                 self.skills = names.compactMap { $0.stringValue }.sorted()
             }
             self.rosterPath = payload["roster_path"]?.stringValue ?? ""
+            self.hireVocabulary = HireVocabulary(payload)
         }
     }
 

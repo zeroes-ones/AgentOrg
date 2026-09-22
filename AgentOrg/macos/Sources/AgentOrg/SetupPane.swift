@@ -733,6 +733,50 @@ struct ProviderEditor: View {
         await controller.reloadProviderAndModels()
     }
 
+    /// The wording beside one provider kind, keyed by the engine's own tag.
+    ///
+    /// A lookup, not a list: which kinds are *offered* is `config.SUPPORTED_KINDS`, arriving in the
+    /// `providers` reply, and a kind this table has never heard of still appears — under its own name —
+    /// rather than being dropped. The prose lives here because it cannot be derived, the same allowance
+    /// `CapabilityChoice.systemWording` takes for the grants.
+    ///
+    /// Two entries carry something a tag cannot: "Local Ollama (api/chat)" is named for where it points,
+    /// not the vendor. "Ollama" was ambiguous enough to send someone adding Ollama's *cloud*
+    /// (`https://ollama.com/v1`, which speaks the OpenAI dialect) to the `ollama` kind, which targets a
+    /// **local server's** `/api/chat` route — producing `…/chat/completions/api/chat`, a 404 that read
+    /// as a broken key or URL when the only wrong thing was the picker's label.
+    private static let kindWording: [String: String] = [
+        "openai": "OpenAI-compatible",
+        "anthropic": "Anthropic",
+        "ollama": "Local Ollama (api/chat)",
+    ]
+
+    /// The provider-kind picker, built from the kinds **the engine sent**.
+    ///
+    /// A missing vocabulary is drawn as the fact it is, not as an empty picker: nil means the engine
+    /// has not answered yet (an older reply, a launch still booting), which is not "there are no kinds".
+    @ViewBuilder
+    private var providerKindPicker: some View {
+        if let kinds = controller.providerKindVocabulary.kinds, !kinds.isEmpty {
+            Picker("", selection: $draft.kind) {
+                ForEach(kinds, id: \.self) { kind in
+                    Text(Self.kindWording[kind] ?? kind).tag(kind)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 200)
+            .accessibilityLabel("Provider kind")
+        } else {
+            Label(controller.providerKindVocabulary.kinds == nil
+                      ? "Kind unavailable — the engine sent no kinds"
+                      : "Kind unavailable — the engine lists none",
+                  systemImage: "exclamationmark.triangle")
+                .font(.caption2).foregroundStyle(.secondary)
+                .frame(width: 200, alignment: .leading)
+                .accessibilityLabel("Provider kind unavailable: the engine has not sent a list")
+        }
+    }
+
     private var fields: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
@@ -740,19 +784,7 @@ struct ProviderEditor: View {
                     .textFieldStyle(.roundedBorder)
                     .disabled(editing != nil)
                     .accessibilityLabel("Provider id")
-                Picker("", selection: $draft.kind) {
-                    Text("OpenAI-compatible").tag("openai")
-                    Text("Anthropic").tag("anthropic")
-                    // Named for where it points, not for the vendor. "Ollama" was ambiguous enough to
-                    // send someone adding Ollama's *cloud* (`https://ollama.com/v1`, which speaks the
-                    // OpenAI dialect) to the `ollama` kind, which targets a **local server's**
-                    // `/api/chat` route. The result was `…/chat/completions/api/chat` — a 404 that read
-                    // as a broken key or URL, when the only wrong thing was the picker's label.
-                    Text("Local Ollama (api/chat)").tag("ollama")
-                }
-                .labelsHidden()
-                .frame(width: 200)
-                .accessibilityLabel("Provider kind")
+                providerKindPicker
             }
 
             TextField("base_url (e.g. https://api.groq.com/openai/v1)", text: $draft.baseURL)

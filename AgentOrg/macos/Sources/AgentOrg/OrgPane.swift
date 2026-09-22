@@ -361,13 +361,7 @@ struct HireForm: View {
                 .frame(maxWidth: 320)
                 .accessibilityLabel("What this agent does")
 
-                Picker("Level", selection: $draft.level) {
-                    ForEach(["junior", "practitioner", "senior", "staff", "principal"], id: \.self) {
-                        Text($0.capitalized).tag($0)
-                    }
-                }
-                .frame(width: 170)
-                .accessibilityLabel("Seniority level")
+                levelPicker
             }
 
             HStack(spacing: 8) {
@@ -458,6 +452,39 @@ struct HireForm: View {
         editingId = nil
         draft = AgentDraft()
         original = nil
+    }
+
+    /// The level picker, built from the levels **the engine sent** (`serve._cmd_agents`'s `levels`,
+    /// read from `people.LEVELS`).
+    ///
+    /// Not spelled here, and that was a real bug rather than a tidiness point: the list this replaces
+    /// was `junior, practitioner, senior, staff, principal` — five of the six names `LEVELS` resolves —
+    /// so `mid`, which the engine accepts for `hire --level`, could not be chosen from the app at all.
+    /// A hand-written list is the only thing that can decide which entries it omits, and nothing on
+    /// either surface could see the omission.
+    ///
+    /// A missing vocabulary is drawn as the fact it is. `hireVocabulary.levels` nil means the engine
+    /// has not answered (an older reply, a launch still booting), which is not the same as "there are
+    /// no levels"; a picker with nothing in it would say the second while meaning the first.
+    @ViewBuilder
+    private var levelPicker: some View {
+        if let levels = controller.hireVocabulary.levels, !levels.isEmpty {
+            Picker("Level", selection: $draft.level) {
+                ForEach(levels, id: \.self) { level in
+                    Text(level.capitalized).tag(level)
+                }
+            }
+            .frame(width: 170)
+            .accessibilityLabel("Seniority level")
+        } else {
+            Label(controller.hireVocabulary.levels == nil
+                      ? "Level unavailable — the engine sent no levels"
+                      : "Level unavailable — the engine lists none",
+                  systemImage: "exclamationmark.triangle")
+                .font(.caption2).foregroundStyle(.secondary)
+                .frame(width: 170, alignment: .leading)
+                .accessibilityLabel("Seniority level unavailable: the engine has not sent a list")
+        }
     }
 
     /// The models of the chosen provider, so the two pickers stay consistent.

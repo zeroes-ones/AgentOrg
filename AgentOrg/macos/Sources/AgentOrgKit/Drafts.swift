@@ -169,6 +169,47 @@ public struct AgentDraft: Sendable, Equatable {
     }
 }
 
+// MARK: - The vocabularies the engine owns
+
+/// The provider kinds a write is accepted for, decoded from the `providers` reply.
+///
+/// **Why this decodes and does not list.** The editor spelled the three kinds inline
+/// (`openai`/`anthropic`/`ollama`) beside `config.SUPPORTED_KINDS`. That is the same three today and a
+/// copy either way: the first fourth dialect the engine accepts would be unpickable from the console,
+/// and a second copy cannot disagree with itself, so nothing would say so. `serve._cmd_providers` now
+/// sends the kinds it will accept, and the picker is built from what arrived.
+///
+/// **Nil is carried, not collapsed into `[]`.** A reply with no `kinds` key is not a reply that said
+/// "there are none": the first means the engine has not answered, and the form says so rather than
+/// drawing an empty picker that reads as "no kinds exist".
+public struct ProviderKindVocabulary: Sendable, Equatable {
+    public let kinds: [String]?
+
+    public init(_ payload: [String: JSONValue]) {
+        self.kinds = payload["kinds"]?.arrayValue?.compactMap { $0.stringValue }
+    }
+}
+
+/// The levels and roles a hire may name, decoded from the `agents` reply.
+///
+/// **Why this decodes and does not list.** The hire form listed five of `people.LEVELS`' six names
+/// (`junior, practitioner, senior, staff, principal`), so `mid` — an alias the engine resolves — could
+/// not be chosen from the app at all. That is a functional gap and not staleness: the engine accepted a
+/// level the console could not send. `serve._cmd_agents` now sends `levels` and `roles`, taken from
+/// `people.LEVELS` and `people.HIRE_ROLES`, and the form renders what arrived.
+///
+/// **Nil is carried, not collapsed into `[]`**, for the same reason as `ProviderKindVocabulary`: the
+/// form must be able to tell "the engine has not sent its levels yet" from "the engine lists none".
+public struct HireVocabulary: Sendable, Equatable {
+    public let levels: [String]?
+    public let roles: [String]?
+
+    public init(_ payload: [String: JSONValue]) {
+        self.levels = payload["levels"]?.arrayValue?.compactMap { $0.stringValue }
+        self.roles = payload["roles"]?.arrayValue?.compactMap { $0.stringValue }
+    }
+}
+
 /// The capabilities an agent can be granted, as a list the UI renders and tests can assert on.
 ///
 /// Kept in the Kit rather than in a view so the vocabulary has one definition: the toggle, the help

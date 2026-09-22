@@ -211,12 +211,13 @@ def test_every_new_command_is_documented_in_usage_md():
     """A command nobody can discover is only half built. USAGE.md's table is the surface a person
     reads, so every new one appears there — and the doc still describes commands that run."""
     text = (ROOT / "USAGE.md").read_text(encoding="utf-8")
-    for documented in ("`abort --slug s`", "`reassign --slug s <node> --agent A`",
+    for documented in ("`abort --slug s`", "`pause --slug s`", "`resume --slug s`",
+                       "`reassign --slug s <node> --agent A`",
                        "`takeover --slug s <node>`", "`discard --slug s`", "`subagents list --slug s`",
                        "`subagents result <child> --slug s`", "`agent update <name>",
                        "`agent retire <name>`", "`providers list`", "`providers add <id>",
                        "`providers test <id>", "`providers remove <id>`", "`improve`", "`proposals`",
-                       "`run --approve-plan"):
+                       "`run --approve-plan`", "`portfolio remove <org> --preview`"):
         assert documented in text, f"{documented} is not in USAGE.md"
 
 

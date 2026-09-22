@@ -119,8 +119,11 @@ python3 -m engine.cli --config /path/credentials.json --json doctor
 | `skills graph [--skill N] [--review A B C]` | *What depends on what?* The library's chain graph, and a plan coherence review |
 | `mission set/status/start/advance/mark` | The standing purpose above the goal: objectives worked one at a time |
 | `portfolio init/add/status/run/…` | The person and the several orgs they run; `--org` scopes any command to one org |
+| `portfolio remove <org> --preview` | *What would forgetting this org take away?* The engine's account of what it removes and what it leaves, removing nothing |
 | `decide --slug s --approve` | Resolve a gate: continue past it (`--reject --note "…"` parks instead) |
 | `abort --slug s` | **Stop the run.** Keeps its checkpoint — not `decide`, which lets it carry on spending |
+| `pause --slug s` | **Park the run** at its next node boundary, keeping its checkpoint — `resume` carries it on, `abort` ends it |
+| `resume --slug s` | **Continue a parked run** from its checkpoint. `--no-execute` clears the pause and stops there, so nothing is spent before you look |
 | `reassign --slug s <node> --agent A` | Pin a node to a different agent; the router's refusals still apply |
 | `takeover --slug s <node>` | Take a node over yourself, so its artifact records a human producer |
 | `discard --slug s` | **Clear a settled run.** Moves its two checkpoints into `.agent_state/discarded/` — not `abort`, which stops a run still going. `--include-record` moves the trace, handoffs, ledger, goal and cache too |
@@ -963,12 +966,16 @@ You hold terminal authority. During a run:
 | **Reassign** | Move a task to a different agent — the manual form of the router's job |
 | **Take over** | Act as the agent yourself, then hand back or forward |
 | **Force a route** | Decide when the router finds no confident match |
-| **Abort** | **Stop the run.** The checkpoint is kept, so a resume remains possible |
+| **Pause** | Park the run at its next node boundary, keeping its checkpoint — `resume` carries it on |
+| **Resume** | Continue a parked run from its checkpoint |
+| **Abort** | **Stop the run.** The checkpoint is kept, so a `resume` remains possible |
 
 Each of those is a command, not a panel:
 
 ```bash
 python3 -m engine.cli decide   --slug booking --approve        # continue past the gate
+python3 -m engine.cli pause    --slug booking                  # park it at the next boundary
+python3 -m engine.cli resume   --slug booking                  # carry a parked run on
 python3 -m engine.cli abort    --slug booking                  # stop it
 python3 -m engine.cli reassign --slug booking dev --agent Ana  # pin a node to another agent
 python3 -m engine.cli takeover --slug booking dev              # do it yourself
