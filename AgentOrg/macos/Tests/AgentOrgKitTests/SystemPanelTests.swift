@@ -410,9 +410,20 @@ final class SystemPanelTests: XCTestCase {
         // `loadSystem` goes through the same `fetch` as every other panel read, which is what makes a
         // refusal visible in the terminal rather than silent. Asserted as "the field is populated from
         // the engine" — an implementation that set `system` locally would leave this empty.
+        //
+        // **The emptiness is asserted on a controller with no engine, not on the launched one.** The
+        // console refreshes the slow panels the moment the engine reports ready, so on a launched
+        // controller that read can land between the launch and this line — measured at one run in three,
+        // which is a flaky test rather than a finding. A controller that has never spoken to an engine is
+        // the state that actually carries the claim: nothing is asserted about this machine before a
+        // reply arrives.
+        XCTAssertTrue(OrgController(settings: .discover(repositoryRoot: Self.repositoryRoot()),
+                                    maxRestartAttempts: 0, preferences: .ephemeral())
+                        .system.isEmpty,
+                      "nothing is claimed before the read")
+
         let controller = try await launchedController()
         defer { controller.stop() }
-        XCTAssertTrue(controller.system.isEmpty, "nothing is claimed before the read")
         await controller.loadSystem()
         XCTAssertFalse(controller.system.isEmpty, "the engine answered the `system` command")
         XCTAssertFalse(controller.systemCapabilities.isEmpty)
