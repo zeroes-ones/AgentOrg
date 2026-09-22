@@ -237,6 +237,15 @@ public final class AgentProcessService: @unchecked Sendable {
     /// would hide it.
     private var _stopRequested = false
 
+    /// The reason a launch was abandoned because the engine never reported ready, or nil.
+    ///
+    /// **The latch that keeps a verdict a verdict.** The launch deadline (see `startLaunchDeadline`)
+    /// stops an engine that has not reported ready; the exit that follows would otherwise be classified
+    /// by the termination handler as an ordinary clean finish, and the console would show a tidy stop
+    /// for a launch that failed. Read there, and cleared by `launch()` — it is a fact about *one*
+    /// process, not about the bridge.
+    private var _abandonedReason: String?
+
     /// Called on the main queue when the state changes. The UI subscribes here.
     public var onStateChange: (@Sendable (EngineState) -> Void)?
     /// Called on a background queue for each decoded event.
@@ -320,6 +329,13 @@ public final class AgentProcessService: @unchecked Sendable {
     /// Guards `timeoutTimer`, which three different queues create and cancel. See `startTimeoutSweep`.
     private let timeoutLock = NSLock()
 
+    /// The timer that ends a launch whose engine never reported ready. See `startLaunchDeadline`.
+    private var launchDeadlineTimer: DispatchSourceTimer?
+    /// Guards `launchDeadlineTimer`, which is created on the caller's thread, fired on `commandQueue`,
+    /// and cancelled from `dispatch` (the stdout queue) and the termination handler. Same reasoning as
+    /// `timeoutLock`: two of those racing on one stored property is a data race.
+    private let launchLock = NSLock()
+
     private let terminationGrace: TimeInterval
     /// How long a command may wait for its acknowledgement.
     ///
@@ -330,6 +346,28 @@ public final class AgentProcessService: @unchecked Sendable {
     /// exactly one place to change it and a test can inject a short one instead of waiting ten minutes.
     private let commandTimeout: TimeInterval
 
+    /// How long the engine may take to report ready before the launch is abandoned.
+    ///
+    /// **The one wait in this bridge that had no bound at all.** A command has `commandTimeout`; a stop
+    /// has `terminationGrace`; the bootstrap — the wait a person actually sits through, in front of a
+    /// window that says "Working…" — had nothing. `.launching` was left by the readiness frame and by
+    /// nothing else, so an engine that never sent one (a wedged child, a child blocked behind a
+    /// permission prompt, a child whose stdout nobody was reading) left the console waiting for the life
+    /// of the process. No retry, no failure banner, no end; the only thing on screen that changed was
+    /// the elapsed seconds.
+    ///
+    /// Sixty seconds, and the trade is worth naming. The engine's own bootstrap is a fraction of a
+    /// second on a warm machine (measured: 0.3–0.7 s by hand, ~2.5 s for the app's first spawn), so this
+    /// is a hundred times the normal cost — long enough that no healthy launch can be cut short by a
+    /// busy machine, and short enough that a person learns something inside a minute. The case it is
+    /// *not* sized for is the documented one where macOS is waiting on a permission prompt off-screen;
+    /// that is why the console still says so at 20 s, before this fires, and why the message this
+    /// produces names what it was waiting for rather than claiming the engine is broken.
+    ///
+    /// A stored value, like `commandTimeout`, so the console owns the policy and a test can inject a
+    /// short one instead of waiting a minute.
+    private let launchTimeout: TimeInterval
+
     /// The deadline the console's own commands are sent with, for the UI to quote.
     ///
     /// A computed property rather than a stored one: the controller needs the number to *describe* the
@@ -339,7 +377,8 @@ public final class AgentProcessService: @unchecked Sendable {
 
     public init(config: EngineLaunchConfig,
                 terminationGrace: TimeInterval = 5.0,
-                commandTimeout: TimeInterval = AgentProcessService.defaultCommandTimeout) {
+                commandTimeout: TimeInterval = AgentProcessService.defaultCommandTimeout,
+                launchTimeout: TimeInterval = AgentProcessService.defaultLaunchTimeout) {
         self.config = config
         self.terminationGrace = terminationGrace
         // Floored here rather than only at the call site: a zero or negative budget would time every
@@ -347,6 +386,9 @@ public final class AgentProcessService: @unchecked Sendable {
         // engine at all. The console floors its own value too, but a guarantee that depends on the
         // caller having done so is not a guarantee.
         self.commandTimeout = max(1, commandTimeout)
+        // Floored for the same reason, and because a zero here would abandon every launch in the instant
+        // between the spawn and the interpreter's first byte — a bridge that cannot start an engine.
+        self.launchTimeout = max(1, launchTimeout)
     }
 
     /// How long a command waits for its acknowledgement before it is reported as timed out.
@@ -359,6 +401,12 @@ public final class AgentProcessService: @unchecked Sendable {
     /// couple of seconds, that a command is outstanding and names it. The timeout is the backstop for
     /// "no answer ever", not the mechanism for "this is taking a while".
     public nonisolated static let defaultCommandTimeout: TimeInterval = 600
+
+    /// How long a launch waits for `engine.ready` before the engine is abandoned as unusable.
+    ///
+    /// A named constant rather than a literal, so the number has one home, the console can quote it, and
+    /// a test can assert the boundary rather than the wording. See `launchTimeout` for the trade.
+    public nonisolated static let defaultLaunchTimeout: TimeInterval = 60
 
     // MARK: - Lifecycle
 
@@ -400,69 +448,67 @@ public final class AgentProcessService: @unchecked Sendable {
         stdoutDecoder = LineDecoder()
         stderrDecoder = LineDecoder()
 
-        // A `readabilityHandler` fires *repeatedly* with empty data once the pipe reaches EOF, so a
-        // handler that simply returns on empty data busy-loops for as long as the file handle lives —
-        // burning a core per pipe. Detaching on the zero-byte read is the fix, and it is also where the
-        // handler should be removed: the process is done writing.
+        // **One blocking reader per pipe, started once — not a `readabilityHandler` that reads one
+        // chunk per notification.**
         //
-        // **Every read of these pipes is serialised on `queue`, and that is a fix rather than tidiness.**
-        // Two threads read them: the `readabilityHandler`, driven by the run loop, and the termination
-        // handler's final `drain`. When they interleave, the drain's `readDataToEndOfFile` can consume
-        // the bytes the handler was about to read — and, worse, can consume *part* of a line while the
-        // handler holds the other part in the decoder's buffer. The decoder is then left holding bytes
-        // for a line that can never complete, and the frame is lost.
+        // WHY THIS SHAPE
+        // --------------
+        // A `readabilityHandler` is a *notification*, and this code used it as a *reader*: every fire
+        // enqueued exactly one read. A descriptor stays readable until it is drained, so a single write
+        // produced a burst of fires — measured on this machine, 25 to 2832 of them for one six-byte
+        // write — and therefore a burst of queued reads, each of which then parked in `read()` waiting
+        // for the *next* write. The queue `engine.ready` has to travel down was left cluttered with
+        // reads for bytes that had already been consumed.
         //
-        // That was a real, intermittent failure: the engine's fatal `error` frame — the one frame that
-        // carries *why* it died — occasionally vanished, and the app reported "exited before it
-        // finished starting" instead. It reproduced roughly once in a dozen full test runs, and more
-        // often under load. Reading and decoding on one serial queue is what makes it impossible rather
-        // than unlikely: whichever runs first sees the bytes, and the decoder is only ever touched by
-        // one thread at a time.
-        outPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            self?.queue.async {
-                guard let self else { return }
-                let data = handle.availableData
-                guard !data.isEmpty else {
-                    handle.readabilityHandler = nil
-                    return
-                }
-                self.consumeStdout(data)
-            }
-        }
-
-        // stderr: diagnostics. A separate decoder *and* a separate queue, because interleaving the two
-        // streams would corrupt both the protocol and the error text — and because a blocking read on
-        // this pipe must never be able to hold up the one carrying `engine.ready`.
-        errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            self?.stderrQueue.async {
-                guard let self else { return }
-                let data = handle.availableData
-                guard !data.isEmpty else {
-                    handle.readabilityHandler = nil
-                    return
-                }
-                self.consumeStderr(data)
-            }
-        }
+        // Worse, that handler **removed itself** on a zero-byte read. Empty data is how EOF arrives, so
+        // it was meant as "the child has finished writing" — but it is a *terminal* decision taken from
+        // a single observation, and nothing ever re-armed it. A handler that detached itself while the
+        // child was still alive took the console's only ear with it: no readiness frame, no diagnostics,
+        // and — the part that makes it so hard to see — no thread parked in `read()` for a debugger to
+        // find. The app would then wait for ever on an engine that was talking to somebody who had
+        // stopped listening.
+        //
+        // So the read is not a handler at all. Each pipe gets one reader: a loop that blocks in `read()`
+        // and consumes everything the child writes, for as long as the child writes, ending at EOF and
+        // nowhere else. It cannot detach, because there is nothing to detach; it cannot spin, because a
+        // blocking read costs nothing while there is nothing to read; and it cannot be starved by the
+        // other pipe, because each runs on its own serial queue (`queue`, `stderrQueue`) — the property
+        // the previous fix established, and the reason those two queues exist.
+        //
+        // The termination handler's drain goes with it. The readers *are* the drain: the child's last
+        // frames, most importantly a fatal `error` frame, are read by the same loop that reads
+        // everything else, in order, and that loop ends only when the stream does.
+        let stdoutHandle = outPipe.fileHandleForReading
+        let stderrHandle = errPipe.fileHandleForReading
 
         process.terminationHandler = { [weak self] finished in
             guard let self else { return }
-            // **Drain before detaching.** The child may have written its fatal `error` frame to stdout
-            // and exited in the same instant; a handler removed first would discard that frame and the
-            // app would only have "status 1". So the remaining bytes are read and dispatched *before*
-            // the handlers are torn down, which is what makes the reason survive the exit — and both
-            // Both queues are synchronised before draining, one pipe each, so a drain cannot race the
-            // handler servicing the same pipe. Syncing them *in turn* is safe precisely because they
-            // are separate: a blocked read on stderr no longer holds the queue stdout needs, which was
-            // the bug. Each sync waits only for its own pipe to become idle.
-            self.queue.sync {
-                self.drainStdout(outPipe: outPipe)
+            // **Let the readers reach EOF before publishing the exit — bounded, never unbounded.**
+            //
+            // The child can write its last frame and exit in the same instant, so the state must not be
+            // published until those bytes have been read and dispatched: "the reason" is exactly what
+            // the reader is still holding. Waiting for the readers is waiting for the reason.
+            //
+            // It is a *bounded* wait, and that is why this is not a `sync` on each queue. A pipe reaches
+            // EOF only when every write end is closed, and a write end inherited by some other process
+            // keeps it open — the case `serve.py`'s parent watchdog exists for. An unbounded wait there
+            // would wedge the one path that must always complete, because it is where `.finished` and
+            // `.failed` are published and where every command still awaiting an answer is resolved.
+            self.waitForReaders()
+            // The process is gone, so there is nothing left for the launch deadline to end.
+            self.stopLaunchDeadline()
+
+            // **A verdict already given for this launch stands.** The launch deadline may have
+            // abandoned this process as an engine that never reported ready (see `_abandonedReason`),
+            // and the exit that follows that stop is the *consequence* of the verdict rather than news
+            // that contradicts it. Without this, stopping a wedged launch would be reported as a clean
+            // `.finished` a moment later, and the console would show a tidy finish for an engine that
+            // never started.
+            if self.stateLock.withLock({ self._abandonedReason }) != nil {
+                self.stopTimeoutSweep()
+                self.failPendingCommands(EngineError(.notRunning, "the engine was stopped"))
+                return
             }
-            self.stderrQueue.sync {
-                self.drainStderr(errPipe: errPipe)
-            }
-            self.queue.sync { self.detachStdoutHandler(outPipe: outPipe) }
-            self.stderrQueue.sync { self.detachStderrHandler(errPipe: errPipe) }
 
             // A non-zero exit with no prior terminal state is a failure, not a clean finish. Reporting
             // it as `finished` would hide a crash — **unless we are the reason it stopped**: see
@@ -495,8 +541,6 @@ public final class AgentProcessService: @unchecked Sendable {
         do {
             try process.run()
         } catch {
-            detachStdoutHandler(outPipe: outPipe)
-            detachStderrHandler(errPipe: errPipe)
             let engineError = EngineError(.launchFailed,
                                           "could not start \(executable.path): \(error.localizedDescription)")
             setState(.failed, error: engineError)
@@ -516,7 +560,16 @@ public final class AgentProcessService: @unchecked Sendable {
             _fatalReason = nil
             // And nothing has been asked of it yet, so a non-zero exit from here on is its own doing.
             _stopRequested = false
+            // Nor has this launch been abandoned: that verdict belongs to the previous process.
+            _abandonedReason = nil
         }
+        // The readers start here rather than before the spawn, so a `run()` that throws leaves no
+        // parked thread behind — and after it, so nothing the child writes can go unread: the pipe
+        // buffers whatever arrives in the window between the spawn and these two lines.
+        queue.async { [weak self] in self?.readStdout(stdoutHandle) }
+        stderrQueue.async { [weak self] in self?.readStderr(stderrHandle) }
+        stopLaunchDeadline()
+        startLaunchDeadline()
         // Deliberately left `.launching`. The `.running` transition happens in `dispatch` when the
         // readiness frame arrives — so a process that dies during bootstrap is never shown as running.
     }
@@ -534,6 +587,9 @@ public final class AgentProcessService: @unchecked Sendable {
         // Recorded *before* the signal, so the termination handler — which may run at any moment after
         // it — cannot mistake the stop we asked for for a crash. See `_stopRequested`.
         stateLock.withLock { _stopRequested = true }
+        // A stop ends the launch as surely as readiness does, so the deadline has nothing left to
+        // decide. Left running it would fire against a process that is already going away.
+        stopLaunchDeadline()
         setState(.terminating)
         // Close our end of the command pipe **first**. The engine treats stdin EOF as a clean shutdown,
         // so this asks it to stop on its own terms — it finishes the command in flight, writes its
@@ -690,9 +746,21 @@ public final class AgentProcessService: @unchecked Sendable {
         // The readiness handshake. This is what turns `.launching` into `.running`, so a process that
         // was spawned but never became usable is *never* reported as running — the bug where the app
         // claimed "engine running (pid …)" for an engine that had already died.
+        //
+        // **Readiness is proven by the handshake frame *or* by any reply, and that is a fix rather than
+        // a convenience.** The frame was the only trigger, which made the whole console depend on one
+        // line being observed on one pipe at one moment: if it was missed, `.launching` was permanent —
+        // no poll starts, no reply is ever applied, and every pane shows a placeholder for an engine
+        // that is running and answering. The engine reads its command stream only *after* the handshake
+        // (`serve_forever` emits `engine.ready` and then enters the read loop), so a reply is the same
+        // fact arriving by a second route — and the console always has commands in flight during a
+        // launch, because the window loads its providers, models, roster and capabilities the moment it
+        // opens. A frame that goes missing therefore costs nothing: the first acknowledgement proves the
+        // engine is past the handshake and the console attaches on it.
         if event.type == "engine.ready" {
-            stateLock.withLock { _ready = true }
-            setState(.running)
+            markReady()
+        } else if event.type == "command.ack", !isReady {
+            markReady()
         }
         // A fatal frame carries the reason the engine is about to exit. Recorded here, before the exit,
         // so the termination handler can report *why* instead of a bare status code. The child writes
@@ -716,6 +784,19 @@ public final class AgentProcessService: @unchecked Sendable {
             }
         }
         onEvent?(event)
+    }
+
+    /// Record that the engine is usable, once.
+    ///
+    /// The one place `.running` is published from, so both proofs of readiness — the handshake frame and
+    /// the first reply (see `dispatch`) — reach the console by the same path, and the launch deadline is
+    /// withdrawn however readiness arrived.
+    private func markReady() {
+        let already = stateLock.withLock { _ready }
+        guard !already else { return }
+        stateLock.withLock { _ready = true }
+        stopLaunchDeadline()
+        setState(.running)
     }
 
     /// Resolve every awaiting command with an error, so no continuation is left suspended.
@@ -789,21 +870,11 @@ public final class AgentProcessService: @unchecked Sendable {
         timeoutTimer = nil
     }
 
-    /// Stop reading the pipes. A handler left installed after the process exits would fire on a closed
-    /// handle, which crashes rather than returning empty data.
-    private func detachStdoutHandler(outPipe: Pipe) {
-        outPipe.fileHandleForReading.readabilityHandler = nil
-    }
-
-    private func detachStderrHandler(errPipe: Pipe) {
-        errPipe.fileHandleForReading.readabilityHandler = nil
-    }
-
     /// Decode and dispatch a chunk from the child's stdout.
     ///
-    /// Split out of the `readabilityHandler` so the same decoding runs both for a live read and for the
-    /// final drain at exit — one code path, so a frame cannot be handled one way while running and
-    /// another way while dying.
+    /// Split out of the reader so the same decoding runs for every chunk, however it arrived — one code
+    /// path, so a frame cannot be handled one way while the engine is starting and another while it is
+    /// working.
     private func consumeStdout(_ data: Data) {
         for frame in stdoutDecoder.append(data) {
             switch frame {
@@ -823,26 +894,111 @@ public final class AgentProcessService: @unchecked Sendable {
         }
     }
 
-    /// Read whatever remains on both pipes and dispatch it, before the process is torn down.
+    // MARK: - Reading the child's output
+
+    /// Read the child's stdout until it reaches EOF, dispatching every frame.
     ///
-    /// The child can write its last frames — most importantly a fatal `error` frame — and exit in the
-    /// same instant. The `readabilityHandler` may not have fired for those bytes yet, and the
-    /// termination handler used to detach the handlers first, discarding them. This synchronous read
-    /// closes that race: whatever the child managed to write is decoded before the pipes are closed.
+    /// A loop, not a handler, and the shape is the fix — see the note where it is started. The two
+    /// properties that matter: it blocks while the child is quiet (one parked thread, no polling and no
+    /// spin), and it ends **only** at EOF, so there is no state it can reach in which the console has
+    /// stopped reading a pipe the engine is still writing to.
     ///
-    /// `readDataToEndOfFile` is bounded by the child having exited (its write end is closed), so it
-    /// cannot block indefinitely.
-    /// Drain one pipe, on the queue that already owns it. Split per pipe so each is drained under the
-    /// same serial queue its own handler runs on — the property that prevents a drain from racing a
-    /// handler — without the two pipes waiting on one another.
-    private func drainStdout(outPipe: Pipe) {
-        let remainingOut = outPipe.fileHandleForReading.readDataToEndOfFile()
-        if !remainingOut.isEmpty { consumeStdout(remainingOut) }
+    /// `availableData` returning empty is EOF — it blocks otherwise, rather than reporting a spurious
+    /// empty read — which is what makes the exit condition honest rather than a guess about timing.
+    private func readStdout(_ handle: FileHandle) {
+        while true {
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            consumeStdout(data)
+        }
     }
 
-    private func drainStderr(errPipe: Pipe) {
-        let remainingErr = errPipe.fileHandleForReading.readDataToEndOfFile()
-        if !remainingErr.isEmpty { consumeStderr(remainingErr) }
+    /// Read the child's stderr until EOF, and nothing else: these are diagnostics, not protocol, so a
+    /// failure here must not be able to touch the state machine.
+    private func readStderr(_ handle: FileHandle) {
+        while true {
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            consumeStderr(data)
+        }
+    }
+
+    /// Wait for both readers to reach EOF, for at most `terminationGrace`.
+    ///
+    /// A group rather than two `sync` calls, because there is one wait to bound rather than two: a write
+    /// end leaking on *one* pipe must not stretch the other's wait, and the total is the number that
+    /// matters — a person is waiting for the state to be published, not for a pipe to close. See the
+    /// termination handler for why this wait is bounded at all.
+    private func waitForReaders() {
+        let group = DispatchGroup()
+        group.enter()
+        queue.async { group.leave() }
+        group.enter()
+        stderrQueue.async { group.leave() }
+        _ = group.wait(timeout: .now() + terminationGrace)
+    }
+
+    // MARK: - The launch deadline
+
+    /// Start the one-shot that ends a launch the engine never confirmed.
+    ///
+    /// **The bound `launchTimeout` documents, enforced rather than recorded.** `.launching` is left by
+    /// the readiness frame and by nothing else, so without this an engine that never sends one leaves
+    /// the console waiting for the life of the process — the "Working…" that never ends, with the
+    /// elapsed seconds as the only thing on screen that moves.
+    ///
+    /// A `DispatchSourceTimer` on `commandQueue` rather than a `Task`, for the same reason the command
+    /// sweep uses one: it must not be paused by a menu being open or a window being dragged, and it must
+    /// not be deferred by a run loop that has nothing else to do.
+    private func startLaunchDeadline() {
+        launchLock.lock()
+        defer { launchLock.unlock() }
+        guard launchDeadlineTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: commandQueue)
+        timer.schedule(deadline: .now() + launchTimeout)
+        timer.setEventHandler { [weak self] in self?.abandonLaunchIfNotReady() }
+        launchDeadlineTimer = timer
+        timer.resume()
+    }
+
+    /// Withdraw the deadline. Called when readiness arrives by either route, and on every path that ends
+    /// the launch — an engine that has reported, or one that has stopped, has nothing left to time out.
+    private func stopLaunchDeadline() {
+        launchLock.lock()
+        defer { launchLock.unlock() }
+        launchDeadlineTimer?.cancel()
+        launchDeadlineTimer = nil
+    }
+
+    /// End a launch whose engine never reported ready.
+    ///
+    /// **A mitigation, and named as one.** It is the backstop for the case the console cannot repair:
+    /// a child that is alive and silent. The structural fixes are elsewhere — the reader loop cannot
+    /// stop while the child lives, and readiness is proven by a reply as well as by the handshake frame
+    /// — so this exists only so that "silent for ever" ends in a *stated* failure instead of an
+    /// unbounded wait.
+    ///
+    /// What it does is deliberately the smallest thing that ends the wait safely:
+    ///
+    /// 1. Stop the child. A relaunch that left a live engine behind would put two engines on one
+    ///    checkpoint, and that engine is holding the workspace whether or not it is answering.
+    /// 2. Record why, in `_abandonedReason`, so the exit that follows the stop is not read as an
+    ///    ordinary clean finish (`_stopRequested` alone would make it one).
+    /// 3. Publish `.failed` with the reason, which sends the console down the path it already has for a
+    ///    dead engine: the failure banner, the terminal line, and the *bounded* automatic retry — three
+    ///    attempts and then a statement that it has given up, rather than a retry loop.
+    private func abandonLaunchIfNotReady() {
+        guard !isReady else { return }
+        guard let process, process.isRunning else { return }
+        // Only a launch in flight. A stop already under way owns the end of this process, and a running
+        // engine has nothing to time out (it proved readiness to get there).
+        guard state == .launching else { return }
+        let reason = "the engine did not report ready within \(Int(launchTimeout))s, so it was stopped. "
+            + "The engine's own diagnostics are in the terminal above; `engine.cli doctor` checks the "
+            + "configuration it was starting from."
+        stateLock.withLock { _abandonedReason = reason }
+        terminate()
+        setState(.failed, error: EngineError(.launchFailed, reason))
     }
 
     private func setState(_ new: EngineState, error: EngineError? = nil) {

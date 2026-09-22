@@ -148,8 +148,7 @@ final class OrgControllerBridgeTests: XCTestCase {
     }
 
     private func waitUntil(_ deadline: TimeInterval = 8,
-                           _ condition: () -> Bool) async -> Bool {
-        let end = Date().addingTimeInterval(deadline)
+                           _ condition: () -> Bool) async -> Bool {        let end = Date().addingTimeInterval(deadline)
         while Date() < end {
             if condition() { return true }
             try? await Task.sleep(nanoseconds: 50_000_000)
@@ -1332,5 +1331,45 @@ final class OrgControllerBridgeTests: XCTestCase {
         await controller.saveProvider(ProviderDraft(id: "b", kind: "openai", baseURL: "https://b/v1"))
         XCTAssertFalse(controller.providerSave.isEmpty,
                        "the second attempt's reply replaces the first's rather than being ignored")
+    }
+
+    // MARK: - A launch that never reports ready
+
+    /// A stand-in that is alive and says nothing at all — the shape of "the engine is fine, but the app
+    /// never attaches" from the console's side.
+    private func makeSilentEngineScript() throws -> URL {
+        let script = root.appendingPathComponent("silent_engine.py")
+        let source = """
+        import time
+        while True:
+            time.sleep(0.2)
+        """
+        try source.write(to: script, atomically: true, encoding: .utf8)
+        return script
+    }
+
+    func testALaunchThatNeverReportsReadyEndsInAStatedFailure() async throws {
+        // **The console's own copy of the bug.** `.launching` was left by the readiness frame and by
+        // nothing else, so a child that never sent one — a wedged engine, an engine behind a permission
+        // prompt, a child whose output nobody was reading — left "Working…" on screen for the life of
+        // the process: no poll starts, no pane fills, no failure is ever reported, and the only thing
+        // that changes is the elapsed seconds. It now ends, in the terms a person can act on.
+        let script = try makeSilentEngineScript()
+        let settings = OrgController.OrgSettings(engineRoot: root, projectPath: root,
+                                                 credentialsPath: nil, libraryRoot: nil)
+            .with(runtime: .system(URL(fileURLWithPath: "/usr/bin/env")),
+                  arguments: ["python3", script.path])
+        let controller = OrgController(settings: settings, maxRestartAttempts: 0,
+                                       restartDelay: 0.05, launchTimeout: 1.0,
+                                       preferences: .ephemeral())
+        controller.launch()
+        let ended = await waitUntil(10) { controller.engineFailure != nil }
+        XCTAssertTrue(ended, "a launch that never reports ready must end, not wait for ever")
+        XCTAssertTrue(controller.engineFailure?.contains("did not report ready") ?? false,
+                      controller.engineFailure ?? "nil")
+        XCTAssertEqual(controller.engineState, .failed)
+        XCTAssertNil(controller.launchProgress, "the launch row is closed out, not left ticking")
+        // And the engine it abandoned was stopped rather than left holding the workspace.
+        XCTAssertFalse(controller.engineState.isLive)
     }
 }

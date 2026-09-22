@@ -470,6 +470,15 @@ public final class OrgController: ObservableObject {
     public nonisolated static let defaultCommandTimeout: TimeInterval =
         AgentProcessService.defaultCommandTimeout
 
+    /// How long a launch may wait for the engine to report ready before it is abandoned.
+    ///
+    /// The console's copy of `AgentProcessService.launchTimeout`, on the same rule as the command
+    /// timeout above: the number is a policy about what a person will wait for, so it lives on the
+    /// console and the bridge is handed it. It is quoted in `waitingAdvice` and in the failure the
+    /// bridge produces, so there is one number on screen rather than two that can disagree.
+    public nonisolated static let defaultLaunchTimeout: TimeInterval =
+        AgentProcessService.defaultLaunchTimeout
+
     /// How long a command may be outstanding before the console says so.
     ///
     /// Two seconds, and the trade is worth naming: a `status` poll on a healthy engine answers in
@@ -496,6 +505,12 @@ public final class OrgController: ObservableObject {
     /// The console's own copies of the two timeouts, injected so both are assertable.
     private let commandTimeout: TimeInterval
     private let slowCommandAfter: TimeInterval
+    /// How long a launch may wait for `engine.ready` before the bridge abandons the engine.
+    ///
+    /// Injected for the same reason the other two are: without it, asserting what a launch that never
+    /// reports ready does would mean waiting out the production value. See
+    /// `AgentProcessService.abandonLaunchIfNotReady` for what the bridge does with it.
+    private let launchTimeout: TimeInterval
     /// Ticks while a launch or a command is in flight, so the elapsed time on screen advances.
     ///
     /// A timer rather than a recomputed-on-render string: SwiftUI only redraws when something
@@ -638,6 +653,7 @@ public final class OrgController: ObservableObject {
                 engineAwayGrace: TimeInterval = OrgController.defaultEngineAwayGrace,
                 commandTimeout: TimeInterval = OrgController.defaultCommandTimeout,
                 slowCommandAfter: TimeInterval = OrgController.defaultSlowCommandAfter,
+                launchTimeout: TimeInterval = OrgController.defaultLaunchTimeout,
                 preferences: AppPreferences? = nil,
                 proposalDismissals: UserDefaults = .standard) {
         self.settings = settings
@@ -669,6 +685,9 @@ public final class OrgController: ObservableObject {
         // to turn the console into something that cannot issue a command at all.
         self.commandTimeout = max(1, commandTimeout)
         self.slowCommandAfter = max(0.1, slowCommandAfter)
+        // Floored for the same reason, and one step further: a zero here would have the bridge abandon
+        // every launch in the instant between the spawn and the interpreter's first byte.
+        self.launchTimeout = max(1, launchTimeout)
     }
 
     /// Three attempts, then stop and say so.
@@ -760,6 +779,45 @@ public final class OrgController: ObservableObject {
             return "\(root.path) exists but \(module.path) does not, so it is not the engine package"
         }
         return nil
+    }
+
+    /// A sentence naming the one environment cause the console can recognise for itself, or nil.
+    ///
+    /// **Why this is here rather than in `launchProblem`.** The check above reads the engine's
+    /// `cli.py`, and on the machine this was measured on that check *passes* while the engine child
+    /// blocks: the app's own reads of a protected folder succeed, and the child's do not. What the child
+    /// does first is `getcwd()`, which macOS implements as an `open()` on the working directory — and
+    /// when that directory is inside `~/Documents`, `~/Desktop` or `~/Downloads`, TCC raises its
+    /// "would like to access files" prompt and the `open()` **waits for the answer**. Measured here: a
+    /// child alive, at 0 % CPU, with its main thread in
+    /// `_PyPathConfig_ComputeSysPath0 → __getcwd → open$NOCANCEL` for minutes, having written nothing at
+    /// all — not `engine.ready`, not a diagnostic. The prompt was on screen the whole time.
+    ///
+    /// So the console sees exactly what a wedged engine looks like, and the difference is a dialog a
+    /// person has to answer. It cannot be detected by reading the file (see above), but it *can* be
+    /// recognised from the shape: an engine that never reported ready, launched from a folder macOS
+    /// protects. Saying so is the difference between a five-second fix and another bug report — and it
+    /// is a *sentence*, not a claim: it says "usually", it names both ways out, and an engine that did
+    /// report ready never gets it.
+    ///
+    /// - Parameter engineIsSilent: true when the engine never sent `engine.ready`, which is what makes
+    ///   this the likely story rather than the engine having failed somewhere of its own accord.
+    ///
+    /// Internal rather than private so the rule — protected folder *and* silence — can be asserted
+    /// without a window or a child process.
+    func protectedFolderHint(engineIsSilent: Bool) -> String? {
+        guard engineIsSilent else { return nil }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        // The folders macOS gates behind a permission prompt, by their real paths under the user's home.
+        let protected = ["Documents", "Desktop", "Downloads"].map { home + "/" + $0 }
+        let roots = [settings.engineRoot.path, settings.projectPath.path]
+        let gated = roots.filter { path in protected.contains { path == $0 || path.hasPrefix($0 + "/") } }
+        guard !gated.isEmpty else { return nil }
+        return " The engine never reported ready and its working directory is inside a folder macOS "
+            + "protects (\(gated[0])), which usually means a \"would like to access files\" prompt for "
+            + "the Documents folder is open — or is behind this window. Choose Allow, or move the "
+            + "AgentOrg folder somewhere macOS does not protect (for example ~/code) and press "
+            + "Try again."
     }
 
     /// Launch the engine and begin streaming.
@@ -855,7 +913,8 @@ public final class OrgController: ObservableObject {
         self.service?.onDiagnostic = nil
         self.service?.onUnparsable = nil
 
-        let service = AgentProcessService(config: config, commandTimeout: commandTimeout)
+        let service = AgentProcessService(config: config, commandTimeout: commandTimeout,
+                                          launchTimeout: launchTimeout)
 
         service.onStateChange = { [weak self] state in
             Task { @MainActor [weak self] in
@@ -891,7 +950,8 @@ public final class OrgController: ObservableObject {
                     // A failure must be impossible to miss. It goes to the terminal *and* to `notice`,
                     // which the status bar and every panel surface — the whole point, because the old
                     // behaviour showed a healthy-looking engine that was doing nothing.
-                    let reason = service.lastError?.message ?? "the engine failed to start"
+                    let reason = (service.lastError?.message ?? "the engine failed to start")
+                        + (self.protectedFolderHint(engineIsSilent: !service.isReady) ?? "")
                     self.logs.append(notice: "engine failed: \(reason)")
                     self.engineFailure = reason
                     self.finishLaunchProgress(outcome: "it failed")
@@ -3563,7 +3623,14 @@ public final class OrgController: ObservableObject {
     /// What to do about a wait that has gone on too long, or nil while it is still normal.
     public var waitingAdvice: String? {
         if let progress = launchProgress {
-            return progress.advice(now: Date())
+            // **The deadline as well as the cause.** This is the row a person reads while a launch is
+            // going nowhere, and "still starting" without "and it will be stopped at Ns" leaves them
+            // unable to tell waiting from watching a stuck screen — which is the whole complaint. The
+            // number is the one the bridge actually enforces, so the sentence on screen is a promise
+            // that is kept rather than a second, drifting account of it.
+            guard let advice = progress.advice(now: Date()) else { return nil }
+            return advice + " A launch that has not reported ready after \(Int(launchTimeout))s is "
+                + "stopped and retried."
         }
         guard let slowest = slowCommands.first else { return nil }
         let budget = Int(slowest.deadline.timeIntervalSince(slowest.sentAt))

@@ -34,13 +34,16 @@ final class AgentProcessServiceTests: XCTestCase {
     /// The invocation is in the config rather than the service, so a test can point the bridge at any
     /// program — which is exactly how these tests exercise pipes without Python in the loop.
     private func launchService(_ script: String,
-                               grace: TimeInterval = 2.0) throws -> AgentProcessService {
+                               grace: TimeInterval = 2.0,
+                               launchTimeout: TimeInterval = AgentProcessService.defaultLaunchTimeout)
+                               throws -> AgentProcessService {
         let config = EngineLaunchConfig(
             runtime: .system(URL(fileURLWithPath: "/bin/sh")),
             engineRoot: URL(fileURLWithPath: FileManager.default.temporaryDirectory.path),
             projectPath: URL(fileURLWithPath: FileManager.default.temporaryDirectory.path),
             arguments: ["-c", script])
-        let service = AgentProcessService(config: config, terminationGrace: grace)
+        let service = AgentProcessService(config: config, terminationGrace: grace,
+                                          launchTimeout: launchTimeout)
         try service.launch()
         return service
     }
@@ -268,8 +271,75 @@ final class AgentProcessServiceTests: XCTestCase {
         XCTAssertEqual(service.state, .running)
     }
 
-    func testAFatalErrorFrameIsReportedAsTheFailureReason() throws {
-        // The engine writes its fatal reason to stdout as a typed frame precisely so the app can read
+    func testReadinessIsAlsoProvenByAReply() throws {
+        // **The frame was the only trigger, and that made the whole console depend on one line being
+        // observed on one pipe at one moment.** If it was missed, `.launching` was permanent: no poll
+        // starts, no reply is applied, and every pane shows a placeholder for an engine that is running
+        // and answering. The engine reads its command stream only *after* the handshake, so a reply is
+        // the same fact by a second route — this child never sends `engine.ready` at all.
+        let ready = expectation(description: "ready from a reply")
+        let service = try launchService(
+            "while read -r line; do echo '{\"v\":1,\"seq\":0,\"type\":\"command.ack\","
+            + "\"payload\":{\"cmd_id\":\"c1\",\"ok\":true,\"detail\":{}}}'; done")
+        defer { service.terminate() }
+        XCTAssertEqual(service.state, .launching, "no frame has been sent")
+        service.onStateChange = { state in if state == .running { ready.fulfill() } }
+        // The console always has commands in flight during a launch: the window loads its providers,
+        // models, roster and capabilities as it opens.
+        service.post("status")
+        wait(for: [ready], timeout: 8)
+        XCTAssertTrue(service.isReady)
+        XCTAssertEqual(service.state, .running)
+    }
+
+    func testABurstIsDeliveredWholeAndReadingContinuesAfterIt() throws {
+        // The reader is a loop rather than one read per readability notification. A notification fires
+        // and keeps firing while the descriptor is readable, so the shape that read once per fire queued
+        // hundreds of reads for bytes that had already been consumed — and every one of them then parked
+        // in `read()` waiting for the next write. Both properties are asserted here: nothing in the
+        // burst is lost, and the stream after it is still read.
+        let ready = expectation(description: "ready after the burst")
+        let lock = NSLock()
+        var entered = 0
+        let service = try launchService(
+            "i=0; while [ $i -lt 200 ]; do echo '{\"v\":1,\"seq\":'$i',\"type\":\"node.enter\","
+            + "\"payload\":{\"node_id\":\"n\"}}'; i=$((i+1)); done; "
+            + "echo '{\"v\":1,\"seq\":1,\"type\":\"engine.ready\",\"payload\":{\"providers\":[]}}'; sleep 30")
+        defer { service.terminate() }
+        service.onEvent = { event in
+            guard event.type == "node.enter" else { return }
+            lock.lock(); entered += 1; lock.unlock()
+        }
+        service.onStateChange = { state in if state == .running { ready.fulfill() } }
+        wait(for: [ready], timeout: 8)
+        lock.lock()
+        let total = entered
+        lock.unlock()
+        XCTAssertEqual(total, 200)
+        XCTAssertEqual(service.state, .running)
+    }
+
+    func testALaunchThatNeverReportsReadyIsAbandoned() throws {
+        // The console's one unbounded wait: `.launching` was left by the readiness frame and by nothing
+        // else, so an engine that never sent one left the window saying "Working…" for the life of the
+        // process — no failure, no retry, no end. The deadline is the bound; this pins that it fires,
+        // that it says what it was waiting for, and that the stop it performs cannot rewrite the verdict
+        // as a clean finish a moment later.
+        let failed = expectation(description: "abandoned")
+        let service = try launchService("sleep 30", launchTimeout: 1.0)
+        service.onStateChange = { state in if state == .failed { failed.fulfill() } }
+        wait(for: [failed], timeout: 10)
+        XCTAssertEqual(service.state, .failed)
+        XCTAssertTrue(service.lastError?.message.contains("did not report ready") ?? false,
+                      service.lastError?.message ?? "nil")
+        // Let the SIGTERM land and the termination handler run; the verdict must survive it.
+        let settled = expectation(description: "settled after the stop")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { settled.fulfill() }
+        wait(for: [settled], timeout: 5)
+        XCTAssertEqual(service.state, .failed, "an abandoned launch is not a clean finish")
+    }
+
+    func testAFatalErrorFrameIsReportedAsTheFailureReason() throws {        // The engine writes its fatal reason to stdout as a typed frame precisely so the app can read
         // it before the exit — otherwise all the app knew was "exited with status 1".
         let failed = expectation(description: "failed")
         let service = try launchService(

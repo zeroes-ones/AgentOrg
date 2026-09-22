@@ -38,6 +38,27 @@ final class OrgControllerTests: XCTestCase {
         XCTAssertEqual(controller.engineDiagnostics.count, 1)
     }
 
+    func testThePermissionHintIsOfferedOnlyForAProtectedFolderAndASilentEngine() {
+        // The one environment cause the console can recognise on its own: an engine that never reported
+        // ready, launched from inside a folder macOS gates behind a permission prompt. Measured on this
+        // machine, the child's first syscall after `exec` is `getcwd()`, macOS implements that as an
+        // `open()` on the working directory, and the `open()` waits for the answer to the Documents
+        // prompt — so the child writes nothing at all and the console sees what a wedged engine looks
+        // like. The hint names it; getting the rule wrong would either stay silent about the one thing a
+        // person can act on, or invent a permission story for an unrelated failure.
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let inside = home.appendingPathComponent("Documents/somewhere")
+        let gated = makeController(root: inside)
+        XCTAssertNotNil(gated.protectedFolderHint(engineIsSilent: true),
+                        "a silent engine from inside a protected folder must be named")
+        XCTAssertNil(gated.protectedFolderHint(engineIsSilent: false),
+                     "an engine that reported ready never gets this advice")
+
+        let outside = makeController(root: FileManager.default.temporaryDirectory)
+        XCTAssertNil(outside.protectedFolderHint(engineIsSilent: true),
+                     "an unprotected folder must not be blamed on a permission prompt")
+    }
+
     func testLaunchFailsFastWhenTheEngineDirectoryIsMissing() {
         // The bug this prevents: `Process.run()` fails with "The file 'AgentOrg' doesn't exist",
         // which is true but never says *which* path was wrong. A bad engine root must be caught
