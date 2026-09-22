@@ -154,10 +154,39 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc signature. Not a Developer ID — enough for the app to launch locally without Gatekeeper
-# quarantining it, which is the difference between "it opens" and "it is damaged".
-codesign --force --deep --sign - "$BUNDLE" >/dev/null 2>&1 \
-  || echo "note: ad-hoc codesign skipped (the app still runs locally)"
+# Signature.
+#
+# Ad-hoc (`-`) is enough to *launch* locally, but it is not enough to *stay* launched, and that was a
+# bug rather than a theory. macOS keys a folder-access grant to the code's designated requirement, and
+# for ad-hoc code that requirement is built from the CDHash — which changes on every single build. So
+# every rebuild silently invalidated the "Allow" the user gave last time: tccd logged "Failed to match
+# existing code requirement for subject dev.agentorg.console and service
+# kTCCServiceSystemPolicyDocumentsFolder", raised the prompt again, and the engine's first syscall
+# blocked until it was answered. That first syscall is `getcwd()` — Python resolves `sys.path[0]` that
+# way, and on macOS `getcwd()` is an `open(".")` on the working directory, which is TCC-gated when the
+# repository lives under ~/Documents. The console then said "Working…" for the life of the process.
+#
+# A certificate-backed identity fixes this at the root: its designated requirement is anchored to the
+# certificate, not to any one build, so the grant survives rebuilds and macOS asks *once*. Any valid
+# codesigning identity will do; an Apple Development certificate is preferred only because it is already
+# trusted. Ad-hoc is still the fallback, so a machine with no identity still builds and runs.
+SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' 'NF>=3 {print $2}' | grep -i '^Apple Development' | head -1)
+[[ -z "$SIGN_IDENTITY" ]] && SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' 'NF>=3 {print $2; exit}')
+
+SIGNED=0
+if [[ -n "$SIGN_IDENTITY" ]]; then
+  if codesign --force --deep --sign "$SIGN_IDENTITY" "$BUNDLE" >/dev/null 2>&1; then
+    echo "==> signed as \"$SIGN_IDENTITY\" — a folder-access grant now survives rebuilds"
+    SIGNED=1
+  else
+    echo "note: signing as \"$SIGN_IDENTITY\" failed; falling back to ad-hoc"
+  fi
+fi
+if [[ "$SIGNED" == 0 ]]; then
+  codesign --force --deep --sign - "$BUNDLE" >/dev/null 2>&1 \
+    || echo "note: ad-hoc codesign skipped (the app still runs locally)"
+  echo "note: ad-hoc signature — macOS will re-ask for folder access after every rebuild"
+fi
 
 echo "==> built $BUNDLE"
 
