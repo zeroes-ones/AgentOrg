@@ -57,6 +57,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from .goal import Posture
+
 try:  # POSIX only. The engine's targets are macOS and Linux. A platform without `flock` still gets
     import fcntl  # the reload-before-every-write, which is the part that fixes the resurrected
 except ImportError:  # pragma: no cover - not a target platform  removal; what it loses is the
@@ -72,6 +74,8 @@ __all__ = [
     "MIN_TICK_S",
     "MAX_TICK_S",
     "DEFAULT_TICK_S",
+    "POSTURES",
+    "DEFAULT_POSTURE",
     "PARKED_OUTCOMES",
     "parse_when",
     "parse_duration",
@@ -83,6 +87,15 @@ __all__ = [
 SCHEDULE_FILENAME = "schedules.json"
 #: Bumped when the document's shape changes incompatibly.
 SCHEDULE_VERSION = "1.0.0"
+
+#: The postures a scheduled entry may name, and the one it gets when a person does not choose.
+#:
+#: Read from `goal.Posture` rather than written out here, because the terminal's
+#: `schedules add --posture` takes *this* tuple as its `choices` and `DEFAULT_POSTURE` as its own
+#: default: three copies of one word (the field, the check in `__post_init__`, and the flag) is how
+#: a schedule ends up accepting a posture the goal cannot resolve.
+POSTURES: tuple[str, ...] = tuple(posture.value for posture in Posture)
+DEFAULT_POSTURE: str = Posture.UNATTENDED.value
 
 #: The tick bounds. The floor exists because a sub-five-second tick is a busy loop dressed as a
 #: schedule; the ceiling because anything longer than an hour belongs to cron, not to a foreground
@@ -187,7 +200,7 @@ class ScheduleEntry:
 
     slug: str
     objective: str
-    posture: str = "unattended"
+    posture: str = DEFAULT_POSTURE
     interval_s: int = 0
     next_due_at: str = ""
     enabled: bool = True
@@ -209,9 +222,10 @@ class ScheduleEntry:
             self.created_at = _iso_now()
         if not self.updated_at:
             self.updated_at = self.created_at
-        if self.posture not in ("unattended", "supervised"):
+        if self.posture not in POSTURES:
             raise ScheduleError(
-                f"unknown posture {self.posture!r}; expected unattended or supervised"
+                f"unknown posture {self.posture!r}; expected one of "
+                + ", ".join(POSTURES)
             )
 
     # ── the due predicate ───────────────────────────────────────────────────
@@ -338,7 +352,7 @@ class ScheduleEntry:
         return cls(
             slug=slug,
             objective=objective,
-            posture=str(data.get("posture") or "unattended").strip().lower(),
+            posture=str(data.get("posture") or DEFAULT_POSTURE).strip().lower(),
             interval_s=int(data.get("interval_s") or 0),
             next_due_at=str(data.get("next_due_at") or ""),
             enabled=bool(data.get("enabled", True)),
@@ -585,7 +599,7 @@ class ScheduleStore:
 
     # ── mutation ────────────────────────────────────────────────────────────
 
-    def add(self, *, objective: str, slug: str = "", posture: str = "unattended",
+    def add(self, *, objective: str, slug: str = "", posture: str = DEFAULT_POSTURE,
             every: str | int | None = None, at: str | None = None,
             due_now: bool = False, enabled: bool = True,
             now: float | None = None) -> ScheduleEntry:
@@ -629,7 +643,7 @@ class ScheduleStore:
                 "or --due-now (at the next tick)"
             )
         entry = ScheduleEntry(slug=target, objective=text,
-                              posture=str(posture or "unattended").strip().lower(),
+                              posture=str(posture or DEFAULT_POSTURE).strip().lower(),
                               interval_s=interval, next_due_at=due, enabled=enabled)
         if not enabled:
             entry.disabled_reason = "added disabled"
@@ -781,10 +795,10 @@ def posture_policy(orch: Any, posture: str) -> Any:
     passes its own object to :func:`fire` so a scheduled run cannot end up with a different authority
     from a typed one.
     """
-    from .goal import GoalPolicy, Posture
+    from .goal import GoalPolicy
 
     base = orch._default_goal_policy()
-    resolved = Posture(str(posture or "unattended").strip().lower())
+    resolved = Posture(str(posture or DEFAULT_POSTURE).strip().lower())
     return GoalPolicy(
         auto_approve=base.auto_approve if resolved is Posture.UNATTENDED else False,
         auto_hire=base.auto_hire,
