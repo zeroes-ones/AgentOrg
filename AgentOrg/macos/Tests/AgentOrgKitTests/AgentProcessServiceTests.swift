@@ -74,6 +74,18 @@ final class AgentProcessServiceTests: XCTestCase {
         XCTAssertEqual(environment["AGENTORG_PROJECT"], "/tmp/proj")
     }
 
+    func testNoPinnedLibraryMeansNoVariableAndThereforeDiscovery() {
+        // **The variable's absence is the app's half of "let the engine look for one".** The engine
+        // treats an *empty* value as a candidate too, so exporting `""` would not be the same
+        // statement as exporting nothing — this pins that an unpinned launch leaves the key out
+        // entirely, which is how the console's Clear button restores the pre-pin behaviour.
+        let config = EngineLaunchConfig(
+            runtime: .system(URL(fileURLWithPath: "/bin/sh")),
+            engineRoot: URL(fileURLWithPath: "/tmp/engine"),
+            projectPath: URL(fileURLWithPath: "/tmp/proj"))
+        XCTAssertNil(config.resolvedEnvironment["AGENTORG_SKILLS_ROOT"])
+    }
+
     // MARK: - Attaching a project
 
     func testNoAttachedProjectMeansUnchangedArguments() {

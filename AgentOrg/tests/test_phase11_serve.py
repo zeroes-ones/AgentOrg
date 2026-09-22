@@ -1907,3 +1907,63 @@ def test_stop_now_is_the_last_resort_it_claims_to_be(tmp_path):
     payloads = _acks_from(seen)
     assert payloads, "os._exit fired before the command in flight could be acknowledged"
     assert payloads[-1]["cmd_id"] == "c1" and payloads[-1]["ok"] is True
+
+
+# ── the library, as the engine itself resolves it ────────────────────────────
+
+
+def test_the_library_command_reports_the_root_the_engine_resolved(config, library):
+    """The app shows *this* sentence rather than testing `scripts/workflow-runner.py` itself: whether
+    a directory is a usable library is the engine's answer, and a Swift copy of that rule would be a
+    weaker second version of `library.resolve`."""
+    payload = Server(config=config, library=library, workspace=None)._cmd_library({})
+    assert payload["ok"] is True
+    assert payload["root"] == str(library.files.root)
+    assert payload["detail"].startswith(payload["root"])
+    assert payload["capabilities_verified"] is True, "a resolved library has checked its capabilities"
+
+
+def test_the_library_command_is_answered_over_the_wire(config, library):
+    """Read like any other panel command, so a refusal is visible rather than silent."""
+    _, events = drive(config, library, [{"cmd_id": "c1", "type": "library"}])
+    payload = ack_for(events, "c1")
+    assert payload is not None and payload["ok"] is True
+    assert payload["detail"]["root"] == str(library.files.root)
+
+
+def test_the_library_command_reports_the_candidates_it_would_probe_unpinned(config, library):
+    """The console renders this list rather than keeping a copy of it, so the payload has to be the
+    engine's own function — a literal repeated in the test would be the very second copy this
+    prevents."""
+    from engine.library import unpinned_search_paths
+
+    payload = Server(config=config, library=library, workspace=None)._cmd_library({})
+    assert payload["search_paths"] == unpinned_search_paths()
+    assert payload["search_paths"], "there is always somewhere to look"
+
+
+def test_the_library_command_says_whether_the_root_was_pinned_or_discovered(config, library, monkeypatch):
+    """The app sets `$AGENTORG_SKILLS_ROOT` from the person's choice, so this is how it can tell "the
+    value I sent was used" from "I sent nothing and the engine found one" — and from the third case,
+    which is the one worth naming: the variable is a *preferred candidate* in
+    `default_search_paths()`, so a pinned path with no runner does not stop the engine, it runs a
+    checkout behind it instead."""
+    server = Server(config=config, library=library, workspace=None)
+    monkeypatch.delenv("AGENTORG_SKILLS_ROOT", raising=False)
+    assert server._cmd_library({})["source"] == "discovered"
+    monkeypatch.setenv("AGENTORG_SKILLS_ROOT", str(library.files.root))
+    assert server._cmd_library({})["source"] == "pinned"
+    monkeypatch.setenv("AGENTORG_SKILLS_ROOT", "/tmp/not-a-library")
+    assert server._cmd_library({})["source"] == "fallback"
+    assert server._cmd_library({})["root"] == str(library.files.root), \
+        "a fallback still reports the root that actually resolved"
+
+
+def test_the_library_command_with_nothing_attached_says_so_rather_than_claiming_a_root():
+    """A key the engine cannot fill is not invented: no root is reported, and the candidates still
+    are, because they describe the engine rather than the attached checkout."""
+    payload = Server(config=None, library=None, workspace=None)._cmd_library({})
+    assert payload["ok"] is False
+    assert payload["root"] == ""
+    assert payload["source"] == "none"
+    assert payload["search_paths"], "the candidates do not depend on a library being attached"

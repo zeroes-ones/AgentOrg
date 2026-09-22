@@ -2073,7 +2073,16 @@ struct UsageSection: View {
             KeyValueRow(key: "runtime", value: controller.runtimeDescription)
             KeyValueRow(key: "project", value: controller.projectPath)
             KeyValueRow(key: "credentials", value: controller.credentialsPath)
-            KeyValueRow(key: "skills", value: controller.libraryPath)
+            KeyValueRow(key: "skills", value: controller.libraryPathDescription)
+            if let sentence = controller.librarySentence {
+                // Only once the engine has answered, so this row never shows a path or a description
+                // this app invented — see `librarySentence`.
+                Text(sentence)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let error = controller.engineError {
                 KeyValueRow(key: "error", value: error, tone: .red)
             }

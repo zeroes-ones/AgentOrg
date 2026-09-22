@@ -2110,6 +2110,68 @@ class Server:
         return {"retired": spec.as_dict(),
                 "agents": self._cmd_agents({})["agents"]}
 
+    def _cmd_library(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Where the Skills library is, in the engine's own words — and where it would look.
+
+        **Why a command rather than a sentence in the app.** Whether a directory is a usable library
+        is this engine's answer: only `library.resolve` probes for the runner and asserts the
+        capabilities a run depends on, so a console that tested `scripts/workflow-runner.py` itself
+        would be a second, weaker copy of that rule that goes stale the first time the layout changes.
+        This reports what the engine actually resolved, plus the two facts a person needs to decide
+        what to pin:
+
+        - `root` / `detail` / the `verification_report()` keys — the library this engine is using and
+          what was actually checked about it (`capabilities checked; content unpinned` is not the same
+          claim as "verified", which is why the report keeps the facts apart).
+        - `source` — which root the engine ended up using, and why. `pinned` means the root named by
+          `$AGENTORG_SKILLS_ROOT` is the one that resolved; `fallback` means a pin was given but that
+          checkout had no usable runner, so a candidate behind it was used instead; `discovered` means
+          nothing was pinned. **`fallback` is a fact the app must be able to show**, because the
+          override is a *preferred candidate* in `default_search_paths()`, not a hard assertion — a
+          pinned path that is not a library does not stop the engine, it quietly runs something else,
+          and a console that reported "pinned" for it would be describing a launch that did not happen.
+        - `search_paths` — the roots the engine probes **when nothing is pinned**, straight from
+          `library.unpinned_search_paths()`. The app renders these rather than keeping its own copy of
+          the list, which is the same rule `syscap.console_payload` follows for the capabilities.
+
+        A library the engine could not resolve at all never reaches here: `serve` refuses to start over
+        one, and reports `library`'s own sentence as a fatal bootstrap `error` frame instead — which is
+        the answer the console shows for a root that does not work and nothing else does either.
+        """
+        from .library import unpinned_search_paths
+
+        search_paths = unpinned_search_paths()
+        library = self.library
+        if library is None:
+            return {
+                "ok": False,
+                "root": "",
+                "commit": "",
+                "detail": "no Skills library is attached to this engine",
+                "source": "none",
+                "search_paths": search_paths,
+            }
+        files = library.files
+        override = os.environ.get("AGENTORG_SKILLS_ROOT") or ""
+        if not override:
+            source = "discovered"
+        elif str(Path(override).expanduser()) == str(files.root):
+            source = "pinned"
+        else:
+            source = "fallback"
+        return {
+            "ok": True,
+            "root": str(files.root),
+            "commit": library.commit or "",
+            # The same sentence `doctor`'s library check prints, so the console and the CLI cannot
+            # describe one checkout two ways.
+            "detail": (f"{files.root} at commit {str(library.commit or '')[:12]} — "
+                       f"{library.verification_summary()}"),
+            "source": source,
+            "search_paths": search_paths,
+            **library.verification_report(),
+        }
+
     def _cmd_skills(self, payload: dict[str, Any]) -> dict[str, Any]:
         """The skills an agent can be hired for, so the console offers real ones rather than a guess."""
         return {"skills": self._skill_names()}

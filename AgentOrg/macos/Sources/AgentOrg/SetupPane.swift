@@ -1259,6 +1259,89 @@ struct AutonomyStep: View {
     }
 }
 
+// MARK: - The Skills library root
+
+/// Pin the root of the Skills library, or clear it so the engine searches for one.
+///
+/// **The field never validates a path, and that is deliberate.** Whether a directory is a usable
+/// library is the engine's answer: `library.resolve` probes for `scripts/workflow-runner.py` and
+/// asserts the CLI surface a run depends on, and a Swift check would be a weaker second rule that
+/// goes stale the first time the layout changes — blessing a directory the engine then refuses. So
+/// this pins, and the engine's verdict arrives with the launch the pin is applied to: a usable root
+/// reaches ready and answers `library` (whose sentence is shown below), and one it refuses makes
+/// `serve` emit its own `library.resolve` sentence as a fatal bootstrap frame, which the failure
+/// banner shows verbatim.
+///
+/// **Empty means discover.** Clearing the field is not an error state: it is the statement "let the
+/// engine look for one", which is the behaviour before this setting existed and has to stay reachable
+/// — so the Clear button writes nothing rather than a blank path the engine would then refuse.
+struct LibraryRootEditor: View {
+    @ObservedObject var controller: OrgController
+    @State private var draft: String = ""
+
+    /// Whether the field differs from what is pinned, so "Use this folder" is offered only when it
+    /// would change something. Compared after trimming, because that is how the preference stores it:
+    /// otherwise a single trailing space would enable a button that writes the same value.
+    private var isDirty: Bool {
+        draft.trimmingCharacters(in: .whitespacesAndNewlines) != (controller.pinnedLibraryRoot ?? "")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Skills library root").font(.subheadline.weight(.medium))
+            Text("The engine needs a checkout of `zeroes-ones/Skills` — it becomes the prompts and the "
+                 + "completion criteria every run is held to. Pin one here and the engine is told where "
+                 + "it is; leave it empty and the engine looks for it itself, which on a machine whose "
+                 + "checkout is inside ~/Documents means macOS may ask for permission before the engine "
+                 + "can start.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                TextField("/path/to/Skills", text: $draft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.caption, design: .monospaced))
+                    .accessibilityLabel("Skills library root")
+                    .accessibilityHint("Leave empty to let the engine search for the library itself")
+                Button("Choose…") { chooseFolder() }
+                    .controlSize(.small)
+                Button("Use this folder") { Task { await controller.setLibraryRoot(draft) } }
+                    .controlSize(.small)
+                    .disabled(!isDirty)
+                Button("Clear") {
+                    draft = ""
+                    Task { await controller.setLibraryRoot(nil) }
+                }
+                .controlSize(.small)
+                .disabled(!controller.libraryIsPinned)
+                .help("Unpin the library and let the engine search for one itself.")
+            }
+            Text(controller.libraryIsPinned
+                 ? "Pinned. The engine is told this root at launch; changing it relaunches the engine."
+                 : "Not pinned — the engine will look for the library itself at launch.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .onAppear { draft = controller.pinnedLibraryRoot ?? "" }
+    }
+
+    /// Choose a folder with the standard panel, then pin it. A folder rather than a file, and no
+    /// validation of what is inside it — see the type's note above.
+    private func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "Use this folder"
+        panel.message = "Choose the Skills checkout that contains scripts/workflow-runner.py."
+        panel.directoryURL = controller.pinnedLibraryRoot.map { URL(fileURLWithPath: $0) }
+            ?? URL(fileURLWithPath: FileManager.default.homeDirectoryForCurrentUser.path)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        draft = url.path
+        Task { await controller.setLibraryRoot(url.path) }
+    }
+}
+
 // MARK: - Setup, as a destination
 
 /// The same steps, editable at leisure — plus the two cards that are not steps.
@@ -1337,9 +1420,41 @@ struct SetupPane: View {
                 }
                 SectionCard(title: SetupSection.skills.rawValue, symbol: SetupSection.skills.symbol,
                             summary: SetupSection.skills.summary) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        KeyValueRow(key: "root", value: controller.libraryPath)
+                    VStack(alignment: .leading, spacing: 10) {
+                        LibraryRootEditor(controller: controller)
+                        Divider()
+                        KeyValueRow(key: "in use", value: controller.libraryPathDescription)
                         KeyValueRow(key: "available", value: "\(controller.skills.count) skill(s)")
+                        if let sentence = controller.librarySentence {
+                            // The engine's own sentence about the library it resolved, shown rather
+                            // than paraphrased: what was checked (`capabilities checked; content
+                            // unpinned` is not "verified") is a distinction only the engine knows.
+                            Text(sentence)
+                                .font(.caption2).foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if !controller.libraryIsPinned, !controller.librarySearchPaths.isEmpty {
+                            // The engine's own candidate list, not one spelled here — a Swift copy
+                            // of `library.unpinned_search_paths()` would be a second answer to a
+                            // question the engine already answers.
+                            Text("With nothing pinned the engine probes: "
+                                 + controller.librarySearchPaths.joined(separator: ", "))
+                                .font(.caption2).foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if controller.libraryPinNotUsed {
+                            // The engine's semantics, not this app's: the pinned path is a *preferred
+                            // candidate*, so one without a runner is skipped rather than refused.
+                            // Shown here because a path that does not match what was typed is exactly
+                            // the kind of silent difference this pane exists to surface.
+                            Label("The pinned root was not used — the engine found no "
+                                  + "scripts/workflow-runner.py there, so it ran the checkout named "
+                                  + "above instead.", systemImage: "exclamationmark.triangle")
+                                .font(.caption2).foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                         if controller.skills.isEmpty {
                             // Which read is outstanding, rather than only an empty figure: "0 skill(s)"
                             // beside a button reads as a missing feature, and the list is a round trip

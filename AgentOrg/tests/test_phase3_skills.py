@@ -19,7 +19,9 @@ from engine.library import (
     PIN_ENV,
     LibraryError,
     _RUNNER_CAPABILITIES,  # noqa: PLC2701 - the stub must satisfy the same list the engine asserts
+    default_search_paths,
     resolve,
+    unpinned_search_paths,
 )
 from engine.skills import (
     FilesystemSkillSource,
@@ -780,3 +782,33 @@ def test_a_pin_that_records_no_hashes_is_refused_rather_than_accepted(tmp_path):
     pin.write_text('{"commit": null, "files": {}}', encoding="utf-8")
     with pytest.raises(LibraryError, match="no file hashes"):
         resolve(root, pin_path=pin)
+
+
+# ── where the engine looks when nothing is pinned ────────────────────────────
+
+
+def test_the_unpinned_search_paths_are_under_the_users_home_in_order():
+    """**The list a console shows instead of its own.** A surface that spells these three paths
+    itself is a second copy of an engine-owned list, which is how a console comes to describe a
+    search the engine does not perform. Built from `Path.home()` rather than matching literal
+    strings, so this test does not become the copy it exists to prevent."""
+    home = pathlib.Path.home()
+    assert unpinned_search_paths() == [
+        str(home / "Documents" / "Projects" / "Skills"),
+        str(home / ".zeroes-ones" / "skills"),
+        str(home / ".agentorg" / "skills"),
+    ]
+
+
+def test_default_search_paths_prepends_the_override_only_when_one_is_set(monkeypatch):
+    """`unpinned_search_paths()` is the list *without* `$AGENTORG_SKILLS_ROOT`, and
+    `default_search_paths()` is that list with the override in front when it is set — the two must
+    be one list, or a reader asking "where would it look if I pin nothing" gets a different answer
+    from the search itself."""
+    monkeypatch.delenv("AGENTORG_SKILLS_ROOT", raising=False)
+    assert default_search_paths() == unpinned_search_paths()
+
+    monkeypatch.setenv("AGENTORG_SKILLS_ROOT", "/tmp/pinned-skills")
+    assert default_search_paths() == ["/tmp/pinned-skills"] + unpinned_search_paths()
+    assert unpinned_search_paths() == default_search_paths()[1:], \
+        "a pin must not change the defaults a person is shown"

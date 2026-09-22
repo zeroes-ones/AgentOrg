@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any
 
 __all__ = ["LibraryError", "LibraryFiles", "Library", "resolve", "sha256_file", "sha256_text",
-           "load_pin", "default_pin_path", "PIN_ENV"]
+           "load_pin", "default_pin_path", "default_search_paths", "unpinned_search_paths", "PIN_ENV"]
 
 
 class LibraryError(RuntimeError):
@@ -495,6 +495,27 @@ def _first_existing(paths: list[str]) -> Path | None:
     return None
 
 
+def unpinned_search_paths() -> list[str]:
+    """The roots probed when nothing is pinned, in order of preference.
+
+    **A function of its own, and the reason is that a surface must not keep its own copy of this
+    list.** `default_search_paths()` returns this list *plus* a leading override, which is the shape
+    :func:`resolve` needs; a reader answering "where would the engine look if I pinned nothing?" wants
+    exactly what this returns, and spelling the three paths anywhere else is how the list in a console
+    comes to disagree with the list the engine searches. `serve._cmd_library` reports this, so the app
+    shows these rather than its own.
+
+    Order matters: the documented sibling checkout first (the common layout), then the installer's
+    conventional locations.
+    """
+    home = Path.home()
+    return [
+        str(home / "Documents" / "Projects" / "Skills"),
+        str(home / ".zeroes-ones" / "skills"),
+        str(home / ".agentorg" / "skills"),
+    ]
+
+
 def default_search_paths() -> list[str]:
     """Candidate library roots, most specific first.
 
@@ -507,12 +528,7 @@ def default_search_paths() -> list[str]:
     candidates: list[str] = []
     if override:
         candidates.append(override)
-    home = Path.home()
-    candidates += [
-        str(home / "Documents" / "Projects" / "Skills"),
-        str(home / ".zeroes-ones" / "skills"),
-        str(home / ".agentorg" / "skills"),
-    ]
+    candidates += unpinned_search_paths()
     return candidates
 
 

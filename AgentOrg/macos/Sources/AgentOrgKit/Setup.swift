@@ -634,6 +634,7 @@ public final class AppPreferences {
         static let posture = "setup.goalPosture"
         static let projectConfirmed = "setup.projectConfirmed"
         static let wizardDone = "setup.wizardCompleted"
+        static let libraryRoot = "setup.libraryRoot"
     }
 
     private let store: PreferenceStore
@@ -694,7 +695,41 @@ public final class AppPreferences {
         set { store.set(newValue, forKey: Key.wizardDone) }
     }
 
+    /// The Skills library root the person pinned, or nil to let the engine look for one.
+    ///
+    /// **Persisted here rather than in the engine's config, because it is this app's choice about how
+    /// to *launch* the engine.** The engine already accepts a root (`library.resolve`) and already
+    /// honours `$AGENTORG_SKILLS_ROOT`; what was missing was a way for a person to say which one, so
+    /// the engine had to search — and on a machine whose checkout is under `~/Documents` that search
+    /// is an `open()` macOS gates behind a permission prompt, before the engine can report ready. The
+    /// console exports the variable from this value, so pinning it here is what makes a launch
+    /// independent of that dialog.
+    ///
+    /// **An empty value is the same state as no value.** A cleared field produces `""`, and the
+    /// honest reading of "I cleared it" is "let the engine discover one" — which is the behaviour
+    /// before this preference existed and has to stay reachable. Whitespace is trimmed for the same
+    /// reason: a field holding a single space is a cleared field, not a root named " ".
+    public var libraryRoot: String? {
+        get {
+            guard let raw = store.string(forKey: Key.libraryRoot) else { return nil }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        set {
+            let trimmed = newValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if trimmed.isEmpty {
+                store.removeObject(forKey: Key.libraryRoot)
+            } else {
+                store.set(trimmed, forKey: Key.libraryRoot)
+            }
+        }
+    }
+
     /// Forget every app-level choice, so the wizard shows again. For support, and for a test.
+    ///
+    /// The pinned library root is deliberately *not* cleared here: it is not one of the wizard's
+    /// questions but a decision about where the engine finds a dependency, and a person re-running
+    /// setup to answer the wizard again did not ask to forget it.
     public func reset() {
         store.removeObject(forKey: Key.posture)
         store.removeObject(forKey: Key.projectConfirmed)

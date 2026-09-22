@@ -37,7 +37,18 @@ public final class OrgController: ObservableObject {
     @Published public private(set) var engineFailure: String?
     @Published public private(set) var projectPath: String = ""
     @Published public private(set) var credentialsPath: String = ""
-    @Published public private(set) var libraryPath: String = ""
+    /// The engine's answer to `library`: where the Skills library is, the sentence describing it, and
+    /// the roots it would probe when nothing is pinned.
+    ///
+    /// Held whole, as the engine reported it, for the same reason `system` is: the pane must be able
+    /// to say *why* — a pinned root the engine used, or one it discovered — and re-fetching the parts
+    /// separately would let the sentence and the list disagree for a frame. Empty before the first
+    /// reply, which is the honest state: the engine has not been asked yet.
+    ///
+    /// Nothing about a library root is decided here. Whether a directory is usable is
+    /// `engine/library.py`'s answer, so this is a decode of that answer rather than a check in Swift
+    /// — see `libraryPath` and `librarySentence`.
+    @Published public private(set) var library: [String: JSONValue] = [:]
     /// Lines from the Python engine's own diagnostics, separate from the protocol events.
     @Published public private(set) var engineDiagnostics: [String] = []
 
@@ -681,14 +692,25 @@ public final class OrgController: ObservableObject {
                 launchTimeout: TimeInterval = OrgController.defaultLaunchTimeout,
                 preferences: AppPreferences? = nil,
                 proposalDismissals: PreferenceStore = UserDefaults.standard) {
-        self.settings = settings
+        // **The person's pinned library root wins over discovery.** `OrgSettings.discover` leaves
+        // `libraryRoot` nil because the app has no opinion at startup; the stored preference is the
+        // opinion, and it has to be applied *here* so every launch from this controller — including
+        // the first, which happens from the window's own `.task` — passes it to the child. Assigning
+        // it after construction would leave the first spawn discovering a library, which is the one
+        // launch the whole change exists for.
+        let prefs = preferences ?? AppPreferences()
+        var effectiveSettings = settings
+        if let pinned = prefs.libraryRoot {
+            effectiveSettings.libraryRoot = URL(fileURLWithPath: pinned)
+        }
+        self.settings = effectiveSettings
         self.logs = logs ?? LogStore()
-        self.writer = WorkspaceWriter(root: settings.projectPath)
-        self.runtime = settings.runtimeOverride ?? PythonRuntimeResolver.resolveFromEnvironment()
-        self.arguments = settings.argumentsOverride ?? ["-m", "engine.cli", "serve"]
-        self.projectPath = settings.projectPath.path
-        self.credentialsPath = settings.credentialsPath?.path ?? "(not set)"
-        self.libraryPath = settings.libraryRoot?.path ?? "(auto-discovered)"
+        self.writer = WorkspaceWriter(root: effectiveSettings.projectPath)
+        self.runtime = effectiveSettings.runtimeOverride
+            ?? PythonRuntimeResolver.resolveFromEnvironment()
+        self.arguments = effectiveSettings.argumentsOverride ?? ["-m", "engine.cli", "serve"]
+        self.projectPath = effectiveSettings.projectPath.path
+        self.credentialsPath = effectiveSettings.credentialsPath?.path ?? "(not set)"
         self.engineDiagnostics = ["runtime: \(runtime.display)"]
         self.notifier = notifier ?? SystemConsoleNotifier()
         self.maxRestartAttempts = max(0, maxRestartAttempts)
@@ -701,7 +723,7 @@ public final class OrgController: ObservableObject {
         // zero made the first launch look like it had already given up.
         self.restartAttemptsRemaining = max(0, maxRestartAttempts)
         self.offline = RunStateBrowser(writer: self.writer)
-        self.preferences = preferences ?? AppPreferences()
+        self.preferences = prefs
         self.proposalDismissals = proposalDismissals
         self.hiddenProposalIds = Set(
             proposalDismissals.stringArray(forKey: Self.hiddenProposalsKey) ?? [])
@@ -835,13 +857,19 @@ public final class OrgController: ObservableObject {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         // The folders macOS gates behind a permission prompt, by their real paths under the user's home.
         let protected = ["Documents", "Desktop", "Downloads"].map { home + "/" + $0 }
-        // The library root joins the two the launch itself needs, but only when the console has pinned
-        // it: `AgentProcessService` then tells the child to read it (`AGENTORG_SKILLS_ROOT`) *before* it
-        // reports ready, so a gated one is the same failure by the same cause. Left unpinned — which is
-        // what this app does — the path is the engine's business, and the sentence below says so rather
-        // than the console pretending to know it.
-        let roots = [settings.engineRoot.path, settings.projectPath.path]
-            + [settings.libraryRoot?.path].compactMap { $0 }
+        // Where the library sits joins the two the launch itself needs. Pinned, that path is a fact
+        // the console holds and `AgentProcessService` tells the child to read (`AGENTORG_SKILLS_ROOT`)
+        // *before* it reports ready, so a gated one is the same failure by the same cause. Unpinned,
+        // the roots the *engine* reported it would probe join them — and only those: a list spelled
+        // here would be this app's copy of `library.unpinned_search_paths()`, which is the drift the
+        // engine's own `search_paths` key exists to prevent. Before the engine has ever answered there
+        // are none, and the sentence below still names the possibility.
+        var roots = [settings.engineRoot.path, settings.projectPath.path]
+        if let pinned = settings.libraryRoot?.path {
+            roots.append(pinned)
+        } else {
+            roots += librarySearchPaths
+        }
         let gated = roots.filter { path in protected.contains { path == $0 || path.hasPrefix($0 + "/") } }
         guard !gated.isEmpty else { return nil }
         var sentence = " The engine never reported ready, and a folder it has to read before it can "
@@ -853,12 +881,17 @@ public final class OrgController: ObservableObject {
             // The variant measured on this machine, and the reason this clause exists: the launch's own
             // folders were readable and the block was the child opening the Skills checkout the engine
             // discovers for itself (`engine/library.py`'s `assert_capabilities`, reached from `_load_stack`
-            // before `serve_forever`). Nobody pinned that path, so the console cannot name it — it can
-            // still name the possibility and the second way out, which is the difference between a
-            // person moving a folder and a person filing another bug report.
-            sentence += " The engine also reads the Skills library it discovers for itself before it "
-                + "reports ready; a checkout kept beside the repository is under the same protection, and "
-                + "pinning `AGENTORG_SKILLS_ROOT` at a copy outside it is the other way out."
+            // before `serve_forever`). Nobody pinned that path, so the console cannot name one — but it
+            // can name the engine's own candidates, and the second way out, which is the difference
+            // between a person moving a folder and a person filing another bug report.
+            var clause = " The engine also reads the Skills library it discovers for itself before it "
+                + "reports ready; a checkout kept beside the repository is under the same protection, "
+                + "so pinning one outside it in Setup is the other way out."
+            if !librarySearchPaths.isEmpty {
+                clause += " The engine looks for it at: "
+                    + librarySearchPaths.joined(separator: ", ") + "."
+            }
+            sentence += clause
         }
         return sentence
     }
@@ -878,6 +911,12 @@ public final class OrgController: ObservableObject {
         // A fresh launch clears the previous failure, so a fixed config does not leave a stale banner.
         engineFailure = nil
         engineError = nil
+        // **And the previous library answer goes with it.** The engine is about to be spawned with
+        // whatever root this controller now holds, so the last child's answer — its root, its commit,
+        // its sentence — is a fact about a different process. Leaving it up would draw a healthy
+        // library beside a launch that is failing over a different one; the next engine's `library`
+        // reply (or its fatal bootstrap frame, for a root it refuses) replaces it.
+        library = [:]
         restartTask?.cancel()
         restartTask = nil
         if !isRestartAttempt {
@@ -2645,6 +2684,144 @@ public final class OrgController: ObservableObject {
 
     public var hasPortfolio: Bool { !portfolioOrgs.isEmpty }
 
+    // MARK: - The Skills library
+
+    /// Load the engine's own answer about the Skills library — where it is, what was checked about it,
+    /// and the roots it would probe when nothing is pinned.
+    ///
+    /// Read from `serve._cmd_library` rather than assembled here, and that is the point: whether a
+    /// directory is a usable library is decided by `library.resolve`, which probes for the runner and
+    /// asserts the CLI surface a run depends on. A Swift check would be a weaker second rule that goes
+    /// stale the first time the layout changes, and the failure mode is a console blessing a
+    /// directory the engine then refuses.
+    ///
+    /// Part of the window's fill and of the slow cadence, like `system`: the library is a fact about
+    /// the machine's setup, not about a run, and it changes when a person pins a different root.
+    public func loadLibrary() async {
+        await fetch("library") { [weak self] payload in
+            self?.applyLibrary(payload)
+        }
+    }
+
+    /// Adopt one `library` reply. Internal so a test can drive the pane without a live engine.
+    func applyLibrary(_ payload: [String: JSONValue]) {
+        // The candidate list is a fact about this machine's home directory and the engine's own
+        // search, so it outlives the reply it arrived in — see `knownLibrarySearchPaths`. The rest
+        // of the payload is about one process and is withdrawn by the next launch.
+        let reported = (payload["search_paths"]?.arrayValue ?? []).compactMap { $0.stringValue }
+        if !reported.isEmpty { knownLibrarySearchPaths = reported }
+        assignIfChanged(\.library, payload)
+    }
+
+    /// Where the Skills library is **as the engine resolved it**, or the root the console pinned
+    /// before the engine has answered.
+    ///
+    /// Never a guess about a discovered path: an unpinned console cannot know which checkout the
+    /// engine will use — the whole reason the engine has to search — so before a reply this is empty
+    /// and the panes say the engine will look for it itself (see `libraryPathDescription`). The
+    /// previous `"(auto-discovered)"` was a phrase pretending to be a path.
+    public var libraryPath: String {
+        if let root = library["root"]?.stringValue, !root.isEmpty { return root }
+        return settings.libraryRoot?.path ?? ""
+    }
+
+    /// Whether the console pinned the root rather than letting the engine search for one.
+    public var libraryIsPinned: Bool { settings.libraryRoot != nil }
+
+    /// The root the console will send the engine on the next launch, or nil when it will send none.
+    ///
+    /// The settings' own value rather than `libraryPath`: this is what the *editor* shows, and it must
+    /// be the value that will be exported, not the one the running engine happened to resolve.
+    public var pinnedLibraryRoot: String? { settings.libraryRoot?.path }
+
+    /// The engine's own sentence about the library, or nil before it has been asked.
+    public var librarySentence: String? {
+        guard let detail = library["detail"]?.stringValue, !detail.isEmpty else { return nil }
+        return detail
+    }
+
+    /// The roots the engine probes when nothing is pinned, as the engine reported them.
+    ///
+    /// Live reply first, then the last list the engine ever reported — because the list describes the
+    /// engine's own search (`library.unpinned_search_paths()`, derived from this machine's home), not
+    /// one process, and the moment it is needed most is a launch that is *failing*: `library` is
+    /// withdrawn when a launch starts, so without this a hang would lose the very paths that explain
+    /// it. Empty only until the engine has ever answered, in which case a pane says nothing about
+    /// paths rather than rendering a list this app made up.
+    public var librarySearchPaths: [String] {
+        let live = (library["search_paths"]?.arrayValue ?? []).compactMap { $0.stringValue }
+        return live.isEmpty ? knownLibrarySearchPaths : live
+    }
+
+    /// The last candidate list the engine reported. Not published: it is read through
+    /// `librarySearchPaths`, which is what a view observes.
+    private var knownLibrarySearchPaths: [String] = []
+
+    /// Whether the engine chose the root itself, rather than using one the console sent.
+    ///
+    /// From the engine's `source`, not from the app's own settings: an app that decided this would
+    /// report "pinned" for a value the child never saw, which is exactly the drift this field exists
+    /// to expose.
+    public var libraryWasDiscovered: Bool { library["source"]?.stringValue == "discovered" }
+
+    /// A pin was sent but the engine is using a different checkout — the one case that silently
+    /// contradicts the field.
+    ///
+    /// `$AGENTORG_SKILLS_ROOT` is a *preferred candidate* to `library.resolve`, not an assertion: a
+    /// pinned path with no `scripts/workflow-runner.py` is skipped and a candidate behind it is used.
+    /// That is the engine's semantic, not this app's to change — but it means a person can pin one
+    /// path and get another, so it is *said* rather than left to be discovered by reading a path that
+    /// does not match what they typed.
+    public var libraryPinNotUsed: Bool {
+        libraryIsPinned && library["source"]?.stringValue == "fallback"
+    }
+
+    /// What to show where the library root is reported.
+    ///
+    /// The engine's resolved path once it has answered; otherwise the pinned root; otherwise a
+    /// sentence rather than an empty cell — an unpinned console genuinely does not know which
+    /// checkout the engine will use, and saying so is the honest rendering of that.
+    public var libraryPathDescription: String {
+        if !libraryPath.isEmpty { return libraryPath }
+        return "the engine will look for it itself (not read yet)"
+    }
+
+    /// Pin the Skills library root, or clear it so the engine discovers one again.
+    ///
+    /// **This writes a preference and relaunches; it does not test the path.** Whether the value is a
+    /// usable library is the engine's verdict, delivered by the launch it is applied to: a root the
+    /// engine can use reaches ready and answers `library`, and one it cannot makes `serve` emit its
+    /// own `library.resolve` sentence as a fatal bootstrap frame, which the failure banner shows
+    /// verbatim. Validating here would be a second, weaker rule — and the one thing this app must not
+    /// do is tell a person their library is fine and then launch an engine that disagrees.
+    ///
+    /// Passing nil (or an empty/whitespace string, which the preference treats as nil) clears the pin,
+    /// so `AgentProcessService` exports no `AGENTORG_SKILLS_ROOT` and the engine's own search runs —
+    /// the behaviour before this setting existed, kept reachable on purpose.
+    ///
+    /// A live engine is stopped and relaunched, the way a project change is: the variable is read by
+    /// the child at spawn, so a running engine still holds the old root, and showing a new root beside
+    /// an engine using a different one is the kind of disagreement this app exists to avoid.
+    public func setLibraryRoot(_ path: String?) async {
+        preferences.libraryRoot = path
+        let url = preferences.libraryRoot.map { URL(fileURLWithPath: $0) }
+        guard settings.libraryRoot?.path != url?.path else { return }
+        settings.libraryRoot = url
+        // The engine's previous answer describes a different root, so it is withdrawn rather than left
+        // on screen beside a launch that is about to use another one. A failure clears it too: the
+        // banner carries the engine's reason, and a stale "here is the library" beside a failed launch
+        // would be the console disagreeing with itself.
+        library = [:]
+        let wasLive = engineState.isLive
+        if wasLive {
+            logs.append(notice: "stopping the engine so the library root can change…")
+            service?.terminate()
+        }
+        cancelAutoRestart(reason: "the library root changed")
+        if wasLive { launchOnceStopped() }
+        objectWillChange.send()
+    }
+
     // MARK: - The machine
 
     /// What the agents may do on this Mac, in the engine's own words.
@@ -3086,7 +3263,8 @@ public final class OrgController: ObservableObject {
     /// `loadAttention` joins for that reason too — it is what the navigation's Now row counts, and a row
     /// that stayed at zero until someone opened a section would be the "cannot be found" failure again.
     public func loadWindow() async {
-        await loadTogether([loadProviders, loadModels, loadRoster, loadSystem, loadAttention])
+        await loadTogether([loadProviders, loadModels, loadRoster, loadSystem, loadAttention,
+                            loadLibrary])
     }
 
     /// Reload the provider list and the model catalog together.
@@ -3357,6 +3535,8 @@ public final class OrgController: ObservableObject {
     ///
     /// - `system`: read-only and cheap, but it changes when the configuration does — a `system_set` from
     ///   another window, or a grant made with the CLI.
+    /// - `library`: cheap too, and it changes when a person pins a different root in Setup or the
+    ///   checkout under the discovered path moves to another commit.
     /// - `schedules`: read from the workspace's own schedule file, which changes when an entry is added,
     ///   removed, or fired.
     /// - `attention`: one checkpoint per project under the projects root, and a run can come to rest in
@@ -3371,6 +3551,7 @@ public final class OrgController: ObservableObject {
            now.timeIntervalSince(last) < Self.defaultSlowPanelInterval { return }
         lastSlowPanelRefresh = now
         await loadSystem()
+        await loadLibrary()
         await loadSchedules()
         await loadAttention()
         if !portfolioLive.isEmpty { await loadPortfolioLive() }
