@@ -364,6 +364,9 @@ python3 -m engine.cli org --goal "Build a booking API with auth and payments"
 # What is happening: the headline, the timeline, the gaps and the one next step.
 python3 -m engine.cli activity --project ~/code/my-app
 
+# Every project that needs you, with the step that resolves each — no slug to remember.
+python3 -m engine.cli attention
+
 # Who is working on what: every unit of work, its owner, its handoffs and progress.
 python3 -m engine.cli flow --project ~/code/my-app
 
@@ -425,6 +428,15 @@ reason.
 `engine.cli activity` is the one to reach for when you do not know what is going on: it reads what the
 engine already wrote and answers *what is it doing now*, *how did it get here*, *why did it stop* and
 *what do I do next* — with the same report the app's **Activity** tab renders.
+
+`engine.cli attention` answers the question one step further out: **what needs me across every project**.
+`status` and `activity` are scoped to one workspace, so a run parked at a gate in a folder you had not
+registered was invisible to the app and unreachable from the CLI at once. `attention` enumerates the
+projects under a root and prints, for each one that is waiting, what it waits for and the exact command
+that resolves it — and it decides nothing, listing gates without answering them. The app's **Now**
+destination renders the same report for the workspaces that are not the one the window is acting on,
+each with the engine's own next step and an **Adopt as an org** step for the ones that are not registered
+yet (a run in another folder cannot be acted on until it is).
 
 ## Testing
 

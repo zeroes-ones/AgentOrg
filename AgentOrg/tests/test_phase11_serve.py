@@ -247,6 +247,40 @@ def test_pool_reports_its_summary(config, library):
     assert "summary" in detail and "tasks" in detail
 
 
+def test_attention_lists_the_sibling_workspaces_that_need_a_person(config, library):
+    """The one command in this loop that is not scoped to the server's own workspace.
+
+    Every other read here describes the single workspace `serve` was started on, which is exactly why
+    a run parked in another folder could not be found *or* acted on from the console. `attention`
+    enumerates the siblings and answers with the same document the CLI prints, so it must be a real,
+    acknowledged command carrying that shape — and a project with nothing waiting must not appear.
+    """
+    import tempfile
+
+    parked = pathlib.Path(tempfile.mkdtemp())
+    waiting = Workspace.for_project("servetest-waiting", root=parked)
+    waiting.ensure()
+    (waiting.state_dir / "run_state.json").write_text(json.dumps({
+        "run_id": "run_1", "slug": "servetest-waiting", "phase": "awaiting_gate",
+        "gate": {"gate_id": "release", "kind": "human", "reason": "needs a decision"},
+        "outcome": {"nodes": {}},
+    }), encoding="utf-8")
+    quiet = Workspace.for_project("servetest-quiet", root=parked)
+    quiet.ensure()
+
+    stdin = io.StringIO(json.dumps({"cmd_id": "c1", "type": "attention"}) + "\n")
+    out = CapturedOut()
+    server = Server(config=config, library=library, workspace=quiet, slug="servetest-quiet",
+                    stdin=stdin, stdout=out)
+    assert server.serve_forever() == 0
+    detail = ack_for(out.events(), "c1")["detail"]
+    assert [row["slug"] for row in detail["workspaces"]] == ["servetest-waiting"]
+    row = detail["workspaces"][0]
+    assert row["waiting_for"] == "Decide gate 'release'"
+    assert "decide --slug servetest-waiting" in row["next_action"]["command"]
+    assert "servetest-quiet" not in json.dumps(detail), "the quiet project is not a row"
+
+
 def test_start_requires_a_goal(config, library):
     """A start with no goal must be refused with a reason, not silently plan nothing."""
     _, events = drive(config, library, [{"cmd_id": "c1", "type": "start"}])

@@ -217,7 +217,8 @@ def test_every_new_command_is_documented_in_usage_md():
                        "`subagents result <child> --slug s`", "`agent update <name>",
                        "`agent retire <name>`", "`providers list`", "`providers add <id>",
                        "`providers test <id>", "`providers remove <id>`", "`improve`", "`proposals`",
-                       "`run --approve-plan`", "`portfolio remove <org> --preview`"):
+                       "`run --approve-plan`", "`portfolio remove <org> --preview`",
+                       "`attention [--root P]`"):
         assert documented in text, f"{documented} is not in USAGE.md"
 
 

@@ -613,4 +613,88 @@ final class OrgControllerTests: XCTestCase {
         XCTAssertEqual(granted.hirePayload()["capabilities"],
                        .array([.string("read:*"), .string("system:state")]))
     }
+
+    // MARK: - What needs a person, outside this window
+
+    /// One row of the engine's `attention` document, shaped the way `engine/attention.py` shapes it.
+    private func attentionRow(path: String, slug: String, waitingFor: String,
+                              command: String, registered: Bool = false,
+                              ref: String = "") -> JSONValue {
+        .object([
+            "slug": .string(slug), "name": .string(slug), "path": .string(path),
+            "phase": .string("awaiting_gate"), "headline": .string("Waiting on you: \(waitingFor)"),
+            "waiting_for": .string(waitingFor),
+            "next_action": .object([
+                "kind": .string("decide"), "label": .string(waitingFor),
+                "detail": .string("the reason"), "command": .string(command),
+                "performable": .bool(false), "needs": .string("gate"),
+            ]),
+            "org": .object([
+                "registered": .bool(registered), "ref": .string(ref), "slug": .string(slug),
+                "adopt": registered ? .null : .object([
+                    "name": .string(slug), "slug": .string(slug), "path": .string(path)]),
+                "adopt_command": registered ? .string("") : .string("engine.cli portfolio add …"),
+            ]),
+        ])
+    }
+
+    func testTheAttentionListExcludesTheWorkspaceThisWindowActsOn() {
+        // The active workspace's own gate is already on Now and already badged, so counting it in the
+        // "elsewhere" list would count one decision twice — and the list exists for work this window
+        // cannot reach. The comparison is on the path, which is the field both reports name the project
+        // with (`serve._workspace_info` and `attention.attention_row`).
+        let controller = makeController(root: FileManager.default.temporaryDirectory)
+        controller.applyStatus(["workspace": .object(["path": .string("/tmp/here")])])
+        controller.applyAttention([
+            "count": .int(2),
+            "workspaces": .array([
+                attentionRow(path: "/tmp/here", slug: "here", waitingFor: "Decide gate 'a'",
+                             command: "engine.cli decide --slug here --approve"),
+                attentionRow(path: "/tmp/elsewhere", slug: "elsewhere",
+                             waitingFor: "Decide gate 'b'",
+                             command: "engine.cli decide --slug elsewhere --approve",
+                             registered: true, ref: "org_elsewhere"),
+            ]),
+        ])
+        XCTAssertEqual(controller.attentionRows.count, 2, "the engine's list is kept whole")
+        XCTAssertEqual(controller.attentionElsewhereCount, 1)
+        XCTAssertEqual(controller.attentionElsewhereRows.first?["slug"]?.stringValue, "elsewhere")
+    }
+
+    func testAnAttentionRowCarriesTheEnginesOwnStepAndItsOneAction() {
+        // What the row must be able to show: what it waits for, the command the terminal would run, and
+        // the engine's own payload for the one write that can reach a run in another folder.
+        let controller = makeController(root: FileManager.default.temporaryDirectory)
+        controller.applyStatus(["workspace": .object(["path": .string("/tmp/here")])])
+        controller.applyAttention([
+            "count": .int(1),
+            "workspaces": .array([
+                attentionRow(path: "/tmp/elsewhere", slug: "elsewhere",
+                             waitingFor: "Decide gate 'pm'",
+                             command: "engine.cli decide --slug elsewhere --approve"),
+            ]),
+        ])
+        let row = controller.attentionElsewhereRows.first
+        XCTAssertEqual(row?["waiting_for"]?.stringValue, "Decide gate 'pm'")
+        XCTAssertEqual(row?["next_action"]?.objectValue?["command"]?.stringValue,
+                       "engine.cli decide --slug elsewhere --approve")
+        let adopt = row?["org"]?.objectValue?["adopt"]?.objectValue
+        XCTAssertEqual(adopt?["name"]?.stringValue, "elsewhere")
+        XCTAssertEqual(adopt?["path"]?.stringValue, "/tmp/elsewhere")
+    }
+
+    func testNoAttentionReplyMeansNothingIsClaimed() {
+        // A key the engine has not sent is not a claim: with no reply the list must be empty rather than
+        // carrying whatever the last one said (the same rule `applyStatus` follows).
+        let controller = makeController(root: FileManager.default.temporaryDirectory)
+        XCTAssertTrue(controller.attentionRows.isEmpty)
+        XCTAssertEqual(controller.attentionElsewhereCount, 0)
+        // And a reply naming no workspaces clears rather than keeps.
+        controller.applyAttention(["count": .int(1), "workspaces": .array([
+            attentionRow(path: "/tmp/x", slug: "x", waitingFor: "Decide gate 'x'",
+                         command: "engine.cli decide --slug x --approve")])])
+        XCTAssertEqual(controller.attentionElsewhereCount, 1)
+        controller.applyAttention(["count": .int(0), "workspaces": .array([])])
+        XCTAssertEqual(controller.attentionElsewhereCount, 0)
+    }
 }

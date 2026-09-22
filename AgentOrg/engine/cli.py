@@ -1904,6 +1904,71 @@ def cmd_activity(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_attention(args: argparse.Namespace) -> int:
+    """Every workspace that needs you, with the command that resolves each one.
+
+    `status` answers "where is *this* run" and `activity` answers "what is happening *here*" — both
+    scoped to a project you have to name first, which is the whole complaint this exists for: a run
+    parked at a gate in a project nobody had registered was unreachable, because every surface was
+    scoped to one workspace and nothing enumerated the rest. This enumerates them, in the engine's own
+    words: what each is waiting for and the exact command that resolves it.
+
+    Nothing here *decides* anything. A gate is listed and never answered, a plan is named and never
+    approved — a run's state is the person's data, and this command only reads it.
+
+    `--root` aims it at a directory of projects; without it, the engine's own ``projects/``.
+    """
+    from .attention import build_attention
+    from .flow import clip
+    from .portfolio import Portfolio, PortfolioError
+
+    try:
+        portfolio = Portfolio.load()
+    except PortfolioError as exc:
+        # A register that will not load costs the "is it already an org" half and nothing else: the
+        # list of what needs a person is still the answer to the question asked.
+        _warn(f"cannot read the portfolio: {exc}")
+        portfolio = None
+
+    report = build_attention(getattr(args, "root", None), portfolio=portfolio)
+
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+
+    rows = report["workspaces"]
+    print(f"{report['count']} workspace(s) need you")
+    print(f"  looked in : {report['root']}")
+    if not rows:
+        print()
+        print("nothing is waiting: no run here is at a gate, stopped, or parked awaiting a plan")
+        return EXIT_OK
+    for row in rows:
+        action = row.get("next_action") or {}
+        print()
+        print(f"  {row['name']}  ({row['phase']})")
+        if row.get("headline"):
+            # The engine's own sentence for what this workspace is doing, clipped on a word boundary.
+            print(f"    {clip(row['headline'], 150)}")
+        if row.get("objective"):
+            print(f"    on        : {clip(row['objective'], 100)}")
+        # The same shape `activity` closes with, so the step and its command read the same way on both
+        # commands — one workspace or twenty.
+        print(f"    Next: {row['waiting_for']}")
+        if action.get("detail"):
+            print(f"      {clip(str(action['detail']), 200)}")
+        if action.get("command"):
+            print(f"      $ {action['command']}")
+        org = row.get("org") or {}
+        if org.get("registered"):
+            print(f"      in your portfolio as {org.get('slug')}")
+        elif org.get("adopt_command"):
+            # The one step that makes an unreachable project reachable *in the app*: `serve` is bound to
+            # one workspace, and `portfolio_add` is the one write that is not (`engine.attention`).
+            print(f"      make it usable in the app: {org['adopt_command']}")
+    return EXIT_OK
+
+
 def cmd_decide(args: argparse.Namespace) -> int:
     """Resolve a gate: approve and continue, or reject and park.
 
@@ -4614,6 +4679,12 @@ def build_parser() -> argparse.ArgumentParser:
     activity.add_argument("--limit", type=int, default=40,
                           help="how many timeline entries to show (default: 40)")
     activity.set_defaults(func=cmd_activity)
+
+    attention = sub.add_parser(
+        "attention", parents=[common],
+        help="every workspace that needs you, and the command that resolves each one")
+    attention.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    attention.set_defaults(func=cmd_attention)
 
     flow = sub.add_parser(
         "flow", parents=[common],

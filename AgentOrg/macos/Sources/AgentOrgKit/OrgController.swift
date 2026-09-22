@@ -181,6 +181,19 @@ public final class OrgController: ObservableObject {
     @Published public private(set) var portfolioLive: [String: JSONValue] = [:]
     /// Whether the live fetch is in flight, so the panel can say so rather than look stale.
     @Published public private(set) var portfolioLoading: Bool = false
+    /// Every workspace under the projects root that is waiting on a person, from `attention`.
+    ///
+    /// **Why this exists beside `portfolioLive`.** The register lists the orgs a person has *registered*,
+    /// and the live picture describes those — but a run parked in a folder nobody registered is neither,
+    /// and until this command existed no surface could see it: the engine's own `status` is scoped to the
+    /// workspace the console started on, so a run waiting in another project was invisible here and no
+    /// command could act on it. This is the one read that is not scoped to this workspace.
+    ///
+    /// Held as the engine's whole document (its `workspaces` list, its `root` and its `count`), because
+    /// the count and the list have to agree and the engine computes both.
+    @Published public private(set) var attention: [String: JSONValue] = [:]
+    /// Whether the attention fetch is in flight.
+    @Published public private(set) var attentionLoading: Bool = false
     /// The schedule for this workspace, as the engine reported it.
     ///
     /// Held whole rather than as a bare list, because the parts a person has to act on are not the
@@ -2171,6 +2184,78 @@ public final class OrgController: ObservableObject {
         }
     }
 
+    // MARK: - What needs a person, across every workspace
+
+    /// Load every workspace under the projects root that is waiting on a person.
+    ///
+    /// **Not on the two-second poll, and not scoped to this workspace.** The engine reads one run
+    /// checkpoint per project to answer it, so it is fetched on the slow cadence the other off-poll
+    /// panels share (`refreshSlowPanelsIfDue`) and once when the engine becomes usable (`loadWindow`) —
+    /// which means the sidebar count is right for a person who never opens the section, at a twentieth
+    /// of the read volume.
+    ///
+    /// Held whole rather than flattened: the engine's own `count` and `root` travel with the list, and a
+    /// view recomputing the count from the rows would be a second answer to one question.
+    public func loadAttention() async {
+        attentionLoading = true
+        defer { attentionLoading = false }
+        await fetch("attention") { [weak self] payload in
+            guard let self else { return }
+            // Guarded like every other fetched panel: an unchanged list must not invalidate the window.
+            self.assignIfChanged(\.attention, payload)
+        }
+    }
+
+    /// Apply an `attention` reply. Split out of `loadAttention` so a test can drive the mapping without
+    /// a live engine — the same reason `applyStatus` is separate from `refresh`.
+    func applyAttention(_ payload: [String: JSONValue]) {
+        assignIfChanged(\.attention, payload)
+    }
+
+    /// The workspaces the engine says need a person, in the engine's own order.
+    public var attentionRows: [[String: JSONValue]] {
+        (attention["workspaces"]?.arrayValue ?? []).compactMap { $0.objectValue }
+    }
+
+    /// The ones that are **not** the workspace this window acts on.
+    ///
+    /// The active workspace's own gate or parked plan is already on Now and already badged, so counting
+    /// it again here would count one decision twice — and this is the list the Now section exists for:
+    /// the work this window cannot reach.
+    public var attentionElsewhereRows: [[String: JSONValue]] {
+        let here = workspace["path"]?.stringValue ?? ""
+        if here.isEmpty { return attentionRows }
+        return attentionRows.filter { ($0["path"]?.stringValue ?? "") != here }
+    }
+
+    /// How many other workspaces need a person. Zero until the engine answers.
+    public var attentionElsewhereCount: Int { attentionElsewhereRows.count }
+
+    /// Register a workspace the engine found waiting, so this window can act on it.
+    ///
+    /// **The one honest action the console can take on a run in another folder.** `serve` is bound to one
+    /// workspace and every run command it answers acts on that one, so "decide the gate in *that*
+    /// project" is not a command the engine has. `portfolio_add` is the one write that is not
+    /// workspace-scoped: after it the folder is an org in the register, which the Portfolio section lists
+    /// and can switch to — and after the switch every control in this window acts on it (the section's
+    /// own "Switch to it and decide"). The payload is the **engine's** (`attention.org_link` composes the
+    /// name, slug and path), so this cannot invent a registration the engine would refuse.
+    ///
+    /// The live picture is reloaded after a successful add for the same reason: a Portfolio row is
+    /// marked as waiting on a person only from `portfolio_live`'s `waiting_host`, so without this the new
+    /// org would appear with nothing to act on until that section next loaded.
+    ///
+    /// - Returns: the created org entry, or nil when the engine refused.
+    @discardableResult
+    public func adoptWorkspace(name: String, slug: String, path: String) async -> [String: JSONValue]? {
+        let created = await addOrg(name: name, slug: slug, path: path)
+        if created != nil {
+            await loadPortfolioLive()
+            await loadAttention()
+        }
+        return created
+    }
+
     /// Register an org from the console.
     ///
     /// **Verified, and it says where the org landed.** It used to `send` and `refresh`, which discards
@@ -2183,11 +2268,17 @@ public final class OrgController: ObservableObject {
     /// resolved is in the reply, and it is the difference between "registered" and "registered, and its
     /// work will live in this folder" — which is the question a person actually has.
     ///
+    /// `slug` is passed only where the org must address an **existing** folder: an org registered for a
+    /// workspace the engine already knows (`adoptWorkspace`) has to come back as *that* project, and the
+    /// engine derives a slug from the name otherwise — which would register a second folder beside it
+    /// rather than the one the run lives in.
+    ///
     /// - Returns: the created org entry, or nil when the engine refused.
     @discardableResult
-    public func addOrg(name: String, path: String = "", charter: String = "",
+    public func addOrg(name: String, slug: String = "", path: String = "", charter: String = "",
                        dailyBudgetUSD: Double = 0, active: Bool = false) async -> [String: JSONValue]? {
         var payload: [String: JSONValue] = ["name": .string(name)]
+        if !slug.isEmpty { payload["slug"] = .string(slug) }
         if !path.isEmpty { payload["path"] = .string(path) }
         if !charter.isEmpty { payload["charter"] = .string(charter) }
         if dailyBudgetUSD > 0 { payload["daily_budget_usd"] = .double(dailyBudgetUSD) }
@@ -2992,8 +3083,10 @@ public final class OrgController: ObservableObject {
     /// `loadSystem` joins them for the same reason they are here rather than in a pane's `.task`: this is
     /// the fill that runs when the engine becomes usable, and the capability description has to be read
     /// *then* or a pane that appeared during the bootstrap renders an engine with no machine access.
+    /// `loadAttention` joins for that reason too — it is what the navigation's Now row counts, and a row
+    /// that stayed at zero until someone opened a section would be the "cannot be found" failure again.
     public func loadWindow() async {
-        await loadTogether([loadProviders, loadModels, loadRoster, loadSystem])
+        await loadTogether([loadProviders, loadModels, loadRoster, loadSystem, loadAttention])
     }
 
     /// Reload the provider list and the model catalog together.
@@ -3245,8 +3338,8 @@ public final class OrgController: ObservableObject {
 
     /// How often the panels that are not on the two-second cadence are re-read.
     ///
-    /// **One number for three reads**, because they answer the same kind of question — "what is the
-    /// state of a thing that changes on the scale of minutes" — and three cadences would be three things
+    /// **One number for four reads**, because they answer the same kind of question — "what is the
+    /// state of a thing that changes on the scale of minutes" — and four cadences would be four things
     /// to keep in step. Twenty seconds is set by what each read costs: the capability description and the
     /// schedule are cheap, and `portfolio_live` builds an orchestrator per org (which is why it was never
     /// on the poll at all), so a person watching any of those panels sees a view that is at most one
@@ -3266,6 +3359,9 @@ public final class OrgController: ObservableObject {
     ///   another window, or a grant made with the CLI.
     /// - `schedules`: read from the workspace's own schedule file, which changes when an entry is added,
     ///   removed, or fired.
+    /// - `attention`: one checkpoint per project under the projects root, and a run can come to rest in
+    ///   another project at any moment — including while nothing in this window is happening at all,
+    ///   which is exactly when the row in the navigation has to be right.
     /// - `portfolio_live`: the expensive one, so it is fetched only once something has asked for it —
     ///   which is the Portfolio section's own `.task`. This controller cannot see which destination is
     ///   showing, so "has been fetched before" stands in for "is on screen"; a person who never opens
@@ -3276,6 +3372,7 @@ public final class OrgController: ObservableObject {
         lastSlowPanelRefresh = now
         await loadSystem()
         await loadSchedules()
+        await loadAttention()
         if !portfolioLive.isEmpty { await loadPortfolioLive() }
     }
 

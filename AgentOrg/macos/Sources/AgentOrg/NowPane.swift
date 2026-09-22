@@ -351,6 +351,10 @@ struct HappeningSection: View {
                 EngineNotRunningView(controller: controller)
             } else {
                 headline
+                // The work this window cannot reach, immediately after this workspace's own headline:
+                // both answer "what needs me", and the one a person cannot get to from here is the one
+                // that used to be invisible. See `AttentionSection`.
+                AttentionSection(controller: controller)
                 proposedPlan
                 if runIsLive { transport }
                 goalComposer
@@ -370,6 +374,11 @@ struct HappeningSection: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.secondary.opacity(0.06))
         .cornerRadius(8)
+        // The read that is not scoped to this workspace, asked for when the destination that shows it
+        // appears. `loadWindow` and the slow cadence also fetch it, so this is a first-look rather than
+        // the only path to it — but without it a person who opens the app and looks at Now would see no
+        // section until the next slow-panel tick (20s), which on a parked run is a long silence.
+        .task { await controller.loadAttention() }
     }
 
     /// The present tense, in the engine's own words.
@@ -922,6 +931,156 @@ struct HappeningSection: View {
         case "warn": return "exclamationmark.triangle.fill"
         case "bad": return "xmark.octagon.fill"
         default: return "circle.dotted"
+        }
+    }
+}
+
+// MARK: - Other workspaces that need you
+
+/// The workspaces under the projects root that are waiting on a person — **and are not this one**.
+///
+/// WHY THIS IS HERE AND NOT ON RUNS
+/// --------------------------------
+/// Runs is the destination that works with the engine *stopped*, and it reads one workspace's
+/// `.agent_state/` — the folder this window is pointed at. A run parked in a folder the window is not
+/// pointed at is invisible there by construction, which is precisely the reported failure: *"Not sure
+/// why PM is still blocked Priya… I still don't understand what actions I need to take"*. Now is the
+/// destination that answers "what needs me" and the one the app opens on, so the answer belongs here,
+/// above the sections that describe this workspace's own run.
+///
+/// WHAT THIS CAN AND CANNOT DO
+/// ---------------------------
+/// `serve` is bound to one workspace and every run command it answers acts on that one, so a gate in
+/// another project cannot be decided from here — and no control is offered that would pretend otherwise.
+/// The one write that is not workspace-scoped is `portfolio_add`, so the control is **Adopt as an org**,
+/// using the engine's own payload (`attention.org_link`): the folder becomes an org in the register, the
+/// Portfolio section lists it, and switching to it makes every control in this window act on it. The
+/// engine's own command is shown beside it as selectable text, because the terminal *can* act on that
+/// project directly and this window cannot.
+struct AttentionSection: View {
+    @ObservedObject var controller: OrgController
+    /// The row whose adoption is in flight, keyed by its slug, so only that row shows progress.
+    @State private var adopting: String?
+    /// The engine's refusal, when it made one — a name it already has, a folder it will not register.
+    @State private var refusal: String?
+
+    private var rows: [[String: JSONValue]] { controller.attentionElsewhereRows }
+
+    var body: some View {
+        if !rows.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("\(rows.count) other workspace\(rows.count == 1 ? "" : "s") need you",
+                      systemImage: "hand.raised.fill")
+                    .font(.headline).foregroundStyle(.orange)
+                    .accessibilityLabel("\(rows.count) other work spaces are waiting on you")
+                Text("These are not the project this window is acting on, so its controls cannot decide "
+                     + "what they are waiting for. The engine's step for each is below.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // Keyed on the workspace's own `path`. The slug and the name repeat — a folder named for
+                // its slug is the common case — while the path is what identifies the project, and it is
+                // also the field the engine reports for the workspace this window is on.
+                ForEach(rows.map { (key: $0["path"]?.stringValue ?? "", row: $0) }, id: \.key) { item in
+                    rowView(item.row)
+                }
+                if let refusal {
+                    Label(refusal, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.08))
+            .cornerRadius(8)
+        }
+    }
+
+    /// One workspace: what it is waiting for, the engine's step, and the one action that reaches it.
+    @ViewBuilder
+    private func rowView(_ row: [String: JSONValue]) -> some View {
+        let action = row["next_action"]?.objectValue ?? [:]
+        let org = row["org"]?.objectValue ?? [:]
+        let slug = row["slug"]?.stringValue ?? ""
+        let registered = org["registered"]?.boolValue == true
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 7) {
+                Text(row["name"]?.stringValue ?? slug)
+                    .font(.system(.callout, design: .rounded).weight(.medium))
+                    .lineLimit(1)
+                Text(row["phase"]?.stringValue ?? "")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            if let headline = row["headline"]?.stringValue, !headline.isEmpty {
+                Text(headline).font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text("Next: \(row["waiting_for"]?.stringValue ?? "")").font(.caption)
+            if let detail = action["detail"]?.stringValue, !detail.isEmpty {
+                Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+            }
+            HStack(spacing: 8) {
+                if registered {
+                    // Already an org: there is nothing to add, and the Portfolio's own switch is the step.
+                    Button("Switch to it and decide") {
+                        Task { await controller.selectOrg(org["ref"]?.stringValue ?? slug) }
+                    }
+                    .controlSize(.small).buttonStyle(.borderedProminent)
+                    .help("Make this org the one this window describes, so its parked plan and the "
+                          + "decision it needs are on Now")
+                    .accessibilityLabel("Switch to this org and decide what it is waiting on")
+                } else {
+                    Button("Adopt as an org") { adopt(row) }
+                        .controlSize(.small).buttonStyle(.borderedProminent)
+                        .disabled(adopting != nil || controller.engineState != .running)
+                        .help("Register this project in the portfolio, using the engine's own payload. "
+                              + "It then appears in the Portfolio under Org, where it can be switched to "
+                              + "and decided — a run in another folder cannot be acted on without that.")
+                        .accessibilityLabel("Adopt this project as an org so it can be acted on")
+                }
+                if adopting == slug { ProgressView().controlSize(.small) }
+                // The command the terminal would run. Shown for the person who would rather act there —
+                // and it is the only way to do the two things this window cannot: re-run a graph, or
+                // approve a plan in a folder that is not the one this window describes.
+                if let command = action["command"]?.stringValue, !command.isEmpty {
+                    Text(command)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(1)
+                        .help(command)
+                }
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.06))
+        .cornerRadius(6)
+    }
+
+    /// Register the row's workspace, from the engine's own payload.
+    ///
+    /// Nothing here composes a name, a slug or a path: `attention.org_link` already did, because that is
+    /// the payload `portfolio_add` will accept and a surface that derived its own would be a second
+    /// definition of "what this workspace is called".
+    private func adopt(_ row: [String: JSONValue]) {
+        let org = row["org"]?.objectValue ?? [:]
+        guard let payload = org["adopt"]?.objectValue else { return }
+        let slug = row["slug"]?.stringValue ?? ""
+        adopting = slug
+        refusal = nil
+        Task {
+            let created = await controller.adoptWorkspace(
+                name: payload["name"]?.stringValue ?? slug,
+                slug: payload["slug"]?.stringValue ?? slug,
+                path: payload["path"]?.stringValue ?? "")
+            adopting = nil
+            // A refusal is the engine's sentence (`controller.notice`, set by `mutate`), shown here so a
+            // failed click reads differently from a click that did nothing.
+            if created == nil { refusal = controller.notice }
         }
     }
 }

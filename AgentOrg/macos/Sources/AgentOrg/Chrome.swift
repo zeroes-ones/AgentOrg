@@ -118,6 +118,18 @@ struct MenuBarPanel: View {
                     .foregroundStyle(.secondary)
             }
 
+            // A workspace waiting outside this window. The panel exists for a person whose window is
+            // shut, and a run parked in another project is exactly what they could not otherwise find —
+            // naming it here is what makes "something needs me" true from the menu bar, not only on Now.
+            if controller.attentionElsewhereCount > 0 {
+                Divider()
+                Label("\(controller.attentionElsewhereCount) other workspace"
+                      + (controller.attentionElsewhereCount == 1 ? "" : "s") + " need you",
+                      systemImage: "hand.raised")
+                    .font(.caption).lineLimit(2)
+                    .foregroundStyle(.orange)
+            }
+
             Divider()
 
             // One launch/stop control, named for what it does — the same one the spine carries.

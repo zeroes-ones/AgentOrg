@@ -124,6 +124,27 @@ final class OrgControllerPollTests: XCTestCase {
         withExtendedLifetime(cancellable) {}
     }
 
+    func testAnUnchangedAttentionReplyPublishesNothing() {
+        // `attention` is fetched on the slow cadence and whenever Now appears, and it holds a list —
+        // `@Published` has no equality check, so assigning it straight from the reply would invalidate
+        // every view twice a second worth of a list that had not moved.
+        let controller = makeController()
+        let reply: [String: JSONValue] = [
+            "count": .int(1),
+            "workspaces": .array([.object(["slug": .string("elsewhere"),
+                                           "path": .string("/tmp/elsewhere")])]),
+        ]
+        controller.applyAttention(reply)
+
+        var publishes = 0
+        let cancellable = controller.objectWillChange.sink { publishes += 1 }
+        controller.applyAttention(reply)
+        XCTAssertEqual(publishes, 0, "an unchanged attention reply must not invalidate the window")
+        controller.applyAttention(["count": .int(0), "workspaces": .array([])])
+        XCTAssertEqual(publishes, 1, "a changed one must still reach the navigation's count")
+        withExtendedLifetime(cancellable) {}
+    }
+
     func testAKeyThePayloadDropsIsClearedRatherThanLeftOnScreen() {
         // **Absent means absent.** These fields used to keep whatever the engine last said about them
         // for the rest of the session, so a workspace that had gone, or a proposal queue that had

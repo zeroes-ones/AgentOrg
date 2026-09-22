@@ -375,7 +375,11 @@ struct SpineView: View {
     ///
     /// `decide` has no button here on purpose: the gate row above already carries Approve/Reject with
     /// the evidence beside them, and two controls for one decision is the duplication this rewrite
-    /// removed.
+    /// removed. `approve_plan` is its twin, and for the same reason: the engine reports it as performable
+    /// (the console *does* have the command) and the control that carries it is the plan card in the
+    /// workspace's own pane, drawn with the graph it approves — so nothing is invented here for it either.
+    /// Both therefore fall to `default`, and the row shows the engine's label with the control a few lines
+    /// below it rather than a second button.
     @ViewBuilder
     private func nextButtons(_ next: SpineModel.NextLine) -> some View {
         switch next.kind {
@@ -531,6 +535,12 @@ struct ConsoleView: View {
             // nothing waiting the row describes the destination, like every other row here.
             if controller.gateIsWaitingForHuman { return "a gate needs you" }
             if controller.proposedGraph != nil { return "a plan needs approval" }
+            // The third ask is a workspace this window is not pointed at — the one that used to have no
+            // sentence anywhere. It comes last because it is not *this* org's work, and it is said in
+            // words rather than left to the badge for the same reason the two above are.
+            if controller.attentionElsewhereCount > 0 {
+                return "\(controller.attentionElsewhereCount) others need you"
+            }
             return "live · next step"
         case .runs: return "past runs · disk"
         case .org: return "people · hiring"
@@ -564,6 +574,11 @@ struct ConsoleView: View {
         case .now:
             return (controller.gateIsWaitingForHuman ? 1 : 0)
                 + (controller.proposedGraph != nil ? 1 : 0)
+                // The third decision a person can only make elsewhere: a workspace that is waiting and is
+                // not this one. It is the same question this badge answers ("does anything need me?"),
+                // and the navigation is the one place a person can see it without opening a section —
+                // which is the whole failure this count exists to end.
+                + controller.attentionElsewhereCount
         // A proposal is work waiting on a decision the app cannot make for you — the same test.
         case .runs: return controller.proposals.count
         // The Org row carries nothing: a roster needs no attention, and the old app badged panels

@@ -102,6 +102,35 @@ def test_a_gate_makes_the_next_action_a_decision(workspace):
     assert "decide" in report["next_action"]["command"]
 
 
+def test_a_parked_plan_makes_the_next_action_an_approval(workspace):
+    """The one phase whose whole meaning is "waiting for the Owner" used to say nothing.
+
+    An `awaiting_approval` run has no gate, no stop and no staffing gap, so every branch of
+    `_next_action` fell through and the run read as `none` — the same "nothing is happening and I do
+    not know why" this module exists to end, in the one state a person *must* act in for anything to
+    happen at all. `serve._cmd_status` offered the plan card; the CLI's `activity` closed with no
+    `Next:` line, and a roll-up across projects had no way to find the run either.
+    """
+    state = {
+        "run_id": "run_3", "slug": "health-endpoint", "phase": "awaiting_approval",
+        "goal": "add a health endpoint",
+        "plan": {"manifest": {"nodes": [{"id": "pm"}, {"id": "api"}]}, "validation": {"valid": True}},
+        "outcome": {"nodes": {}},
+    }
+    _write(workspace.state_dir, "run_state.json", json.dumps(state))
+
+    report = build_activity(workspace)
+    assert report["headline"] == "Waiting on you: approve the parked plan"
+    action = report["next_action"]
+    assert action["kind"] == "approve_plan"
+    assert action["command"] == "engine.cli run --approve-plan --slug health-endpoint"
+    # The step list comes from the checkpoint's own plan, unnamed by this module.
+    assert "pm" in action["detail"] and "api" in action["detail"]
+    # The console has a real destination for it — its plan card carries the control — so the engine
+    # says a surface can offer it, rather than pointing a person at a command.
+    assert action["performable"] is True and action["needs"] == ""
+
+
 # ── the timeline ─────────────────────────────────────────────────────────────
 
 

@@ -390,6 +390,12 @@ def _headline(run: dict[str, Any], goal: dict[str, Any], nodes: dict[str, Any],
 
     if gate is not None:
         return f"Waiting on you: {clip(str(gate.get('reason') or gate.get('gate_id') or 'a gate'), 110)}"
+    # A parked plan is waiting on the same person for the same reason a gate is — nothing proceeds
+    # until they answer — and it had no sentence here at all, so the run read as `awaiting_approval —
+    # no active work`, which is a state rather than an ask. The wording matches the next action's
+    # (`_next_action`), so the headline and the step under it say one thing.
+    if phase == "awaiting_approval":
+        return "Waiting on you: approve the parked plan"
     if stop and phase not in ("done",):
         return f"Stopped — {clip(stop, 150)}"
     # A stopped node outranks "running", because a run with a node that cannot advance will not finish,
@@ -434,6 +440,11 @@ def _headline(run: dict[str, Any], goal: dict[str, Any], nodes: dict[str, Any],
 #: table is one no surface performs, which is the safe reading of a kind this build has not seen.
 _NEXT_PERFORMABLE: dict[str, str] = {
     "decide": "gate",
+    # A parked plan has a real destination on a surface: the console's plan card carries the control
+    # (`approve_plan`) and the terminal has `run --approve-plan`. Like `decide`, the control itself
+    # lives where the plan is drawn rather than in a generic row, so `""` here does not mean a second
+    # button is added anywhere.
+    "approve_plan": "",
     "hire": "",
     "investigate": "",
     "resume": "",
@@ -461,10 +472,11 @@ def _next_action(run: dict[str, Any], goal: dict[str, Any],
                  state_dir: Path | None = None) -> dict[str, Any]:
     """The one thing the Owner should do next, if anything.
 
-    Ordered by urgency: a gate is a decision only they can take; an unstaffed node is a hire; a stopped
-    run is a reason to look; a node that cannot advance is a *retry*, because the work was produced and
-    only a new attempt can satisfy the edge that refused it; then an armed-but-idle goal is a resume.
-    An empty result means there is genuinely nothing to do.
+    Ordered by urgency: a gate is a decision only they can take; so is a parked plan, which nothing has
+    executed yet; an unstaffed node is a hire; a stopped run is a reason to look; a node that cannot
+    advance is a *retry*, because the work was produced and only a new attempt can satisfy the edge that
+    refused it; then an armed-but-idle goal is a resume. An empty result means there is genuinely
+    nothing to do.
 
     The retry's command is derived from the state by `flow.recovery_command`, which is the one place
     that knows which verbs the engine will actually accept — so this can never point a person at a
@@ -475,6 +487,21 @@ def _next_action(run: dict[str, Any], goal: dict[str, Any],
         return _action("decide", f"Decide gate {gate.get('gate_id')!r}",
                        clip(str(gate.get("reason") or ""), 200),
                        f"engine.cli decide --slug {run.get('slug', '')} --approve --note \"...\"")
+    # A parked plan is the whole run: nothing has executed, and approving it is the one decision that
+    # starts it — the route `run --approve-plan` and the console's own `approve_plan` both take. It used
+    # to be reported as `none`, because an `awaiting_approval` run has no gate, no stop and no staffing
+    # gap for the branches below to catch — so the one phase whose whole meaning is "waiting for the
+    # Owner" was the one phase with nothing to say. That is how a plan parked in a project nobody had
+    # open became a run that no surface could find and no surface could act on.
+    if str(run.get("phase") or "") == "awaiting_approval":
+        plan = run.get("plan") if isinstance(run.get("plan"), dict) else {}
+        manifest = plan.get("manifest") if isinstance(plan.get("manifest"), dict) else {}
+        steps = [str(n.get("id")) for n in (manifest.get("nodes") or [])
+                 if isinstance(n, dict) and n.get("id")]
+        detail = (f"the graph is parked with {len(steps)} step(s): {', '.join(steps[:8])}"
+                  if steps else "a plan is parked, waiting for your approval")
+        return _action("approve_plan", "Approve the parked plan and run it", detail,
+                       f"engine.cli run --approve-plan --slug {run.get('slug', '')}")
     if staffing:
         return _action("hire", f"Hire for {len(staffing)} unstaffed capabilit(ies)",
                        "; ".join(str(g.get("skill")) for g in staffing[:6]),

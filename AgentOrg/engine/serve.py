@@ -1055,6 +1055,27 @@ class Server:
             _log(f"serve: activity snapshot failed: {exc}")
             return {"headline": "activity unavailable", "timeline": [], "counts": {}}
 
+    def _cmd_attention(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Every workspace under this projects root that is waiting on a person.
+
+        **Why the console needs this at all.** `serve` is bound to one workspace and every run command it
+        answers acts on that one, so a run parked in another folder was invisible here *and*
+        unreachable — the app could not find it and no command could act on it. This is the one command
+        that is not scoped to the workspace: it enumerates the siblings and reports what each is waiting
+        for, plus the step that makes one adoptable (`portfolio_add`, the only write not bound to a
+        workspace — see `attention.org_link`).
+
+        The same document the CLI's `attention` prints, assembled once in `engine/attention.py`, so the
+        two surfaces cannot say different things about one run. Read from the checkpoints rather than
+        from live orchestrators — a waiting state is written to disk *before* the engine parks — so this
+        works for folders this process has never loaded, and a workspace that cannot be read is skipped
+        rather than failing the list.
+        """
+        from .attention import build_attention
+
+        root = getattr(self.workspace, "root", None)
+        return build_attention(root, portfolio=self._load_portfolio())
+
     def _cmd_flow(self, payload: dict[str, Any]) -> dict[str, Any]:
         """The org board: which agent has which work, what crossed between them, and what came back.
 

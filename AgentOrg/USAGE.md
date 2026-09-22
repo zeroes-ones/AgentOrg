@@ -115,6 +115,7 @@ python3 -m engine.cli --config /path/credentials.json --json doctor
 | `run --approve-plan --slug s` | Approve and execute the plan a `--dry-run` left parked |
 | `status --slug s` | *Where is it?* Phase, gate, gaps, instructions, cost and per-node outcomes |
 | `activity --project P` | *What is happening, why, and what next?* Headline, timeline, gaps, next step |
+| `attention [--root P]` | *What needs me, anywhere?* Every project that is waiting on you, with the step that resolves each — no slug required |
 | `flow --project P` | *Who is working on what?* The board: each unit of work, its owner, its handoffs and what came back |
 | `skills graph [--skill N] [--review A B C]` | *What depends on what?* The library's chain graph, and a plan coherence review |
 | `mission set/status/start/advance/mark` | The standing purpose above the goal: objectives worked one at a time |
@@ -952,6 +953,46 @@ Each row carries:
 
 The same board is the app's **Flow** panel, fed from the same engine command, so the two cannot
 disagree.
+
+## What needs me, across every project
+
+`status` and `activity` are scoped to *one* project, so both need you to name it — and a run parked at a
+gate in a folder you had not registered was, until this command existed, unreachable from every surface
+at once. `attention` enumerates the projects under a root and prints, for each one that is waiting, what
+it is waiting for and the command that resolves it:
+
+```bash
+python3 -m engine.cli attention
+```
+
+```
+3 workspace(s) need you
+  looked in : /Users/you/AgentOrg/projects
+
+  add-a-health-endpoint-to-the-api  (awaiting_approval)
+    Waiting on you: approve the parked plan
+    on        : add a health endpoint to the API
+    Next: Approve the parked plan and run it
+      the graph is parked with 7 step(s): pm, architect, api, developer, reviewer, qa, security
+      $ engine.cli run --approve-plan --slug add-a-health-endpoint-to-the-api
+
+  bring-all-features-to-rn-to-ios-and-android-apps  (awaiting_gate)
+    Waiting on you: contract violation: completion.criteria declares 3 criteria …
+    Next: Decide gate 'pm'
+      contract violation: completion.criteria declares 3 criteria (c1, c2, c3) …
+      $ engine.cli decide --slug bring-all-features-to-rn-to-ios-and-android-apps --approve --note "..."
+```
+
+**It decides nothing.** A gate is listed and never answered, a plan is named and never approved: the
+run's state is yours. `--root` aims it at another projects directory, and `--json` gives the whole
+document to a script.
+
+The app's **Now** destination renders the same report — the workspaces that are waiting and are *not*
+the one the window is acting on, each with the engine's own next step. Since `serve` is bound to one
+workspace, the console cannot decide a gate in another folder: the one write that is not scoped that way
+is `portfolio add`, so the row offers **Adopt as an org** using the engine's own payload. After that the
+project is an org in the register, the **Portfolio** section lists it, and switching to it puts its
+parked gate or plan on Now where every control acts on it.
 
 ## Approving and intervening
 
