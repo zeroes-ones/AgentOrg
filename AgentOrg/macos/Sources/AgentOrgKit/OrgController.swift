@@ -810,14 +810,32 @@ public final class OrgController: ObservableObject {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         // The folders macOS gates behind a permission prompt, by their real paths under the user's home.
         let protected = ["Documents", "Desktop", "Downloads"].map { home + "/" + $0 }
+        // The library root joins the two the launch itself needs, but only when the console has pinned
+        // it: `AgentProcessService` then tells the child to read it (`AGENTORG_SKILLS_ROOT`) *before* it
+        // reports ready, so a gated one is the same failure by the same cause. Left unpinned — which is
+        // what this app does — the path is the engine's business, and the sentence below says so rather
+        // than the console pretending to know it.
         let roots = [settings.engineRoot.path, settings.projectPath.path]
+            + [settings.libraryRoot?.path].compactMap { $0 }
         let gated = roots.filter { path in protected.contains { path == $0 || path.hasPrefix($0 + "/") } }
         guard !gated.isEmpty else { return nil }
-        return " The engine never reported ready and its working directory is inside a folder macOS "
-            + "protects (\(gated[0])), which usually means a \"would like to access files\" prompt for "
-            + "the Documents folder is open — or is behind this window. Choose Allow, or move the "
-            + "AgentOrg folder somewhere macOS does not protect (for example ~/code) and press "
-            + "Try again."
+        var sentence = " The engine never reported ready, and a folder it has to read before it can "
+            + "report is inside a folder macOS protects (\(gated[0])). That usually means a "
+            + "\"would like to access files\" prompt is open — or is behind this window, which a locked "
+            + "screen also prevents. Choose Allow, or move that folder somewhere macOS does not protect "
+            + "(for example ~/code) and press Try again."
+        if settings.libraryRoot == nil {
+            // The variant measured on this machine, and the reason this clause exists: the launch's own
+            // folders were readable and the block was the child opening the Skills checkout the engine
+            // discovers for itself (`engine/library.py`'s `assert_capabilities`, reached from `_load_stack`
+            // before `serve_forever`). Nobody pinned that path, so the console cannot name it — it can
+            // still name the possibility and the second way out, which is the difference between a
+            // person moving a folder and a person filing another bug report.
+            sentence += " The engine also reads the Skills library it discovers for itself before it "
+                + "reports ready; a checkout kept beside the repository is under the same protection, and "
+                + "pinning `AGENTORG_SKILLS_ROOT` at a copy outside it is the other way out."
+        }
+        return sentence
     }
 
     /// Launch the engine and begin streaming.

@@ -15,9 +15,9 @@ import XCTest
 @MainActor
 final class OrgControllerTests: XCTestCase {
 
-    private func makeController(root: URL) -> OrgController {
+    private func makeController(root: URL, libraryRoot: URL? = nil) -> OrgController {
         let settings = OrgController.OrgSettings(
-            engineRoot: root, projectPath: root, credentialsPath: nil, libraryRoot: nil)
+            engineRoot: root, projectPath: root, credentialsPath: nil, libraryRoot: libraryRoot)
         // Ephemeral preferences: a test must never write the wizard's answers into the developer's own
         // `UserDefaults`, and the assertions must not depend on what they last were.
         return OrgController(settings: settings, preferences: .ephemeral())
@@ -57,6 +57,17 @@ final class OrgControllerTests: XCTestCase {
         let outside = makeController(root: FileManager.default.temporaryDirectory)
         XCTAssertNil(outside.protectedFolderHint(engineIsSilent: true),
                      "an unprotected folder must not be blamed on a permission prompt")
+
+        // The variant measured on this machine, where the launch's own folders were readable and the
+        // child was actually held on the Skills checkout. The console knows that path only when it
+        // pinned it — and when it has, a gated one must be named like any other.
+        let pinnedInside = home.appendingPathComponent("Documents/Projects/Skills")
+        let pinnedLibrary = makeController(root: FileManager.default.temporaryDirectory,
+                                           libraryRoot: pinnedInside)
+        XCTAssertNotNil(pinnedLibrary.protectedFolderHint(engineIsSilent: true),
+                        "a pinned library inside a protected folder must be named too")
+        XCTAssertNil(pinnedLibrary.protectedFolderHint(engineIsSilent: false),
+                     "and only while the engine is silent, like the other roots")
     }
 
     func testLaunchFailsFastWhenTheEngineDirectoryIsMissing() {
