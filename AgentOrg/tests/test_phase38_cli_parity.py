@@ -183,6 +183,7 @@ def test_every_new_operation_resolves_to_a_command():
     parser = build_parser()
     for argv in (["abort"], ["reassign", "dev", "--agent", "Alice"], ["takeover", "dev"],
                  ["discard", "--slug", "s"],
+                 ["pause", "--slug", "s"], ["resume", "--slug", "s"],
                  ["subagents", "list"], ["subagents", "result", "sub_1"],
                  ["agent", "update", "Alice", "--title", "x"], ["agent", "retire", "Alice"],
                  ["providers", "list"], ["providers", "add", "groq", "--base-url", "https://x/v1"],
@@ -265,6 +266,154 @@ def test_the_hire_help_names_every_capability_the_config_declares():
     # And the sentence that explains the *shape* of the flag, which no list can carry: giving one
     # replaces the skill's default rather than adding to it.
     assert "REPLACES" in line
+
+
+def test_every_closed_flag_vocabulary_is_read_from_the_engine():
+    """The same sin `hire --capability` was: a flag whose values are a set the engine declares must
+    read that set, not restate it.
+
+    Four more were still doing it. `--level` documented five levels while `people.LEVELS` resolved six
+    (`mid` is an alias people type); `--posture` was spelled `unattended`/`supervised` in four separate
+    `choices=` lists against `goal.Posture`; `mission mark` recited the five objective states; and
+    `pool list --state` named four of the six task states while accepting *any* typo as an empty list —
+    the "it says there is nothing" symptom with no way to tell it from a real empty pool.
+
+    The assertions are against the engine's own tables rather than against literals written here, so a
+    seventh level or a seventh task state is picked up the moment it is declared.
+    """
+    from engine.cli import (build_parser, hire_role_choices, level_choices,
+                            mission_state_choices, pool_state_choices, posture_choices,
+                            provider_kind_choices)
+    from engine.config import SUPPORTED_KINDS
+    from engine.goal import Posture
+    from engine.mission import ObjectiveState
+    from engine.people import HIRE_ROLES, LEVELS
+    from engine.pool import TaskState
+    from engine.systemcli import build_parser as system_parser
+    from engine.sysctl_tools import SCRIPT_LANGUAGES
+
+    # The readers and the tables are the same set — the whole point of the readers.
+    assert provider_kind_choices() == list(SUPPORTED_KINDS)
+    assert posture_choices() == [posture.value for posture in Posture]
+    assert level_choices() == sorted(LEVELS)
+    assert hire_role_choices() == list(HIRE_ROLES)
+    assert mission_state_choices() == [state.value for state in ObjectiveState]
+    assert pool_state_choices() == list(TaskState.all())
+    # `providers.registry.SUPPORTED_KINDS` additionally carries `fake`, which exists so a test can
+    # inject a transport — offering it here would invite a provider entry nothing can talk to.
+    assert "fake" not in provider_kind_choices()
+
+    parser = build_parser()
+    for path, flag, values in ((["run"], "--posture", posture_choices()),
+                               (["goal", "set"], "--posture", posture_choices()),
+                               (["defaults", "autonomy"], "--posture", posture_choices()),
+                               (["schedules", "add"], "--posture", posture_choices()),
+                               (["providers", "add"], "--kind", provider_kind_choices()),
+                               (["providers", "test"], "--kind", provider_kind_choices()),
+                               (["hire"], "--level", level_choices()),
+                               (["hire"], "--role", hire_role_choices()),
+                               (["agent", "update"], "--level", level_choices()),
+                               (["pool", "list"], "--state", pool_state_choices())):
+        where = " ".join(path)
+        assert _flag_choices(parser, path, flag) == values, f"{where} {flag}"
+        # A name inside `--help` that the flag then refuses is the half-truth this pins against.
+        help_text = _flag_help(parser, path, flag)
+        for value in values:
+            assert value in help_text, f"{where} {flag} does not document {value}"
+
+    # A positional carries its vocabulary the same way, and `mission mark <state>` had no guard at all.
+    assert _positional_choices(parser, ["mission", "mark"], "state") == mission_state_choices()
+
+    # A *default* is a restatement too, and the one the flag falls back to must be the one the engine
+    # writes into the entry — otherwise `schedules add` with no `--posture` and a `ScheduleEntry` built
+    # directly could disagree about what "the default" is.
+    from engine.schedules import DEFAULT_POSTURE, POSTURES, ScheduleEntry
+
+    assert set(POSTURES) == set(posture_choices())
+    assert DEFAULT_POSTURE == Posture.UNATTENDED.value
+    assert _flag_default(parser, ["schedules", "add"], "--posture") == DEFAULT_POSTURE
+    assert ScheduleEntry(slug="s", objective="o").posture == DEFAULT_POSTURE
+
+    # The machine surface has the same rule: `system automation --language` and the tool's own refusal
+    # must name the same languages, or the flag would accept a source the tool then rejects.
+    assert _flag_choices(system_parser(), ["system", "automation"],
+                         "--language") == list(SCRIPT_LANGUAGES)
+    assert _flag_choices(parser, ["system", "automation"],
+                         "--language") == list(SCRIPT_LANGUAGES), "the wired tree is the same tree"
+
+
+def test_a_pool_state_the_pool_does_not_have_is_a_usage_error():
+    """`--state` used to accept anything and filter to nothing: a typo read as an empty pool, which is
+    the one answer a person cannot tell from "there is no work"."""
+    result = run_cli("pool", "list", "--state", "nonsense")
+    assert result.returncode == EXIT_USAGE
+    assert "nonsense" in result.stderr
+
+
+def test_pool_list_counts_what_it_shows(tmp_path):
+    """The headline is the filtered set when a filter was asked for.
+
+    It used to print the whole pool's total above a filtered list, so a filter that matched nothing
+    read "1 task(s): pool=1" and then "(none)" — a count contradicting the list under it. Only
+    reachable once `--state` refused a value the pool does not have, which is why it is fixed here
+    rather than left as a curiosity in the state it was found in.
+    """
+    root = tmp_path / "projects"
+    creds_path = creds(tmp_path)
+    added = run_cli("--config", str(creds_path), "pool", "add", "do a thing",
+                    "--slug", "poolprobe", "--root", str(root))
+    assert added.returncode == EXIT_OK, added.stderr[:400]
+
+    everything = run_cli("--config", str(creds_path), "pool", "list",
+                         "--slug", "poolprobe", "--root", str(root))
+    assert "1 task(s): pool=1" in everything.stdout
+
+    filtered = run_cli("--config", str(creds_path), "pool", "list", "--state", "done",
+                       "--slug", "poolprobe", "--root", str(root))
+    assert filtered.returncode == EXIT_OK, filtered.stderr[:400]
+    assert "0 of 1 task(s)" in filtered.stdout
+    assert "(none)" in filtered.stdout
+
+    # The machine-readable half says the same thing, so a script does not have to count the list.
+    payload = cli_json("--config", str(creds_path), "pool", "list", "--state", "pool",
+                       "--slug", "poolprobe", "--root", str(root))
+    assert payload["shown"] == 1 and payload["state"] == "pool" and payload["summary"]["total"] == 1
+
+
+def _flag_choices(parser: argparse.ArgumentParser, path: list[str], flag: str) -> list[str]:
+    """The `choices` a flag declares, found by walking the subparsers — argparse stores them nowhere
+    a caller can look up by flag name."""
+    leaf = _leaf_parser(parser, path)
+    action = next(a for a in leaf._actions if flag in a.option_strings)  # noqa: SLF001
+    return list(action.choices or [])
+
+
+def _flag_help(parser: argparse.ArgumentParser, path: list[str], flag: str) -> str:
+    """The rendered help block for one flag, its `choices` included.
+
+    Rendered rather than read off `action.help`: argparse prints the accepted values between the flag
+    and its text, and that rendering is what a person reading `--help` actually sees.
+    """
+    return _help_line(_leaf_parser(parser, path).format_help(), flag)
+
+
+def _flag_default(parser: argparse.ArgumentParser, path: list[str], flag: str) -> object:
+    """The value a flag falls back to when it is not given."""
+    leaf = _leaf_parser(parser, path)
+    return next(a for a in leaf._actions if flag in a.option_strings).default  # noqa: SLF001
+
+
+def _positional_choices(parser: argparse.ArgumentParser, path: list[str], dest: str) -> list[str]:
+    leaf = _leaf_parser(parser, path)
+    action = next(a for a in leaf._actions if a.dest == dest)  # noqa: SLF001
+    return list(action.choices or [])
+
+
+def _leaf_parser(parser: argparse.ArgumentParser, path: list[str]) -> argparse.ArgumentParser:
+    for name in path:
+        choices = parser._subparsers._group_actions[0].choices  # noqa: SLF001
+        parser = choices[name]
+    return parser
 
 
 def _help_line(help_text: str, prog: str) -> str:
@@ -357,6 +506,228 @@ def test_abort_without_a_workspace_is_a_usage_error():
     result = run_cli("abort")
     assert result.returncode == EXIT_USAGE
     assert "give one of --slug" in result.stderr
+
+
+# ── pause and resume: the console's pair, and the terminal's missing half ─────
+#
+# `abort`'s own section above ends with a promise it could not keep: the help said the checkpoint is
+# kept "so it can be resumed", `USAGE.md` repeated it, and no command resumed anything. The app had
+# sent both `pause` and `resume` since it had a Pause button. These pin that the terminal can now ask
+# for the same two states — and that "parked" and "ended" stay told apart, because only one of them
+# can be continued.
+
+
+def test_pause_and_resume_have_a_home_on_both_surfaces():
+    """A parser verb and a serve command per name, plus the protocol value both dispatch on."""
+    from engine.protocol import CommandType
+
+    parser = build_parser()
+    for command in ("pause", "resume"):
+        assert parser.parse_args([command, "--slug", "s"]).func is not None, command
+        assert hasattr(Server, f"_cmd_{command}"), f"the console's {command} route must exist"
+    assert CommandType.PAUSE.value == "pause"
+    assert CommandType.RESUME.value == "resume"
+
+
+def _checkpoint(project) -> dict:
+    return json.loads((project / ".agent_state" / "run_state.json").read_text())
+
+
+def test_pause_parks_the_run_and_resume_carries_it_on(run_project):
+    """The whole pair end to end, on the checkpoint rather than on the CLI's own rendering of it."""
+    root, project, creds_path = run_project
+    park_at_the_gate(root, project, creds_path)
+    assert _checkpoint(project)["phase"] == "awaiting_gate"
+
+    paused = run_cli("--config", str(creds_path), "pause", "--slug", "clirun", "--root", str(root))
+    assert paused.returncode == EXIT_OK, paused.stderr[:400]
+    assert "-> paused" in paused.stdout
+    assert _checkpoint(project)["phase"] == "paused", "the phase is written, not only reported"
+    assert cli_json("--config", str(creds_path), "status", "--slug", "clirun",
+                    "--root", str(root))["phase"] == "paused"
+
+    resumed = run_cli("--config", str(creds_path), "resume", "--slug", "clirun", "--root", str(root),
+                      "--executor", str(project / "stub.py"))
+    assert resumed.returncode == EXIT_OK, resumed.stderr[:400]
+    assert _checkpoint(project)["phase"] != "paused", "resume must leave the parked phase"
+
+
+def test_pause_is_idempotent_and_not_the_same_verb_as_abort(run_project):
+    """Pausing a parked run is the state the person asked for, not a refusal — and it is not stopping.
+
+    The distinction is the one `abort`'s help already draws and that this file holds every pair to: a
+    second pause answers 0 and says so, while a settled run refuses with the next move named.
+    """
+    root, project, creds_path = run_project
+    park_at_the_gate(root, project, creds_path)
+
+    first = run_cli("--config", str(creds_path), "pause", "--slug", "clirun", "--root", str(root))
+    assert first.returncode == EXIT_OK, first.stderr[:400]
+    again = run_cli("--config", str(creds_path), "pause", "--slug", "clirun", "--root", str(root))
+    assert again.returncode == EXIT_OK, "parking a parked run is not an error"
+    assert "already paused" in again.stdout
+    assert _checkpoint(project)["phase"] == "paused"
+    assert "abort" in first.stdout, "a park must name the verb that ends the run instead"
+
+    run_cli("--config", str(creds_path), "abort", "--slug", "clirun", "--root", str(root))
+    ended = run_cli("--config", str(creds_path), "pause", "--slug", "clirun", "--root", str(root))
+    assert ended.returncode == EXIT_CHECK_FAILED
+    assert "already" in ended.stderr
+    assert "engine.cli run" in ended.stderr, "a refusal must say what to do next"
+
+
+def test_resume_refuses_what_it_cannot_continue_and_names_the_next_move(run_project):
+    root, project, creds_path = run_project
+
+    missing = run_cli("--config", str(creds_path), "resume", "--slug", "never-ran",
+                      "--root", str(root))
+    assert missing.returncode == EXIT_CHECK_FAILED
+    assert "no run found" in missing.stderr and "engine.cli status" in missing.stderr
+
+    park_at_the_gate(root, project, creds_path)
+    run_cli("--config", str(creds_path), "abort", "--slug", "clirun", "--root", str(root))
+    settled = run_cli("--config", str(creds_path), "resume", "--slug", "clirun", "--root", str(root))
+    assert settled.returncode == EXIT_CHECK_FAILED
+    assert "aborted" in settled.stderr and "engine.cli run" in settled.stderr
+
+
+def test_resume_no_execute_only_clears_the_park(run_project):
+    """`decide --no-continue`'s counterpart: a caller that wants to inspect before spending."""
+    root, project, creds_path = run_project
+    park_at_the_gate(root, project, creds_path)
+    run_cli("--config", str(creds_path), "pause", "--slug", "clirun", "--root", str(root))
+
+    result = run_cli("--config", str(creds_path), "resume", "--slug", "clirun", "--root", str(root),
+                     "--no-execute")
+    assert result.returncode == EXIT_OK, result.stderr[:400]
+    assert _checkpoint(project)["phase"] == "ready", "the gate is cleared and nothing was driven"
+    assert "outcome" not in result.stdout, "nothing executed, so there is no outcome to report"
+
+
+def test_pause_and_resume_json_is_only_json(run_project):
+    root, project, creds_path = run_project
+    park_at_the_gate(root, project, creds_path)
+
+    paused = run_cli("--json", "--config", str(creds_path), "pause", "--slug", "clirun",
+                     "--root", str(root))
+    assert paused.returncode == EXIT_OK
+    payload = json.loads(paused.stdout)          # must not raise: no human line on stdout
+    assert payload["paused"] is True and payload["phase"] == "paused"
+    assert payload["previous_phase"] == "awaiting_gate"
+    assert "paused run_" not in paused.stdout
+
+    resumed = run_cli("--json", "--config", str(creds_path), "resume", "--slug", "clirun",
+                      "--root", str(root), "--executor", str(project / "stub.py"))
+    assert resumed.returncode == EXIT_OK
+    payload = json.loads(resumed.stdout)
+    assert payload["resumed"] is True and payload["previous_phase"] == "paused"
+
+
+def test_pause_without_a_workspace_is_a_usage_error():
+    result = run_cli("pause")
+    assert result.returncode == EXIT_USAGE
+    assert "give one of --slug" in result.stderr
+
+
+def test_the_terminal_pause_writes_the_phase_the_console_pause_writes(run_project):
+    """One engine operation, two callers. A run this process is not executing has no host to signal,
+    so the terminal records the pause on the checkpoint — and that is exactly the state the console's
+    own pause leaves behind when it does signal one. A second implementation here would be able to
+    disagree with the console about what "paused" means."""
+    from engine.cli import _orchestrator as cli_orchestrator
+    from engine.orchestrator import RunPhase
+
+    class _Host:
+        """The slice of `RunnerHost` the console's pause talks to, and nothing else."""
+
+        def __init__(self) -> None:
+            self.asked = False
+
+        def pause(self) -> bool:
+            self.asked = True
+            return True
+
+    root, project, creds_path = run_project
+    park_at_the_gate(root, project, creds_path)
+    args = argparse_args(config=str(creds_path), slug="clirun", root=str(root))
+
+    # The console's form: ask the process running the graph, and let its answer decide.
+    orch, _ = cli_orchestrator(args, "clirun")
+    run = orch.load("clirun")
+    host = _Host()
+    orch._host = host  # noqa: SLF001 - the same field test_phase11_serve drives a live run through
+    assert orch.pause() is True and host.asked
+    assert run.phase is RunPhase.PAUSED
+    assert _checkpoint(project)["phase"] == "paused", "the console's pause persists this same phase"
+
+    # The terminal's form: no host of ours, so the checkpoint is what the pause is written to.
+    park_at_the_gate(root, project, creds_path)
+    orch2, _ = cli_orchestrator(args, "clirun")
+    run2 = orch2.load("clirun")
+    assert run2.phase is RunPhase.AWAITING_GATE, "the fresh run is parked at its gate"
+    assert orch2.pause(run2) is True
+    assert run2.phase is RunPhase.PAUSED
+    assert _checkpoint(project)["phase"] == "paused"
+    # And a settled run is left alone by it, so "paused" can never be written over "done".
+    run2.phase = RunPhase.DONE
+    assert orch2.pause(run2) is False and run2.phase is RunPhase.DONE
+
+
+# ── the removal preview: the sentence a person agrees to ─────────────────────
+
+
+def test_portfolio_removal_preview_is_the_engines_account_and_removes_nothing(tmp_path):
+    """The app asks `portfolio_removal` *before* it shows its confirmation, so the sentence a person
+    agrees to is the engine's account of the consequence rather than a guess written in Swift.
+
+    The terminal had no way to ask for that account and printed its own version of it ("its folder and
+    state are untouched"). True, and still a second promise about a removal — in the one surface with
+    no confirmation step to notice that the two had drifted. `--preview` is the console's first half,
+    and the removal itself now reports the engine's answer rather than restating it.
+    """
+    home = tmp_path / "home"
+    env = {"AGENTORG_HOME": str(home)}
+    creds_path = creds(tmp_path)
+    folder = tmp_path / "orgs" / "tesla"
+    folder.mkdir(parents=True)
+
+    for argv in (["portfolio", "init", "Ada"],
+                 ["portfolio", "add", "Tesla", "--slug", "tesla", "--path", str(folder)]):
+        result = run_cli("--config", str(creds_path), *argv, env=env)
+        assert result.returncode == EXIT_OK, result.stderr[:400]
+
+    preview = run_cli("--config", str(creds_path), "portfolio", "remove", "tesla", "--preview",
+                      env=env)
+    assert preview.returncode == EXIT_OK, preview.stderr[:400]
+    assert "nothing was removed" in preview.stdout
+
+    # The account is the engine's own — exactly the fields `serve`'s removal handler returns.
+    payload = json.loads(run_cli("--json", "--config", str(creds_path), "portfolio", "remove",
+                                 "tesla", "--preview", env=env).stdout)
+    for field in ("org", "active", "folder", "folder_exists", "folder_bytes", "folder_kept",
+                  "can_delete_folder", "can_delete_folder_why"):
+        assert field in payload, f"{field} is missing from the engine's account"
+    assert payload["folder"] == str(folder)
+    assert payload["folder_exists"] is True
+    assert payload["folder_kept"] is True
+    assert payload["can_delete_folder"] is False, "the engine has no folder delete, and says so"
+
+    # A preview removed nothing and touched nothing.
+    assert folder.is_dir()
+    register = json.loads(run_cli("--json", "--config", str(creds_path), "portfolio", "status",
+                                 env=env).stdout)["register"]
+    assert [org["slug"] for org in register["orgs"]] == ["tesla"]
+
+    # A reference the register does not have is refused, and the orgs that do exist are named.
+    refused = run_cli("--config", str(creds_path), "portfolio", "remove", "nope", "--preview", env=env)
+    assert refused.returncode == EXIT_CHECK_FAILED
+    assert "nope" in refused.stderr and "tesla" in refused.stderr
+
+    # The removal itself reports the same account rather than a second copy of it.
+    removed = run_cli("--config", str(creds_path), "portfolio", "remove", "tesla", env=env)
+    assert removed.returncode == EXIT_OK, removed.stderr[:400]
+    assert "folder kept" in removed.stdout and str(folder) in removed.stdout
+    assert folder.is_dir(), "the folder is never touched: that is the engine's promise, not the CLI's"
 
 
 # ── reassign and takeover ────────────────────────────────────────────────────

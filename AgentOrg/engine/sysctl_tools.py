@@ -180,7 +180,7 @@ from .tools import ToolResult
 
 __all__ = [
     "SystemTools", "SystemCall", "CatalogEntry", "ConsentError",
-    "CATALOGUE", "CONSENT_REQUIRED", "CAPABILITIES", "MUTATING_TOOLS",
+    "CATALOGUE", "CONSENT_REQUIRED", "CAPABILITIES", "MUTATING_TOOLS", "SCRIPT_LANGUAGES",
     "OSASCRIPT", "SCREENCAPTURE", "PBCOPY", "PBPASTE", "OPEN", "PMSET", "DF",
     "SYSTEM_PROFILER", "LSAPPINFO", "SAY", "CAFFEINATE", "MDFIND", "NETWORK_QUALITY",
     "SHORTCUTS", "SOFTWAREUPDATE", "BINARIES",
@@ -245,6 +245,12 @@ CAPABILITIES: tuple[str, ...] = (
     "system:shortcuts",
     "system:softwareupdate",
 )
+
+#: The languages `run_automation` accepts, in the order a person should reach for them. Named because
+#: three surfaces need the same answer — this module's own refusal, the tool's JSON Schema, and the
+#: terminal's `--language` choices — and a list written into all three is a list that disagrees with
+#: itself the first time a language is added.
+SCRIPT_LANGUAGES: tuple[str, ...] = ("applescript", "javascript")
 
 #: Tools that change something the person already had. Each one needs a consent decision before it
 #: acts — see the ASK ONCE section of the module docstring.
@@ -473,8 +479,9 @@ CATALOGUE: tuple[CatalogEntry, ...] = (
                 "script": {"type": "string",
                            "description": "the AppleScript or JXA source to run"},
                 "language": {"type": "string",
-                             "description": "'applescript' (default) or 'javascript'",
-                             "enum": ["applescript", "javascript"]},
+                             "description": f"{SCRIPT_LANGUAGES[0]!r} (default) or "
+                                            f"{SCRIPT_LANGUAGES[1]!r}",
+                             "enum": list(SCRIPT_LANGUAGES)},
             },
             "required": ["script"],
         },
@@ -1724,9 +1731,9 @@ class SystemTools:
         script = str(args.get("script") or "")
         if not script.strip():
             return ToolResult(False, "script is required: there is nothing to run")
-        language = str(args.get("language") or "applescript").strip().lower()
-        if language not in ("applescript", "javascript"):
-            return ToolResult(False, f"language must be 'applescript' or 'javascript', got "
+        language = str(args.get("language") or SCRIPT_LANGUAGES[0]).strip().lower()
+        if language not in SCRIPT_LANGUAGES:
+            return ToolResult(False, f"language must be one of {', '.join(SCRIPT_LANGUAGES)}, got "
                                      f"{language!r}")
 
         if not self.full_access:

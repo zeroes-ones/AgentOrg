@@ -744,12 +744,18 @@ def test_run_automation_needs_a_script(project, system_on):
 
 
 def test_an_unknown_automation_language_is_refused(project, system_on):
+    """The refusal names the languages the tool actually accepts — read from the tool's own table, so a
+    third language is offered the moment it is declared rather than the next time someone edits this."""
+    from engine.sysctl_tools import SCRIPT_LANGUAGES
+
     registry = ToolRegistry(workspace_root=project, agent=make_agent("system:automation"),
                             system=system_on)
     grant_consent(project / ".agent_state", tool="run_automation", agent_id="ag_alice", by="sp.vm")
     result = registry.call("run_automation", {"script": "return 1", "language": "bash"})
     assert not result.ok
-    assert "applescript' or 'javascript'" in result.text
+    for language in SCRIPT_LANGUAGES:
+        assert language in result.text, f"the refusal must name {language}"
+    assert "bash" in result.text, "and the value it was given"
 
 
 # ── the consent ledger ───────────────────────────────────────────────────────

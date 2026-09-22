@@ -40,7 +40,7 @@ from typing import Any
 from .bus import EventBus
 from .catalog import ModelCatalog
 from .completion import SUPPORTED_SHELLS
-from .config import ConfigError, SystemConfig, load, scan_for_leaks
+from .config import SUPPORTED_KINDS, ConfigError, GoalConfig, SystemConfig, load, scan_for_leaks
 from .library import LibraryError, resolve
 from .org import Binder, HiringDesk, PolicyResolver, Router, default_company
 from .org.binding import BindingError
@@ -50,7 +50,7 @@ from .planner import PlanError, Planner, emit_safe_yaml
 from .state import Workspace
 from .providers.registry import build_providers
 from .resources import derive_ceiling, detect
-from .schedules import DEFAULT_TICK_S, MAX_TICK_S, MIN_TICK_S
+from .schedules import DEFAULT_POSTURE, DEFAULT_TICK_S, MAX_TICK_S, MIN_TICK_S
 from .skills import FilesystemSkillSource, SkillError
 from .skills.bundle import Tier
 
@@ -2000,6 +2000,133 @@ def cmd_abort(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_pause(args: argparse.Namespace) -> int:
+    """Park a run at its next node boundary, keeping its checkpoint.
+
+    **This is not `abort`, and the difference is what a person is asking for.** `pause` parks a run
+    so it can be continued; `abort` ends it. Both keep the checkpoint, so a person who reached for
+    the wrong one still has their work — but only one of them can be continued, and saying which is
+    half of what this command is for.
+
+    The console has sent `pause` to a live engine since it had a Pause button, and the terminal had
+    no way to ask for the same state — while `USAGE.md` told the reader that aborting leaves "a
+    resume possible". This is that missing half: the **same engine operation** `serve._cmd_pause`
+    reaches, applied to the run this process loaded from disk rather than one it is executing. A run
+    another process is running cannot be signalled from here, so what is written is the phase a later
+    `status`, `resume` or `flow` reads — which is the state a live pause leaves behind, not a
+    lookalike.
+    """
+    slug = _slug_for(args)
+    orch, workspace = _orchestrator(args, slug)
+    run = orch.load(slug)
+    if run is None:
+        _warn(f"no run found for {slug!r} in {workspace.path}; "
+              f"`engine.cli status --slug {slug}` shows what is actually there")
+        return EXIT_CHECK_FAILED
+    if run.phase.terminal:
+        _warn(f"the run is already {run.phase.value}, so there is nothing to park. "
+              f"`engine.cli run --slug {slug} --manifest <file>` starts a fresh one")
+        return EXIT_CHECK_FAILED
+
+    previous = run.phase.value
+    already = run.phase is RunPhase.PAUSED
+    # A settled or already-paused run is left alone by the engine operation, so the "already" case is
+    # answered here rather than asked for: repeating a pause is not a refusal, it is the state the
+    # person wanted.
+    if not already:
+        orch.pause(run)
+    if args.json:
+        print(json.dumps({**run.as_dict(), "paused": True, "already_paused": already,
+                          "previous_phase": previous,
+                          "checkpoint": str(workspace.checkpoint_path)},
+                         indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+
+    if already:
+        print(f"{run.run_id} is already paused  ({previous})")
+    else:
+        print(f"paused {run.run_id}  ({previous} -> {run.phase.value})")
+    print(f"  workspace : {workspace.path}")
+    print("  the checkpoint is kept, and no node is abandoned: the run stops at a boundary")
+    print(f"  continue  : engine.cli resume --slug {slug}")
+    print(f"  stop      : engine.cli abort --slug {slug}   (ends it; pause only parks it)")
+    return EXIT_OK
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Continue a parked run from its checkpoint, and carry the work on.
+
+    **The console could always do this and the terminal could not.** `resume` is one of the two
+    commands the app's Pause/Resume pair sends, and a run parked at a *gate* by `decide --reject`, or
+    parked by `pause`, or left mid-graph by a crash, had no way to be continued from a shell. The
+    console's half is `serve._cmd_resume`; this is the same `Orchestrator.resume` on the checkpoint
+    this process loaded.
+
+    It continues *executing*, rather than only clearing the pause, for the reason `decide --approve`
+    does: a run set to `ready` with nothing driving it is the "documented as continue, and nothing
+    continued" defect this file has already had once. `--no-execute` keeps the older, inspect-first
+    behaviour.
+
+    The honest limit: a checkpoint that says `running` cannot be told apart from a crashed one by a
+    second process — there is no lock in the workspace to ask — so a resume against a graph another
+    process is still executing would be a second executor of the same nodes. `decide --approve` has
+    the same shape and the same limit; a warning on stderr names it when the checkpoint says
+    `running`, so the one case where it matters is not silent.
+    """
+    slug = _slug_for(args)
+    orch, workspace = _orchestrator(args, slug)
+    run = orch.load(slug)
+    if run is None:
+        _warn(f"no run found for {slug!r} in {workspace.path}; "
+              f"`engine.cli status --slug {slug}` shows what is actually there")
+        return EXIT_CHECK_FAILED
+    if run.phase.terminal:
+        _warn(f"the run is {run.phase.value}, so there is nothing to continue. "
+              f"`engine.cli run --slug {slug} --manifest <file>` starts a fresh one")
+        return EXIT_CHECK_FAILED
+    if run.phase is RunPhase.AWAITING_APPROVAL:
+        _warn(f"the run is awaiting approval, not paused; "
+              f"`engine.cli run --approve-plan --slug {slug}` approves and executes it")
+        return EXIT_CHECK_FAILED
+    if run.phase is RunPhase.RUNNING:
+        _warn("the checkpoint says this run is still running. If another process is executing it, "
+              "stop that one first — two executors of one graph write to the same checkpoint")
+
+    previous = run.phase.value
+    orch.resume(run)
+    if getattr(args, "no_execute", False):
+        if args.json:
+            print(json.dumps({**run.as_dict(), "resumed": True, "previous_phase": previous,
+                              "executed": False, "checkpoint": str(workspace.checkpoint_path)},
+                             indent=2, sort_keys=True, default=str))
+            return EXIT_OK
+        print(f"resumed {run.run_id}  ({previous} -> {run.phase.value})")
+        print("  --no-execute: the gate is cleared and the run is ready; nothing was driven")
+        print(f"  carry on  : engine.cli resume --slug {slug}")
+        return EXIT_OK
+
+    try:
+        outcome = orch.execute(run, executor=args.executor)
+    except OrchestratorError as exc:
+        _warn(f"cannot continue: {exc}")
+        return EXIT_CHECK_FAILED
+    summary = outcome.summary or {}
+    if args.json:
+        print(json.dumps({"run": run.as_dict(), "outcome": outcome.as_dict(),
+                          "resumed": True, "previous_phase": previous},
+                         indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+    print(f"resumed {run.run_id}  ({previous} -> {run.phase.value})")
+    print(f"  outcome   : {summary.get('outcome') or outcome.state.value}")
+    if run.stop_reason:
+        print(f"  stopped   : {run.stop_reason}")
+    if run.gate:
+        print()
+        print(f"  GATE: {run.gate.gate_id} — {run.gate.reason[:70]}")
+        print(f"    decide with: engine.cli decide --slug {slug} --approve")
+    return EXIT_OK
+
+
 def cmd_reassign(args: argparse.Namespace) -> int:
     """Pin a node to a different agent — the manual form of the router's job.
 
@@ -2711,7 +2838,7 @@ def cmd_pool(args: argparse.Namespace) -> int:
     """
     from .org import default_company
     from .people import HireError, People
-    from .pool import PoolError, TaskPool
+    from .pool import DEFAULT_PRIORITY, PoolError, TaskPool
 
     config, source, providers, _ = _load_stack(args)
     workspace = _resolve_workspace(args, _slug_for(args))
@@ -2727,7 +2854,8 @@ def cmd_pool(args: argparse.Namespace) -> int:
                 _warn(f"--schema is not valid JSON: {exc}")
                 return EXIT_USAGE
         try:
-            task = pool.create(args.description, priority=args.priority or 50,
+            task = pool.create(args.description,
+                               priority=DEFAULT_PRIORITY if args.priority is None else args.priority,
                                required_skills=args.skill or [],
                                required_capabilities=args.capability or [],
                                output_schema=schema, tags=args.tag or [],
@@ -2753,12 +2881,19 @@ def cmd_pool(args: argparse.Namespace) -> int:
         if args.state:
             tasks = [t for t in tasks if t.state == args.state]
         if args.json:
-            print(json.dumps({"summary": summary,
+            print(json.dumps({"summary": summary, "state": args.state, "shown": len(tasks),
                               "tasks": [t.as_dict() for t in tasks]},
                              indent=2, sort_keys=True, default=str))
             return EXIT_OK
-        print(f"{summary['total']} task(s): "
-              + ", ".join(f"{k}={v}" for k, v in sorted(summary['by_state'].items())))
+        # The headline is the *filtered* set when a filter was asked for. It printed the whole pool's
+        # total above a filtered list, so `pool list --state done` on a pool with nothing done read
+        # "3 task(s)" and then "(none)" — a count that contradicts the list under it is worse than no
+        # count, and it was reachable only now that `--state` refuses a value the pool does not have.
+        if args.state:
+            print(f"{len(tasks)} of {summary['total']} task(s) in {args.state!r}")
+        else:
+            print(f"{summary['total']} task(s): "
+                  + ", ".join(f"{k}={v}" for k, v in sorted(summary['by_state'].items())))
         for task in tasks:
             who = task.claimed_by or task.offered_to or ""
             print(f"  {task.id:16s} {task.state:8s} p{task.priority:<3d} "
@@ -3225,7 +3360,8 @@ def cmd_providers(args: argparse.Namespace) -> int:
             for entry in payload["skipped"]:
                 print(f"    {str(entry)[:110]}")
         if not payload["providers"]:
-            print("  (none — add one with: engine.cli providers add <id> --kind openai "
+            print("  (none — add one with: engine.cli providers add <id> "
+                  f"--kind {SUPPORTED_KINDS[0]} "
                   "--base-url https://host/v1 --key-env NAME)")
         return EXIT_OK
 
@@ -3233,7 +3369,7 @@ def cmd_providers(args: argparse.Namespace) -> int:
     # reading flags a subparser never defines is the `AttributeError: no attribute 'kind'` failure.
     payload: dict[str, Any] = {
         "provider_id": args.provider_id or "",
-        "kind": getattr(args, "kind", None) or "openai",
+        "kind": getattr(args, "kind", None) or SUPPORTED_KINDS[0],
         "base_url": getattr(args, "base_url", None) or "",
         "api_key": getattr(args, "key", None),
         "api_key_env": getattr(args, "key_env", None),
@@ -3609,16 +3745,7 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     if action == "remove":
-        try:
-            entry = portfolio.remove_org(args.org)
-        except PortfolioError as exc:
-            _warn(f"cannot remove the org: {exc}")
-            return EXIT_CHECK_FAILED
-        portfolio.save()
-        print(f"forgot org : {entry.name}  (its folder and state are untouched)")
-        if entry.path:
-            print(f"  still on disk: {entry.path}")
-        return EXIT_OK
+        return _portfolio_remove(args, portfolio)
 
     if action == "use":
         try:
@@ -3797,6 +3924,64 @@ def _portfolio_run(args: argparse.Namespace, portfolio: Any) -> int:
             print(f"  stopped   : {live['stop_reason']}")
         if live.get("objective_now"):
             print(f"  on        : {live['objective_now'][:88]}")
+    return EXIT_OK
+
+
+def _portfolio_remove(args: argparse.Namespace, portfolio: Any) -> int:
+    """Forget an org — and say what that leaves behind in the **engine's** words, not the CLI's.
+
+    The sentence a person reads before something that sounds destructive has to be the engine's account
+    of the consequence. This printed its own ("its folder and state are untouched"), which happened to
+    be true and was still a second promise: the console asks `portfolio_removal` *before* it shows its
+    confirmation, precisely so the sentence agreed to is the one the engine computed — including
+    `can_delete_folder`, which is false today and is the fact that decides whether the panel offers a
+    delete switch at all. Two copies of "what removing does" is the same defect as two copies of a
+    vocabulary, one step further into the destructive direction.
+
+    `--preview` is the console's own first half: the account, and nothing removed. A refusal names the
+    next move, which matters most here — a typo in the org reference must not read as "removed".
+    """
+    from .portfolio import PortfolioError
+    from .serve import ServerError
+
+    console = _console_for(args, needs_workspace=False)
+    try:
+        account = console._cmd_portfolio_removal({"org": args.org})
+    except ServerError as exc:
+        _warn(f"cannot inspect {args.org!r}: {exc}")
+        return EXIT_CHECK_FAILED
+
+    if args.json and getattr(args, "preview", False):
+        print(json.dumps(account, indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+
+    if getattr(args, "preview", False):
+        org = account["org"]
+        sized = account.get("folder_bytes")
+        print(f"would forget : {org['name']}  ({org['slug']}, {org['id']})")
+        print(f"  folder      : {account['folder'] or '(managed, under projects/)'}")
+        on_disk = _bytes_label(int(sized)) if sized is not None else "(nothing to size)"
+        print(f"  on disk     : {on_disk}")
+        if account.get("active"):
+            print("  note        : this is the active org, so bare commands would have no default")
+        print(f"  folder kept : {account['folder_kept']}")
+        print(f"  delete      : {account['can_delete_folder']} — {account['can_delete_folder_why']}")
+        print("  nothing was removed: drop --preview to actually forget it")
+        return EXIT_OK
+
+    try:
+        entry = portfolio.remove_org(args.org)
+    except PortfolioError as exc:
+        _warn(f"cannot remove the org: {exc}")
+        return EXIT_CHECK_FAILED
+    portfolio.save()
+
+    if args.json:
+        print(json.dumps({**account, "removed": True}, indent=2, sort_keys=True, default=str))
+        return EXIT_OK
+    print(f"forgot org : {entry.name}")
+    print(f"  folder     : {account['folder'] or '(managed, under projects/)'}")
+    print(f"  folder kept: {account['folder_kept']} — {account['can_delete_folder_why']}")
     return EXIT_OK
 
 
@@ -4151,6 +4336,86 @@ def capability_help() -> str:
             "to it, so revoking is expressible.")
 
 
+# ── vocabularies the engine owns ─────────────────────────────────────────────
+#
+# One rule, applied six times: a flag whose values are a *closed set* the engine already declares
+# reads that set rather than repeating it. `capability_help` above is the precedent and the reason —
+# a help line with half a list in it is worse than no line, because it looks authoritative.
+#
+# The failure these prevent is not cosmetic. `--level` documented five levels while `people.LEVELS`
+# resolved six (`mid` is an alias people type); `--kind` named three provider kinds in a `choices=`
+# list beside `config.SUPPORTED_KINDS`; `--posture` spelled `unattended`/`supervised` out four times
+# against `goal.Posture`; `mission mark` recited the five objective states and `pool list --state`
+# recited four of six task states, the latter accepting any typo as an empty list. Every one of them
+# is a second copy of a table the engine enforces, and a second copy is a copy that can disagree.
+#
+# Imported inside the functions, like `capability_help`'s own config read: `build_parser` is called by
+# `doctor` and by shell completion, and those must not pay for importing the goal loop, the mission or
+# the pool to describe a flag.
+
+
+def posture_choices() -> list[str]:
+    """The run postures, from `goal.Posture` — the enum that decides what each one means."""
+    from .goal import Posture
+
+    return [posture.value for posture in Posture]
+
+
+def postures_phrase(default: str) -> str:
+    """The postures as a sentence, with `default` marked as such.
+
+    The default is the *caller's* — a flag with no default of its own hands the goal's own posture
+    (`GoalPolicy`'s) and a scheduled entry its own — so it is passed rather than guessed here.
+    """
+    return ", ".join(f"{value} (default)" if value == default else value
+                     for value in posture_choices())
+
+
+def provider_kind_choices() -> list[str]:
+    """The provider kinds a *write* is accepted for, from `config.SUPPORTED_KINDS`.
+
+    That tuple and not `providers.registry.SUPPORTED_KINDS`: the registry's list carries `fake`, which
+    exists so a test can inject a transport, and offering it here would invite a provider entry
+    nothing can talk to.
+    """
+    return list(SUPPORTED_KINDS)
+
+
+def level_choices() -> list[str]:
+    """The skill levels, from `people.LEVELS` — the table `hire` resolves `--level` through."""
+    from .people import LEVELS
+
+    return sorted(LEVELS)
+
+
+def hire_role_choices() -> list[str]:
+    """The roles a hire may name, from `people.HIRE_ROLES` — the tuple `hire()` validates against."""
+    from .people import HIRE_ROLES
+
+    return list(HIRE_ROLES)
+
+
+def mission_state_choices() -> list[str]:
+    """The objective states, from `mission.ObjectiveState` — the enum `mission mark` writes."""
+    from .mission import ObjectiveState
+
+    return [state.value for state in ObjectiveState]
+
+
+def pool_state_choices() -> list[str]:
+    """The pooled-task states, from `pool.TaskState` — the class the pool itself sets them from."""
+    from .pool import TaskState
+
+    return list(TaskState.all())
+
+
+def pool_priority_help() -> str:
+    """The priority range and default, from the constants `pool.create` clamps with."""
+    from .pool import DEFAULT_PRIORITY, MAX_PRIORITY, MIN_PRIORITY
+
+    return (f"{MIN_PRIORITY}-{MAX_PRIORITY}, higher first (default {DEFAULT_PRIORITY})")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The argument surface, with help text that explains rather than restates.
 
@@ -4327,8 +4592,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-iterations", type=int, default=3, dest="max_iterations",
                      help="cap on the review-fix loop (default: 3)")
     run.add_argument("--executor", help="override the executor plugin path (testing)")
-    run.add_argument("--posture", choices=["unattended", "supervised"],
-                     help="how far this run's goal may go on its own: unattended (default) lets it "
+    run.add_argument("--posture", choices=posture_choices(),
+                     help=f"how far this run's goal may go on its own: "
+                          f"{postures_phrase(GoalConfig().default_posture)} — unattended lets it "
                           "answer its own gates and finish alone; supervised parks at every gate")
     run.add_argument("--dry-run", action="store_true", dest="dry_run",
                      help="plan and bind, but do not execute")
@@ -4386,6 +4652,25 @@ def build_parser() -> argparse.ArgumentParser:
     abort.add_argument("--slug", help="project name (optional with --project, which names it)")
     abort.add_argument("--root", help="projects root (default: AgentOrg/projects)")
     abort.set_defaults(func=cmd_abort)
+
+    pause = sub.add_parser(
+        "pause", parents=[common],
+        help="park the run at its next node boundary, keeping its checkpoint — `resume` continues "
+             "it, `abort` ends it")
+    pause.add_argument("--slug", help="project name (optional with --project, which names it)")
+    pause.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    pause.set_defaults(func=cmd_pause)
+
+    resume = sub.add_parser(
+        "resume", parents=[common],
+        help="continue a parked run from its checkpoint, and carry the work on")
+    resume.add_argument("--slug", help="project name (optional with --project, which names it)")
+    resume.add_argument("--root", help="projects root (default: AgentOrg/projects)")
+    resume.add_argument("--no-execute", action="store_true", dest="no_execute",
+                        help="clear the pause and stop there, so the run is ready to inspect before "
+                             "anything is spent")
+    resume.add_argument("--executor", help="override the executor plugin path (testing)")
+    resume.set_defaults(func=cmd_resume)
 
     reassign = sub.add_parser(
         "reassign", parents=[common],
@@ -4450,9 +4735,11 @@ def build_parser() -> argparse.ArgumentParser:
     goal_set.add_argument("objective", nargs="+", help="what should be achieved")
     goal_set.add_argument("--no-arm", action="store_true", dest="no_arm",
                           help="record the objective but do not start working on it")
-    goal_set.add_argument("--posture", choices=["unattended", "supervised"],
-                          help="unattended (default): the goal answers its own gates and can finish "
-                               "alone. supervised: every gate waits for you.")
+    goal_set.add_argument("--posture", choices=posture_choices(),
+                          help=f"how far this goal may go on its own: "
+                               f"{postures_phrase(GoalConfig().default_posture)} — unattended lets "
+                               "it answer its own gates and can finish alone; supervised waits for "
+                               "you at every one")
     goal_set.add_argument("--human-gate", action="store_true", dest="human_gate",
                           help="stop at every gate: you decide, the org does not "
                                "(same as --posture supervised)")
@@ -4562,10 +4849,11 @@ def build_parser() -> argparse.ArgumentParser:
     mission_advance.set_defaults(func=cmd_mission)
 
     mission_mark = mission_sub.add_parser("mark", parents=[common],
-                                          help="set an objective's state (pending|active|done|"
-                                               "blocked|skipped)")
+                                          help="set an objective's state "
+                                               f"({'|'.join(mission_state_choices())})")
     mission_mark.add_argument("index", type=int, help="the objective's position (#0-based)")
-    mission_mark.add_argument("state", help="pending | active | done | blocked | skipped")
+    mission_mark.add_argument("state", choices=mission_state_choices(),
+                              help=f"one of: {', '.join(mission_state_choices())}")
     mission_mark.add_argument("--summary", help="what it produced, or why it is blocked")
     mission_mark.add_argument("--slug", help="project name (optional with --project)")
     mission_mark.add_argument("--root", help="projects root (default: AgentOrg/projects)")
@@ -4661,9 +4949,11 @@ def build_parser() -> argparse.ArgumentParser:
                                    help="auto-created helpers are temporary (the default)")
     defaults_autonomy.add_argument("--max-tier", type=int, default=None, dest="max_tier",
                                    help="highest delegation tier an auto-hire may reach (0-2)")
-    defaults_autonomy.add_argument("--posture", choices=["unattended", "supervised"],
-                                   help="the posture a new goal inherits: unattended lets it "
-                                        "answer its own gates and finish alone")
+    defaults_autonomy.add_argument("--posture", choices=posture_choices(),
+                                   help=f"the posture a new goal inherits: "
+                                        f"{postures_phrase(GoalConfig().default_posture)} — "
+                                        "unattended lets it answer its own gates and finish alone; "
+                                        "supervised waits for you at every one")
     defaults_autonomy.set_defaults(func=cmd_defaults)
 
     hire = sub.add_parser("hire", parents=[common],
@@ -4673,8 +4963,12 @@ def build_parser() -> argparse.ArgumentParser:
     hire.add_argument("--provider", help="provider id (default: the configured default)")
     hire.add_argument("--model", help="model id (default: the configured default)")
     hire.add_argument("--context-window", type=int, help="override the probed context window")
-    hire.add_argument("--level", help="junior | practitioner | senior | staff | principal")
-    hire.add_argument("--role", help="worker | reviewer (default: inferred from the skill)")
+    hire.add_argument("--level", choices=level_choices(),
+                      help=f"one of: {', '.join(level_choices())} "
+                           "(default: inferred from the skill)")
+    hire.add_argument("--role", choices=hire_role_choices(),
+                      help=f"one of: {', '.join(hire_role_choices())} "
+                           "(default: inferred from the skill)")
     hire.add_argument("--title", help="a human title for the roster (default: derived from the skill)")
     hire.add_argument("--team", help="the team it joins")
     hire.add_argument("--concurrency", type=int, help="how many tasks it may run at once")
@@ -4702,7 +4996,8 @@ def build_parser() -> argparse.ArgumentParser:
     agent_update.add_argument("--model", help="move it to this model")
     agent_update.add_argument("--context-window", type=int, dest="context_window",
                               help="an explicit window, when the provider cannot report one")
-    agent_update.add_argument("--level", help="junior | practitioner | senior | staff | principal")
+    agent_update.add_argument("--level", choices=level_choices(),
+                              help=f"one of: {', '.join(level_choices())}")
     agent_update.add_argument("--title", help="a human title for the roster")
     agent_update.add_argument("--team", help="the team it joins (empty moves it to none)")
     agent_update.add_argument("--concurrency", type=int,
@@ -4735,8 +5030,9 @@ def build_parser() -> argparse.ArgumentParser:
         "add", parents=[common],
         help="add or replace one provider in credentials.json, then re-read it in place")
     providers_add.add_argument("provider_id", help="the provider id, e.g. groq")
-    providers_add.add_argument("--kind", choices=["openai", "anthropic", "ollama"],
-                               help="the protocol it speaks (default: openai)")
+    providers_add.add_argument("--kind", choices=provider_kind_choices(),
+                               help=f"the protocol it speaks "
+                                    f"(default: {SUPPORTED_KINDS[0]})")
     providers_add.add_argument("--base-url", required=True, dest="base_url",
                                help="the API base, e.g. https://api.groq.com/openai/v1 — a base is "
                                     "the part before the operation, so a pasted full endpoint is "
@@ -4760,8 +5056,9 @@ def build_parser() -> argparse.ArgumentParser:
         "test", parents=[common],
         help="probe an entry before it is saved, and list the models it offers")
     providers_test.add_argument("provider_id", help="the provider id to test")
-    providers_test.add_argument("--kind", choices=["openai", "anthropic", "ollama"],
-                                help="the protocol it speaks (default: openai)")
+    providers_test.add_argument("--kind", choices=provider_kind_choices(),
+                                help=f"the protocol it speaks "
+                                     f"(default: {SUPPORTED_KINDS[0]})")
     providers_test.add_argument("--base-url", required=True, dest="base_url",
                                 help="the API base to probe")
     providers_test.add_argument("--key-env", dest="key_env", help="the environment variable holding it")
@@ -4827,6 +5124,9 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio_remove = portfolio_sub.add_parser("remove", parents=[common],
                                                 help="forget an org (its folder is left alone)")
     portfolio_remove.add_argument("org", help="org name, slug or id")
+    portfolio_remove.add_argument("--preview", action="store_true",
+                                  help="the engine's account of what forgetting it takes away and "
+                                       "what it leaves behind, and remove nothing")
     portfolio_remove.set_defaults(func=cmd_portfolio)
 
     portfolio_show = portfolio_sub.add_parser("show", parents=[common],
@@ -4955,7 +5255,9 @@ def build_parser() -> argparse.ArgumentParser:
                                     help="show the pool and its counts")
     pool_list.add_argument("--slug", help="project name (optional with --project, which names it)")
     pool_list.add_argument("--root", help="projects root (default: AgentOrg/projects)")
-    pool_list.add_argument("--state", help="only tasks in this state (pool|claimed|done|...)")
+    pool_list.add_argument("--state", choices=pool_state_choices(),
+                           help=f"only tasks in this state "
+                                f"({'|'.join(pool_state_choices())})")
     pool_list.set_defaults(func=cmd_pool)
     pool_add = pool_sub.add_parser("add", parents=[common], help="add claimable work")
     pool_add.add_argument("description", help="what needs doing")
@@ -4965,7 +5267,7 @@ def build_parser() -> argparse.ArgumentParser:
                           help="a skill the claimer must hold (repeatable)")
     pool_add.add_argument("--capability", action="append",
                           help="a capability the claimer must hold (repeatable)")
-    pool_add.add_argument("--priority", type=int, help="0-100, higher first (default 50)")
+    pool_add.add_argument("--priority", type=int, help=pool_priority_help())
     pool_add.add_argument("--tag", action="append", help="a tag (repeatable)")
     pool_add.add_argument("--parent", help="the task this was decomposed from")
     pool_add.add_argument("--schema", help="a JSON Schema the completion's output must satisfy")
@@ -5032,10 +5334,10 @@ def build_parser() -> argparse.ArgumentParser:
     schedules_add.add_argument("--at", help="fire once at a UTC ISO instant (2026-09-18T07:30:00)")
     schedules_add.add_argument("--due-now", action="store_true", dest="due_now",
                                help="fire at the watcher's next tick")
-    schedules_add.add_argument("--posture", choices=["unattended", "supervised"],
-                               default="unattended",
-                               help="unattended (default) lets the scheduled goal answer its own "
-                                    "gates and finish alone; supervised parks at every gate")
+    schedules_add.add_argument("--posture", choices=posture_choices(), default=DEFAULT_POSTURE,
+                               help=f"how far the scheduled goal may go on its own: "
+                                    f"{postures_phrase(DEFAULT_POSTURE)} — unattended lets it answer "
+                                    "its own gates and finish alone; supervised parks at every gate")
     schedules_add.add_argument("--disabled", action="store_true",
                                help="record it without arming it")
     schedules_add.add_argument("--slug", help="project name (optional with --project)")

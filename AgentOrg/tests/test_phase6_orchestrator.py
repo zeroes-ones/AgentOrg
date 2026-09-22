@@ -417,6 +417,42 @@ def test_pause_and_abort_without_a_run_are_refused(stack):
     assert orch.pause() is False
 
 
+def test_pause_with_an_explicit_run_parks_the_checkpoint(stack):
+    """The terminal's form of the same operation, and why it takes a run.
+
+    A second process — the terminal, or a console that is not executing the graph — has no host of its
+    own to signal, so the *checkpoint* is where the pause is written. That is the state a live pause
+    leaves behind, which is what makes the two surfaces agree rather than merely resemble each other;
+    without it `pause` from a shell was a no-op that could only report `False`.
+    """
+    orch, ws, _ = stack
+    _run_to_gate(orch, ws)
+    run = orch.load("gateprobe")
+    assert run is not None and run.phase is RunPhase.AWAITING_GATE
+
+    assert orch.pause(run) is True
+    assert run.phase is RunPhase.PAUSED
+    reloaded = orch.load("gateprobe")
+    assert reloaded.phase is RunPhase.PAUSED, "the phase is persisted, not only held in memory"
+
+    # Parked is not a state to park twice, and a settled run is never moved back.
+    assert orch.pause(run) is False
+    run.phase = RunPhase.DONE
+    assert orch.pause(run) is False and run.phase is RunPhase.DONE
+
+
+def test_resume_clears_the_park_for_the_run_it_is_given(stack):
+    """`resume`'s half of the pair, on the checkpoint a terminal loaded rather than one it ran."""
+    orch, ws, _ = stack
+    _run_to_gate(orch, ws)
+    run = orch.load("gateprobe")
+    orch.pause(run)
+
+    orch.resume(run)
+    assert run.phase is RunPhase.READY and run.gate is None
+    assert orch.load("gateprobe").phase is RunPhase.READY
+
+
 # ── phases ───────────────────────────────────────────────────────────────────
 
 

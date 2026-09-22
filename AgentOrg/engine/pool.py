@@ -61,7 +61,8 @@ try:  # pragma: no cover - platform probe
 except ImportError:  # pragma: no cover - Windows has no flock
     fcntl = None  # type: ignore[assignment]
 
-__all__ = ["TaskPool", "PoolTask", "PoolError", "TaskState", "validate_output"]
+__all__ = ["TaskPool", "PoolTask", "PoolError", "TaskState", "validate_output",
+           "MIN_PRIORITY", "MAX_PRIORITY", "DEFAULT_PRIORITY"]
 
 
 class PoolError(RuntimeError):
@@ -92,6 +93,25 @@ class TaskState:
     FAILED = "failed"
     BACKLOG = "backlog"      # deliberately parked, not claimable
 
+    @classmethod
+    def all(cls) -> tuple[str, ...]:
+        """Every state, in lifecycle order, read off this class rather than written out again.
+
+        The vocabulary has a reader outside this module — the terminal's `pool list --state` filter,
+        whose help named four of the six and whose flag accepted any typo as an empty list. A second
+        copy of the list is what makes that possible; a caller that needs the states asks for them.
+        """
+        return tuple(value for name, value in vars(cls).items()
+                     if not name.startswith("_") and isinstance(value, str))
+
+
+#: The priority a task is created with, and the range it is clamped into. Named rather than written
+#: into `__init__`'s signature and again into `create`'s clamp and again into the terminal's help: a
+#: ceiling a surface restates is a ceiling that disagrees with the engine the first time it moves.
+MIN_PRIORITY = 0
+MAX_PRIORITY = 100
+DEFAULT_PRIORITY = 50
+
 
 #: How long a claim is valid without a progress heartbeat. Long enough for a slow local model, short
 #: enough that a dead worker's task returns to the pool within one useful interval.
@@ -111,7 +131,7 @@ class PoolTask:
     id: str
     description: str
     state: str = TaskState.POOL
-    priority: int = 50
+    priority: int = DEFAULT_PRIORITY
     required_skills: list[str] = field(default_factory=list)
     required_capabilities: list[str] = field(default_factory=list)
     #: JSON Schema the completion's output must satisfy. None means any text is acceptable.
@@ -326,7 +346,7 @@ class TaskPool:
     # ── creating work ───────────────────────────────────────────────────────
 
     @_guarded
-    def create(self, description: str, *, priority: int = 50,
+    def create(self, description: str, *, priority: int = DEFAULT_PRIORITY,
                required_skills: Iterable[str] = (), required_capabilities: Iterable[str] = (),
                output_schema: dict[str, Any] | None = None, tags: Iterable[str] = (),
                parent_id: str | None = None, depends_on: Iterable[str] = (),
@@ -344,7 +364,7 @@ class TaskPool:
         task = PoolTask(
             id=task_id or f"task_{uuid.uuid4().hex[:10]}",
             description=str(description).strip(),
-            priority=max(0, min(100, int(priority))),
+            priority=max(MIN_PRIORITY, min(MAX_PRIORITY, int(priority))),
             required_skills=[str(s) for s in required_skills],
             required_capabilities=[str(c) for c in required_capabilities],
             output_schema=output_schema,

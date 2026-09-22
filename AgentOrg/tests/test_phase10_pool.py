@@ -80,6 +80,30 @@ def test_the_highest_priority_eligible_task_is_claimed_first(pool, dba):
     assert pool.claim(dba).description == "high"
 
 
+def test_the_states_and_the_priority_range_are_read_from_the_class_not_restated(pool, dba):
+    """A caller that needs the vocabulary asks for it, so a seventh state and a moved ceiling reach
+    the surfaces that document them without a second list to remember.
+
+    The readers here are the ones the terminal uses: `pool list --state` takes `TaskState.all()` as its
+    `choices` and its priority help is built from the three constants, so this pins the *source* those
+    read — a `TaskState` that grew a member without `all()` seeing it would be a state no filter could
+    name, and a clamp written with its own 0/100 would be a ceiling that disagrees with the help.
+    """
+    from engine.pool import DEFAULT_PRIORITY, MAX_PRIORITY, MIN_PRIORITY
+
+    states = TaskState.all()
+    assert set(states) == {TaskState.POOL, TaskState.OFFERED, TaskState.CLAIMED, TaskState.DONE,
+                           TaskState.FAILED, TaskState.BACKLOG}
+    assert len(states) == len(set(states)), "each state appears once"
+
+    assert (MIN_PRIORITY, DEFAULT_PRIORITY, MAX_PRIORITY) == (0, 50, 100)
+    assert pool.create("unspecified", required_skills=["database-designer"]).priority \
+        == DEFAULT_PRIORITY
+    # The clamp is the constants, in both directions.
+    assert pool.create("too high", priority=MAX_PRIORITY + 1).priority == MAX_PRIORITY
+    assert pool.create("too low", priority=MIN_PRIORITY - 1).priority == MIN_PRIORITY
+
+
 def test_two_workers_cannot_claim_the_same_task(pool, dba):
     pool.create("migrate", required_skills=["database-designer"])
     other = agent("ag_dba2", "Dax", ["database-designer"], ["read:*", "write:src/**"])

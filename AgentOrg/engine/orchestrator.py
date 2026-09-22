@@ -2333,17 +2333,42 @@ gated tier rather than the least"
         self.diagnostics.info("human.takeover", message=f"Owner took over {node_id}")
         return run
 
-    def pause(self) -> bool:
-        """Ask the running process to pause at the next node boundary."""
+    def pause(self, run: Run | None = None) -> bool:
+        """Park a run at its next node boundary, keeping its checkpoint.
+
+        Without a ``run`` this is the console's pause: the *running process* is asked to stop at the
+        boundary, and there is nothing to ask when this orchestrator has no host — which is what the
+        ``False`` means.
+
+        An explicit ``run`` is the **second process** case, the same one :meth:`resume` and
+        :meth:`abort` already take a run for: the terminal, or a console that is not the process
+        executing the graph, has no host of its own to signal and the *checkpoint* is the only place
+        the pause can be written. That is not a weaker thing to do — it is the state a live pause
+        leaves behind, and the one `status`, `resume` and `flow` read. A settled run and one that is
+        already paused are both left alone and answer ``False``, so a caller can tell "parked it" from
+        "there was nothing to park".
+        """
         with self._lock:
             host = self._host
-        if host is None:
+        if run is None:
+            if host is None:
+                return False
+            accepted = host.pause()
+            if accepted and self._run is not None:
+                self._run.phase = RunPhase.PAUSED
+                self._persist(self._run)
+            return accepted
+        if run.phase.terminal or run.phase is RunPhase.PAUSED:
             return False
-        accepted = host.pause()
-        if accepted and self._run is not None:
-            self._run.phase = RunPhase.PAUSED
-            self._persist(self._run)
-        return accepted
+        if host is not None:
+            # A host of our own is signalling its runner anyway, so the two cannot disagree about a
+            # graph that is mid-node.
+            host.pause()
+        run.phase = RunPhase.PAUSED
+        run.touch()
+        self._persist(run)
+        self._emit(EventType.RUN_PAUSED, {"run_id": run.run_id, "checkpoint_kept": True})
+        return True
 
     def resume(self, run: Run | None = None) -> Run:
         """Resume a paused run, continuing from its checkpoint."""

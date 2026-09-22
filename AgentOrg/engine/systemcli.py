@@ -1443,6 +1443,11 @@ def install(sub: Any, common: Any) -> Any:
     Written to take the host's own `common` parent rather than defining a second one, so a global flag
     added to `cli` reaches every command here without a change in this file.
     """
+    # The automation language is the engine's own vocabulary (`sysctl_tools`), not a second copy: the
+    # flag's choices and the tool's refusal have to name the same languages or `system automation
+    # --language` would accept a source the tool then rejects.
+    from .sysctl_tools import SCRIPT_LANGUAGES
+
     leaf = argparse.ArgumentParser(add_help=False)
     # `SUPPRESS` so an omitted `--agent` leaves no attribute at all: the flag means "act as someone
     # else", and a normal default would set `None` over a value the group parser had already read.
@@ -1513,8 +1518,9 @@ def install(sub: Any, common: Any) -> Any:
                                        "system.allow_automation")
     automation.add_argument("--script", help="the AppleScript/JXA source")
     automation.add_argument("--file", help="read the source from this file instead")
-    automation.add_argument("--language", choices=["applescript", "javascript"],
-                            default="applescript", help="which language the source is in")
+    automation.add_argument("--language", choices=list(SCRIPT_LANGUAGES),
+                            default=SCRIPT_LANGUAGES[0],
+                            help="which language the source is in")
     automation.set_defaults(func=cmd_automation)
 
     notify = inner.add_parser("notify", parents=[common, leaf],

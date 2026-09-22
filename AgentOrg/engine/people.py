@@ -47,7 +47,7 @@ from . import usercfg
 from .org import Org, OrgError, RoleTemplate, default_company
 from .org.agent import AgentKind, AgentLevel, AgentSpec, Budget
 
-__all__ = ["People", "HireRequest", "HireError"]
+__all__ = ["People", "HireRequest", "HireError", "LEVELS", "HIRE_ROLES"]
 
 
 class HireError(RuntimeError):
@@ -63,6 +63,11 @@ LEVELS: dict[str, AgentLevel] = {
     "staff": AgentLevel.STAFF,
     "principal": AgentLevel.PRINCIPAL,
 }
+
+
+#: The roles a hire may name. `owner` is deliberately absent: the Owner is the terminal authority the
+#: engine always has, not an agent a command creates.
+HIRE_ROLES: tuple[str, ...] = ("worker", "reviewer")
 
 
 @dataclass
@@ -238,6 +243,14 @@ class People:
                 f"unknown level {request.level!r}; choose one of {', '.join(sorted(set(LEVELS)))}"
             )
 
+        # The role is checked here rather than only offered as a `--help` line: the flag had no
+        # choices at all, so `hire --role boss` wrote an agent whose role nothing downstream knows —
+        # and the roster is what the router reads. The vocabulary is this tuple, and the terminal's
+        # help reads *it* rather than a sentence written beside it.
+        role = "reviewer" if request.as_reviewer or _is_reviewer_skill(request.skill) else request.role
+        if role not in HIRE_ROLES:
+            raise HireError(f"unknown role {role!r}; choose one of {', '.join(HIRE_ROLES)}")
+
         spec = AgentSpec(
             id=_new_id(request.name, target),
             name=request.name,
@@ -247,7 +260,7 @@ class People:
             model=model,
             context_window=int(window),
             kind=AgentKind.AI,
-            role="reviewer" if request.as_reviewer or _is_reviewer_skill(request.skill) else request.role,
+            role=role,
             level=level,
             team=request.team,
             capabilities=list(request.capabilities) or _capabilities_for(request.skill),
