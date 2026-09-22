@@ -590,6 +590,10 @@ python3 -m engine.cli doctor          # all seven checks, named
 export AGENTORG_SKILLS_ROOT=/path/to/Skills   # a checkout with scripts/workflow-runner.py
 ```
 
+The app can set the same folder from **Setup → skills**, and there it survives a restart. That is the
+way to do it when the checkout the engine would otherwise find is inside `~/Documents`: macOS then asks
+for permission to read that folder, and until the prompt is answered the engine cannot start.
+
 The app finds the repository by walking up from its own executable until it sees
 `AgentOrg/engine/cli.py`, so it works from a `swift run`, a `--debug` build, and a bundled `.app`
 alike.

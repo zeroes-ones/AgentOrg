@@ -106,7 +106,14 @@ The engine probes `$AGENTORG_SKILLS_ROOT`, `~/Documents/Projects/Skills`, `~/.ze
 `~/.agentorg/skills`. It checks for the **runner**, not merely a directory — a directory that looks
 right but lacks `scripts/workflow-runner.py` is exactly the failure worth catching early.
 
-**Fix:**
+**Fix, in the app:** Setup → *skills* → **Choose…** the checkout (or **Use this folder**), then press
+**Try again**. This sends the folder to the engine as `AGENTORG_SKILLS_ROOT`, which it tries **first**,
+so a launch stops depending on where the search above lands — which is what matters when the checkout it
+finds is inside `~/Documents`, where a macOS folder-permission prompt is what decides whether the engine
+can start at all. A pinned folder with no runner is not forced: the engine falls back to the search
+above, and the app says the pin was not used.
+
+**Fix, at the command line:**
 ```bash
 export AGENTORG_SKILLS_ROOT=/path/to/Skills
 python3 -m engine.cli --library /path/to/Skills doctor   # or pass it explicitly
