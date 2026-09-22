@@ -43,9 +43,10 @@ final class OrgControllerPollTests: XCTestCase {
     ///
     /// The dismissal store is injected for the same reason `AppPreferences.ephemeral()` exists: a test
     /// that dismisses a proposal must not write into the developer's real `UserDefaults`, and the
-    /// assertions must not depend on what an earlier run left there.
+    /// assertions must not depend on what an earlier run left there. In memory, not a suite — a suite
+    /// of this test's own was still a real plist in the developer's preferences directory.
     private func makeController(arguments: [String]? = nil,
-                                dismissals: UserDefaults? = nil) -> OrgController {
+                                dismissals: PreferenceStore? = nil) -> OrgController {
         var settings = OrgController.OrgSettings(
             engineRoot: root, projectPath: root, credentialsPath: nil, libraryRoot: nil)
         if let arguments {
@@ -54,11 +55,7 @@ final class OrgControllerPollTests: XCTestCase {
         }
         return OrgController(settings: settings, maxRestartAttempts: 0, restartDelay: 0.05,
                              preferences: .ephemeral(),
-                             proposalDismissals: dismissals ?? ephemeralDefaults())
-    }
-
-    private func ephemeralDefaults() -> UserDefaults {
-        UserDefaults(suiteName: "org.agentorg.tests.poll.\(UUID().uuidString)") ?? .standard
+                             proposalDismissals: dismissals ?? InMemoryPreferenceStore())
     }
 
     private func event(_ type: String, _ payload: [String: JSONValue] = [:]) -> EngineEvent {
@@ -202,7 +199,7 @@ final class OrgControllerPollTests: XCTestCase {
         // `dismissProposal` was local-only: the row was removed from `proposals`, and the engine — which
         // re-globs the directory on every `status` — put it back within two seconds, under the hand that
         // had just removed it.
-        let dismissals = ephemeralDefaults()
+        let dismissals = InMemoryPreferenceStore()
         let controller = makeController(dismissals: dismissals)
         await controller.dismissProposal(id: "prop_0001")
 
@@ -225,6 +222,34 @@ final class OrgControllerPollTests: XCTestCase {
         relaunched.applyStatus(payload)
         XCTAssertEqual(relaunched.proposals.compactMap { $0["proposal_id"]?.stringValue },
                        ["prop_0002"], "a dismissal that a relaunch undid would be no dismissal at all")
+    }
+
+    func testADismissalPutsNothingInTheRealPreferencesDirectory() async throws {
+        // The dismissal store is the second place a test wrote into the developer's own preferences: the
+        // suite was `org.agentorg.tests.poll.<UUID>`, one real plist per run of the test above, never
+        // removed. Injecting a store is only half of the claim — that it does not persist is a statement
+        // about the disk, so it is measured there.
+        let directory = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Preferences", isDirectory: true)
+        let before = try preferenceFiles(in: directory)
+
+        let controller = makeController()
+        await controller.dismissProposal(id: "prop_0001")
+
+        // A `UserDefaults` suite reaches the preference daemon out of process, so a write that should
+        // not happen is given time to land: a pass then means none was made, not that none had arrived.
+        Thread.sleep(forTimeInterval: 1)
+        let after = try preferenceFiles(in: directory)
+        XCTAssertEqual(after, before,
+                       "a test dismissal must leave no file behind; it added "
+                        + "\(after.subtracting(before).sorted())")
+    }
+
+    /// Every test-domain preference file, by name — the whole family this test and `AppPreferences` used
+    /// to write into the real directory.
+    private func preferenceFiles(in directory: URL) throws -> Set<String> {
+        Set(try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasPrefix("org.agentorg.") })
     }
 
     // MARK: - The engine's own stderr

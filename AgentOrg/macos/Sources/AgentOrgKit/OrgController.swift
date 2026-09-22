@@ -457,8 +457,8 @@ public final class OrgController: ObservableObject {
     /// `refreshSlowPanelsIfDue`.
     private var lastSlowPanelRefresh: Date?
     /// Where "this proposal is dismissed" is remembered between launches. Injected so a test writes to
-    /// a suite of its own rather than to the developer's real defaults.
-    private let proposalDismissals: UserDefaults
+    /// a store of its own rather than to the developer's real defaults.
+    private let proposalDismissals: PreferenceStore
 
     /// How long a command may wait for its acknowledgement.
     ///
@@ -655,7 +655,7 @@ public final class OrgController: ObservableObject {
                 slowCommandAfter: TimeInterval = OrgController.defaultSlowCommandAfter,
                 launchTimeout: TimeInterval = OrgController.defaultLaunchTimeout,
                 preferences: AppPreferences? = nil,
-                proposalDismissals: UserDefaults = .standard) {
+                proposalDismissals: PreferenceStore = UserDefaults.standard) {
         self.settings = settings
         self.logs = logs ?? LogStore()
         self.writer = WorkspaceWriter(root: settings.projectPath)

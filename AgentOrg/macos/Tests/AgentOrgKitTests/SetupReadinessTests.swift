@@ -23,18 +23,15 @@ import XCTest
 @MainActor
 final class SetupReadinessTests: XCTestCase {
 
-    private var suiteName = ""
-    private var store: UserDefaults!
+    private var store: InMemoryPreferenceStore!
 
     override func setUpWithError() throws {
-        // A suite of this test's own, so the assertions are about `AppPreferences` and not about
-        // whatever the developer's machine last stored under the same keys.
-        suiteName = "org.agentorg.tests.\(UUID().uuidString)"
-        store = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-    }
-
-    override func tearDownWithError() throws {
-        store.removePersistentDomain(forName: suiteName)
+        // A store of this test's own, so the assertions are about `AppPreferences` and not about
+        // whatever the developer's machine last stored under the same keys — and one that exists in
+        // memory, because a suite of this test's own was *still* a real plist in the developer's
+        // preferences directory. Every run of this class left one behind: the teardown called
+        // `removePersistentDomain`, which empties the dictionary and leaves the 42-byte file.
+        store = InMemoryPreferenceStore()
     }
 
     // MARK: - The engine has to be up before anything else can be asked
@@ -254,14 +251,45 @@ final class SetupReadinessTests: XCTestCase {
     }
 
     func testTheEphemeralStoreDoesNotLeakBetweenInstances() {
-        // Used for previews and throwaway controllers; two of them must not share state through
-        // `UserDefaults.standard`.
+        // Used for previews and throwaway controllers; two of them must not share state through a
+        // global store.
         let first = AppPreferences.ephemeral()
         first.chosenPosture = .supervised
         first.wizardCompleted = true
         let second = AppPreferences.ephemeral()
         XCTAssertNil(second.chosenPosture)
         XCTAssertFalse(second.wizardCompleted)
+    }
+
+    func testTheEphemeralStorePutsNothingInTheRealPreferencesDirectory() throws {
+        // "No persistence" is a claim about the disk, so it is measured on the disk rather than read
+        // off the type. `ephemeral()` used to be a `UserDefaults(suiteName: "org.agentorg.ephemeral.
+        // <UUID>")` — a suite name that has never been registered still becomes a real plist there on
+        // the first `set`, and nothing ever removed it, so the developer's own preferences directory
+        // held one file per run of every test that passed `.ephemeral()`.
+        let directory = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Preferences", isDirectory: true)
+        let before = try ephemeralPreferenceFiles(in: directory)
+
+        let preferences = AppPreferences.ephemeral()
+        preferences.chosenPosture = .supervised
+        preferences.projectConfirmed = true
+        preferences.wizardCompleted = true
+        preferences.reset()
+
+        // A `UserDefaults` suite reaches the preference daemon out of process, so a write that should
+        // not happen is given time to land: a pass then means none was made, not that none had arrived.
+        Thread.sleep(forTimeInterval: 1)
+        let after = try ephemeralPreferenceFiles(in: directory)
+        XCTAssertEqual(after, before,
+                       "an ephemeral store must leave no file behind; it added "
+                        + "\(after.subtracting(before).sorted())")
+    }
+
+    /// The files `AppPreferences.ephemeral()` would have created, if it still created any.
+    private func ephemeralPreferenceFiles(in directory: URL) throws -> Set<String> {
+        Set(try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasPrefix("org.agentorg.ephemeral.") })
     }
 
     // MARK: - The controller's use of the gate

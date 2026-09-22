@@ -625,8 +625,8 @@ public struct SetupJourneyReport: Sendable, Equatable {
 /// - **That the project question has been answered.** The engine always has a workspace, so this is a
 ///   confirmation rather than a discovery — but a confirmation is what makes the wizard finite.
 ///
-/// `UserDefaults` behind an injectable suite, so a test exercises the real code with its own store
-/// rather than polluting the user's.
+/// A `PreferenceStore` behind injection, so a test exercises the real code with its own store rather
+/// than polluting the user's — and `ephemeral()` hands it one that never reaches the disk at all.
 @MainActor
 public final class AppPreferences {
 
@@ -636,18 +636,23 @@ public final class AppPreferences {
         static let wizardDone = "setup.wizardCompleted"
     }
 
-    private let store: UserDefaults
+    private let store: PreferenceStore
 
-    /// - Parameter store: defaults to `.standard`. A test passes a suite of its own so the assertions
-    ///   are about this type and not about whatever the developer's machine last stored.
-    public init(store: UserDefaults = .standard) {
+    /// - Parameter store: defaults to `.standard`. A test passes a store of its own so the assertions
+    ///   are about this type and not about whatever the developer's machine last stored — and one that
+    ///   keeps its values in memory, because a `UserDefaults(suiteName:)` writes a real plist into the
+    ///   developer's own preferences directory. See `InMemoryPreferenceStore`.
+    public init(store: PreferenceStore = UserDefaults.standard) {
         self.store = store
     }
 
     /// A store with no persistence, for a preview or a throwaway controller.
+    ///
+    /// In memory, so that it is one in fact and not only in name: the `UserDefaults(suiteName:)` this
+    /// used to be left a `~/Library/Preferences/org.agentorg.ephemeral.<UUID>.plist` behind on every
+    /// call that stored anything. See `PreferenceStore`.
     public static func ephemeral() -> AppPreferences {
-        AppPreferences(store: UserDefaults(suiteName: "org.agentorg.ephemeral.\(UUID().uuidString)")
-            ?? .standard)
+        AppPreferences(store: InMemoryPreferenceStore())
     }
 
     /// The posture a goal set from this app inherits, or nil before one has been chosen.
