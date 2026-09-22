@@ -452,19 +452,64 @@ _NEXT_PERFORMABLE: dict[str, str] = {
 }
 
 
-def _action(kind: str, label: str, detail: str, command: str) -> dict[str, Any]:
+def _action(kind: str, label: str, detail: str, command: str,
+            also: list[dict[str, str]] | None = None) -> dict[str, Any]:
     """One next action, with the surface question answered rather than left to be re-derived.
 
     `performable` is the answer where it is unconditional; `needs` names what is still required when it
     is not. Both are always present, so a surface reads two fields instead of enumerating the kinds —
     and a kind added here tomorrow is handled by whatever surface reads it, without a second edit.
+
+    `also` carries the routes that are *not* the first one, each with the label that says how it
+    differs. It is always present and empty when there are none, for the same reason: a surface reads a
+    field rather than asking which kinds happen to have alternatives today.
     """
     needs = _NEXT_PERFORMABLE.get(kind)
     return {
         "kind": kind, "label": label, "detail": detail, "command": command,
         "performable": needs == "",
         "needs": needs or "",
+        "also": also or [],
     }
+
+
+def _gate_action(run: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any]:
+    """The gate decision — with what is already known about it, and the other verbs the engine accepts.
+
+    The command used to be a single line, *approve*, and that is a trap a run can sit in for days: a
+    gate raised because a node's **report** did not satisfy its contract is not resolved by approving
+    it, and approving is what the one command told the person to do. Measured on this machine: the same
+    contract violation gated `pm` twice, the second time *after* an approval, and the gate then stayed
+    open with every surface still pointing at approve.
+
+    Two facts decide whether the alternatives are offered, and both are the engine's own: the node's
+    attempt count (`gate.dossier.attempts`) and when the gate was asked (`asked_at`). Nothing here
+    predicts an outcome — it says what is already true, and names the two other verbs the engine
+    accepts (`reassign`, and `decide --reject`), which is the same "never point a person at a command
+    the engine would refuse" rule `flow.recovery_command` follows for a retry.
+    """
+    slug = str(run.get("slug") or "")
+    dossier = gate.get("dossier") if isinstance(gate.get("dossier"), dict) else {}
+    node = str(dossier.get("node") or gate.get("gate_id") or "")
+    attempts = dossier.get("attempts")
+    detail = clip(str(gate.get("reason") or ""), 200)
+    also: list[dict[str, str]] = []
+    if isinstance(attempts, int) and attempts >= 1:
+        asked = str(gate.get("asked_at") or "")
+        when = asked[:16].replace("T", " ") if len(asked) >= 16 else asked
+        waited = f", open since {when}" if when else ""
+        detail += (f" — {node or 'this node'} has already attempted {attempts} time(s){waited}, and "
+                   f"approving continues the run with that contract unchanged")
+        also.append({
+            "label": "give the node a different agent, instead of asking the same one again",
+            "command": f"engine.cli reassign {node} --slug {slug} --agent <name>",
+        })
+        also.append({
+            "label": "park it and say why, so the same attempt is not repeated blindly",
+            "command": f"engine.cli decide --slug {slug} --reject --note \"...\"",
+        })
+    return _action("decide", f"Decide gate {gate.get('gate_id')!r}", detail,
+                   f"engine.cli decide --slug {slug} --approve --note \"...\"", also=also)
 
 
 def _next_action(run: dict[str, Any], goal: dict[str, Any],
@@ -484,9 +529,7 @@ def _next_action(run: dict[str, Any], goal: dict[str, Any],
     """
     gate = run.get("gate") if isinstance(run.get("gate"), dict) else None
     if gate is not None:
-        return _action("decide", f"Decide gate {gate.get('gate_id')!r}",
-                       clip(str(gate.get("reason") or ""), 200),
-                       f"engine.cli decide --slug {run.get('slug', '')} --approve --note \"...\"")
+        return _gate_action(run, gate)
     # A parked plan is the whole run: nothing has executed, and approving it is the one decision that
     # starts it — the route `run --approve-plan` and the console's own `approve_plan` both take. It used
     # to be reported as `none`, because an `awaiting_approval` run has no gate, no stop and no staffing

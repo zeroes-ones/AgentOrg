@@ -1893,15 +1893,46 @@ def cmd_activity(args: argparse.Namespace) -> int:
                 line += f"  — {str(entry['detail'])[:70]}"
             print(line)
 
-    action = report.get("next_action") or {}
-    if action.get("kind") and action.get("kind") != "none":
-        print()
-        print(f"Next: {action.get('label')}")
-        if action.get("detail"):
-            print(f"  {action['detail']}")
-        if action.get("command"):
-            print(f"  $ {action['command']}")
+    _print_next_action(report.get("next_action") or {}, indent="  ")
     return EXIT_OK
+
+
+#: How much of a next step's detail a terminal prints. One bound for both commands, so the same
+#: sentence cannot be cut at 200 in one view and run on in the other.
+_NEXT_DETAIL_CHARS = 240
+
+
+def _print_next_action(action: dict[str, Any], *, indent: str) -> None:
+    """The next step, the command that resolves it, and the routes that are not the first one.
+
+    One printer for both commands rather than two copies: `activity` closes with this block and
+    `attention` prints the same block once per workspace, and the two had already drifted into
+    different indents and different clippings.
+
+    The alternatives matter more than the indent. A gate told a person to *approve*, and a run gated
+    because a node's report did not satisfy its contract can sit there for days doing exactly that —
+    measured on this machine, the same violation gated `pm` twice, the second time after an approval,
+    and every surface kept pointing at approve. The engine now carries the other verbs it accepts, and
+    what is already known about the gate (`activity._gate_action`); this prints them.
+    """
+    # Imported here rather than at module scope, like the two other readers of the timeline in this
+    # file: `doctor` and the completion script build the whole parser without paying for `flow`, and
+    # this printer is called from two commands that both already import it locally.
+    from .flow import clip
+
+    if not action.get("kind") or action.get("kind") == "none":
+        return
+    print()
+    print(f"{indent}Next: {action.get('label')}")
+    if action.get("detail"):
+        print(f"{indent}  {clip(str(action['detail']), _NEXT_DETAIL_CHARS)}")
+    if action.get("command"):
+        print(f"{indent}  $ {action['command']}")
+    for alternative in action.get("also") or []:
+        if not isinstance(alternative, dict) or not alternative.get("command"):
+            continue
+        print(f"{indent}  or instead — {alternative.get('label')}:")
+        print(f"{indent}    $ {alternative['command']}")
 
 
 def cmd_attention(args: argparse.Namespace) -> int:
@@ -1952,13 +1983,9 @@ def cmd_attention(args: argparse.Namespace) -> int:
             print(f"    {clip(row['headline'], 150)}")
         if row.get("objective"):
             print(f"    on        : {clip(row['objective'], 100)}")
-        # The same shape `activity` closes with, so the step and its command read the same way on both
-        # commands — one workspace or twenty.
-        print(f"    Next: {row['waiting_for']}")
-        if action.get("detail"):
-            print(f"      {clip(str(action['detail']), 200)}")
-        if action.get("command"):
-            print(f"      $ {action['command']}")
+        # The same printer `activity` closes with, so the step, its command and its alternatives read
+        # the same way on both commands — one workspace or twenty.
+        _print_next_action(action, indent="    ")
         org = row.get("org") or {}
         if org.get("registered"):
             print(f"      in your portfolio as {org.get('slug')}")

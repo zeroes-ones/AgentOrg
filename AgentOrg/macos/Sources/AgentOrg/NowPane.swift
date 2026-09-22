@@ -1004,6 +1004,10 @@ struct AttentionSection: View {
         let org = row["org"]?.objectValue ?? [:]
         let slug = row["slug"]?.stringValue ?? ""
         let registered = org["registered"]?.boolValue == true
+        // The routes that are *not* the first one, in the engine's words — the same list a terminal
+        // prints under `Next:`. Computed here rather than beside the view that draws them because a
+        // declaration inside a nested `ViewBuilder` closure is not something to rely on.
+        let alternatives = (action["also"]?.arrayValue ?? []).compactMap { $0.objectValue }
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 7) {
                 Text(row["name"]?.stringValue ?? slug)
@@ -1054,11 +1058,40 @@ struct AttentionSection: View {
                         .help(command)
                 }
             }
+            // The routes that are not the first one. A gate whose reason is about a node's *report* is
+            // not resolved by approving it, and a run can sit there for days while every surface points
+            // at approve — so when the engine's own dossier says the node has already attempted, the
+            // other verbs it accepts travel with the action (`activity._gate_action`) and are shown here
+            // as well as on the command line. Nothing is composed here: label and command are the
+            // engine's, and an alternative without a command is not drawn at all.
+            if !alternatives.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(0..<alternatives.count, id: \.self) { index in
+                        alternativeView(alternatives[index])
+                    }
+                }
+            }
         }
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.secondary.opacity(0.06))
         .cornerRadius(6)
+    }
+
+    /// One route that is not the first one: the engine's label for it, and the command it names.
+    @ViewBuilder
+    private func alternativeView(_ alternative: [String: JSONValue]) -> some View {
+        if let command = alternative["command"]?.stringValue, !command.isEmpty {
+            Text("or instead — \(alternative["label"]?.stringValue ?? "")")
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(command)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .lineLimit(1)
+                .help(command)
+        }
     }
 
     /// Register the row's workspace, from the engine's own payload.

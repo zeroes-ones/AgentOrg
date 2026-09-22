@@ -102,6 +102,54 @@ def test_a_gate_makes_the_next_action_a_decision(workspace):
     assert "decide" in report["next_action"]["command"]
 
 
+def test_a_gate_that_already_asked_once_offers_the_other_routes(workspace):
+    """The trap: a gate whose reason is about a node's *report* is not resolved by approving it.
+
+    Measured on this machine: the same contract violation gated `pm` twice — the second time *after* an
+    approval — and the gate then stayed open with every surface still pointing at approve. So when the
+    engine's own dossier says the node has already attempted, the routes the engine accepts are offered
+    beside the first one, and the facts that decide it are stated rather than inferred.
+    """
+    state = {
+        "run_id": "run_4", "slug": "rn-apps", "phase": "awaiting_gate",
+        "gate": {"gate_id": "pm", "kind": "human", "asked_at": "2026-09-17T14:44:38.073Z",
+                 "reason": "contract violation: completion.criteria declares 3 criteria",
+                 "dossier": {"node": "pm", "attempts": 1,
+                             "summary": "contract violation: criteria not covered"}},
+        "outcome": {"nodes": {"pm": {"status": "needs_review", "verdict": "contract-violation"}}},
+    }
+    _write(workspace.state_dir, "run_state.json", json.dumps(state))
+
+    action = build_activity(workspace)["next_action"]
+    assert action["kind"] == "decide"
+    assert "decide" in action["command"], "the first route is not taken away"
+    assert "attempted 1 time(s)" in action["detail"]
+    assert "2026-09-17 14:44" in action["detail"], "the gate's own age is the engine's own fact"
+    commands = [alt["command"] for alt in action["also"]]
+    assert any("reassign pm" in c for c in commands), "the route for `the model could not meet it`"
+    assert any("--reject" in c for c in commands), "the route that stops the same attempt repeating"
+    for alternative in action["also"]:
+        assert alternative["label"], "an alternative without its reason is a command with no why"
+
+
+def test_a_gate_that_has_not_been_attempted_offers_no_alternatives(workspace):
+    """A first gate is an ordinary decision, and alternatives invented for it are noise to skim past.
+
+    What decides is the engine's own dossier: with no attempt recorded there is nothing to say about
+    repeating one, so `also` stays empty and the block reads exactly as it always did.
+    """
+    state = {
+        "run_id": "run_5", "slug": "console", "phase": "awaiting_gate",
+        "gate": {"gate_id": "release", "kind": "human", "reason": "Owner release approval"},
+        "outcome": {"nodes": {}},
+    }
+    _write(workspace.state_dir, "run_state.json", json.dumps(state))
+
+    action = build_activity(workspace)["next_action"]
+    assert action["kind"] == "decide"
+    assert action["also"] == []
+
+
 def test_a_parked_plan_makes_the_next_action_an_approval(workspace):
     """The one phase whose whole meaning is "waiting for the Owner" used to say nothing.
 
