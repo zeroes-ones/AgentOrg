@@ -90,7 +90,8 @@ final class OrgControllerBridgeTests: XCTestCase {
                                 projectPath: URL? = nil,
                                 attachedProject: URL? = nil,
                                 arguments: [String]? = nil,
-                                preferences: AppPreferences? = nil) throws -> OrgController {
+                                preferences: AppPreferences? = nil,
+                                notifier: ConsoleNotifier? = nil) throws -> OrgController {
         let script = try makeEngineScript(pauseAnswer: pauseAnswer)
         let settings = OrgController.OrgSettings(
             engineRoot: root,
@@ -99,7 +100,8 @@ final class OrgControllerBridgeTests: XCTestCase {
             attachedProject: attachedProject)
             .with(runtime: .system(URL(fileURLWithPath: "/usr/bin/env")),
                   arguments: arguments ?? ["python3", script.path])
-        return OrgController(settings: settings, maxRestartAttempts: maxRestartAttempts,
+        return OrgController(settings: settings, notifier: notifier,
+                             maxRestartAttempts: maxRestartAttempts,
                              restartDelay: 0.05, preferences: preferences ?? .ephemeral())
     }
 
@@ -167,8 +169,8 @@ final class OrgControllerBridgeTests: XCTestCase {
         return controller.logs.lines.map(\.text).joined(separator: "\n")
     }
 
-    private func launchedController() async throws -> OrgController {
-        let controller = try makeController()
+    private func launchedController(notifier: ConsoleNotifier? = nil) async throws -> OrgController {
+        let controller = try makeController(notifier: notifier)
         controller.launch()
         let ready = await waitUntil { controller.engineState == .running }
         XCTAssertTrue(ready, "the stand-in engine must reach `running` via its readiness frame")
@@ -643,6 +645,130 @@ final class OrgControllerBridgeTests: XCTestCase {
         XCTAssertEqual(controller.inFlightNotificationCount, 0)
         XCTAssertEqual(notifier.delivered.count, 26,
                        "every event still notified — bounded bookkeeping, not a dropped delivery")
+    }
+
+    // MARK: - The stop that notified nobody, and the banner that would not go away
+
+    func testAPlanAwaitingApprovalNotifiesOnceAndTheRunsEndingDoesNotRepeatIt() async throws {
+        // **Two halves of the same rule, driven through the controller.** `manifest.proposed` parks the
+        // run at `awaiting_approval` and used to notify nobody — the one engine state that asks a person
+        // for something, silent. It notifies now, and the `run.end` that follows it (the same stop, seen
+        // again) must not: one stop, one banner.
+        let notifier = RecordingNotifier(isAuthorized: true)
+        let controller = makeEventController(notifier: notifier)
+
+        controller.handle(event("manifest.proposed", [
+            "slug": .string("harden-auth"),
+            "validated": .bool(true),
+            "nodes": .array([.string("pm"), .string("dev"), .string("reviewer")]),
+            "gates": .array([.string("release")]),
+            "staffing_gaps": .array([]),
+            "approvable": .bool(true),
+        ]))
+        await controller.awaitNotifications()
+
+        XCTAssertEqual(notifier.delivered.map(\.identifier), [NotificationIdentifier.plan])
+        XCTAssertEqual(notifier.delivered.first?.urgency, .interrupt)
+        XCTAssertTrue(notifier.delivered.first?.body.contains("approve it on Now") ?? false,
+                      notifier.delivered.first?.body ?? "nil")
+
+        controller.handle(event("run.end", ["state": .string("gated"), "gated": .bool(true)]))
+        await controller.awaitNotifications()
+        XCTAssertEqual(notifier.delivered.count, 1,
+                       "the run's ending is the plan stop seen again, not a second stop")
+    }
+
+    func testThePlanBannerGoesWhenTheEngineTakesThePlan() async throws {
+        // **The "no way to clean up" half, on the automatic path.** The banner says the plan needs
+        // approval; the moment the engine takes it that is false, and a person who looks at Notification
+        // Centre afterwards would be reading a question they have already answered.
+        let notifier = RecordingNotifier(isAuthorized: true)
+        let controller = try await launchedController(notifier: notifier)
+        defer { controller.stop() }
+        // The poll's `proposal` key is the same document as the event's, so this is how a parked plan is
+        // present without replaying the frame — the route the Now pane's card reads too.
+        controller.applyStatus(["proposal": .object([
+            "nodes": .array([.string("pm")]), "approvable": .bool(true),
+        ])])
+        XCTAssertNotNil(controller.proposedGraph)
+
+        await controller.approvePlan()
+        XCTAssertTrue(notifier.withdrawn.contains(NotificationIdentifier.plan),
+                      "the approved plan's banner must be taken back, got \(notifier.withdrawn)")
+        XCTAssertNil(controller.proposedGraph)
+    }
+
+    func testTheGateBannerGoesWhenThePersonAnswersTheGate() async throws {
+        let notifier = RecordingNotifier(isAuthorized: true)
+        let controller = try await launchedController(notifier: notifier)
+        defer { controller.stop() }
+        controller.applyStatus(["goal": .object([
+            "objective": .string("ship it"), "posture": .string("supervised"),
+        ])])
+        controller.handle(event("human.gate", [
+            "gate_id": .string("release"), "kind": .string("human"),
+            "reason": .string("Owner release approval"),
+            "waiting_on": .string("owner"),
+            "why": .string("a safety control fired (guardrail); the goal may not release this"),
+        ]))
+        await controller.awaitNotifications()
+        XCTAssertEqual(notifier.delivered.map(\.identifier), [NotificationIdentifier.gate])
+        notifier.reset()
+
+        let answered = await controller.approve()
+        XCTAssertTrue(answered, "the stand-in engine accepts an approve")
+        XCTAssertTrue(notifier.withdrawn.contains(NotificationIdentifier.gate),
+                      "a gate that has been answered must stop being announced as waiting")
+    }
+
+    func testTheGateBannerGoesWhenTheGoalAnswersTheGateInstead() async throws {
+        // The other way a gate stops being a person's: the engine recorded its own decision. No click
+        // was ever going to arrive, so a banner still asking for one is worse than stale — it is wrong.
+        let notifier = RecordingNotifier(isAuthorized: true)
+        let controller = makeEventController(notifier: notifier)
+        controller.handle(event("human.gate", [
+            "gate_id": .string("release"), "kind": .string("human"),
+            "reason": .string("Owner release approval"),
+            "waiting_on": .string("owner"),
+        ]))
+        await controller.awaitNotifications()
+        XCTAssertEqual(notifier.delivered.count, 1)
+
+        controller.handle(event("human.decision", [
+            "gate_id": .string("release"), "by": .string("goal"),
+            "why": .string("the goal's posture authorised it"),
+        ]))
+        XCTAssertTrue(notifier.withdrawn.contains(NotificationIdentifier.gate),
+                      "a gate the engine answered itself is not still waiting on anyone")
+        XCTAssertNil(controller.pendingGate)
+    }
+
+    func testTheBannerAboutTheStoppedEngineGoesWhenTheEngineComesBack() async throws {
+        // The engine's failure banner is cleared on `engine.ready` so a fixed engine does not leave a
+        // stale red block in the window. The notification that says the same thing had no such clearing
+        // — it stayed in Notification Centre beside a healthy console.
+        let notifier = RecordingNotifier(isAuthorized: true)
+        let controller = makeEventController(notifier: notifier)
+
+        controller.handle(event("engine.ready"))
+        XCTAssertTrue(notifier.withdrawn.contains(NotificationIdentifier.engineFailed),
+                      "the engine is back, so the banner that said it stopped goes with it")
+    }
+
+    func testClearingDeliveredNotificationsTakesBackEveryNameThisBuildPosts() async throws {
+        // **The control the console did not have.** Nothing in this app could empty Notification Centre:
+        // the terminal has its Clear menu, the stderr buffer has `clearEngineDiagnostics`, the status
+        // bar's notice has a dismiss button — and a delivered banner had nothing at all, so it stayed
+        // for the life of the machine.
+        let notifier = RecordingNotifier(isAuthorized: true)
+        let controller = makeEventController(notifier: notifier)
+
+        controller.clearDeliveredNotifications()
+
+        XCTAssertEqual(Set(notifier.withdrawn), Set(NotificationIdentifier.all),
+                       "every identifier this build can post under must be withdrawable")
+        XCTAssertEqual(controller.notice, "cleared this app's delivered notifications",
+                       "a button with no visible outcome reads as a button that did nothing")
     }
 
     // MARK: - The proposed graph the Now pane draws

@@ -976,14 +976,10 @@ public final class OrgController: ObservableObject {
                     self.stopSnapshotting()
                     // An engine that died is worth telling someone about: the whole reason this app
                     // exists is a run nobody is watching. This is not one of the engine's events — it
-                    // is the *bridge's* failure, which is why it is planned directly rather than
-                    // decoded from a frame.
-                    self.notify(plan: NotificationPlan(
-                        identifier: "engine.failed",
-                        title: "The engine stopped",
-                        body: reason,
-                        urgency: .interrupt,
-                        thread: NotificationPlanner.threadPrefix))
+                    // is the *bridge's* failure — which is why it is planned from a factory rather than
+                    // decoded from a frame, and why that factory lives with the other plans: one
+                    // vocabulary for identifiers and one place the sentence is asserted.
+                    self.notify(plan: NotificationPlanner.engineStopped(reason: reason))
                     self.scheduleRestartIfBounded(structural: false)
                 default:
                     if !state.isLive {
@@ -1435,11 +1431,49 @@ public final class OrgController: ObservableObject {
         // A gate the engine already answered is never a question for a person, so the planner must not
         // be told one is waiting. `gateDisposition` is the single source of that answer.
         let waitingOnAHuman = pendingGate != nil && gateDisposition.isWaitingForHuman
+        // The other stop that is already on screen: a plan the engine proposed and parked the run on.
+        // `run.end` carries the run's outcome and not the history that led to it, so the console is the
+        // only thing that can say "this ending was the plan stop you have already been told about".
         guard let plan = NotificationPlanner.plan(for: event,
-                                                  gateIsWaitingOnAHuman: waitingOnAHuman) else {
+                                                  gateIsWaitingOnAHuman: waitingOnAHuman,
+                                                  planIsAwaitingApproval: proposedGraph != nil) else {
             return
         }
         notify(plan: plan)
+    }
+
+    /// Take this app's banners back out of Notification Centre.
+    ///
+    /// **The control the console did not have.** Every other message surface here can be emptied: the
+    /// terminal has its Clear menu, the engine's stderr has `clearEngineDiagnostics`, the status bar's
+    /// notice has a dismiss button. A *delivered notification* could not — once posted it stayed in
+    /// Notification Centre for the life of the machine, and the app had no way to see or clear it.
+    ///
+    /// It is the second half of the same rule the console already follows for a resolved stop: the
+    /// status-bar notice that announced a gate is cleared the moment the gate is answered
+    /// (`approve`, `reject`, `clearGateAnsweredByGoal`), and each of those now withdraws the banner too.
+    /// What is left for a person is the banners that no later event resolves — a finished run, a failed
+    /// one — and this is the one control that takes those away.
+    ///
+    /// Deliberately not conditional on `notificationsAvailable`: a build that cannot post has nothing to
+    /// withdraw, which makes this a no-op rather than a lie, and the button that calls it is disabled in
+    /// that state by the view for the same reason.
+    public func clearDeliveredNotifications() {
+        notifier.withdraw(NotificationIdentifier.all)
+        // Said in the one place this app says what it just did, because a button that produces nothing
+        // visible reads as a button that did nothing — and the pile it cleared was in another app's
+        // window, which this one cannot show.
+        logs.append(notice: "asked macOS to clear this app's delivered notifications")
+        notice = "cleared this app's delivered notifications"
+    }
+
+    /// Withdraw the banners a stop's resolution has made stale.
+    ///
+    /// One call per *kind of stop*, so the call sites read as what they are — the gate is answered, so
+    /// the gate's banner goes. Passing `NotificationIdentifier.all` here would clear banners about other
+    /// stops that are still waiting, which is the console forgetting something on a person's behalf.
+    private func withdrawNotifications(_ identifiers: [String]) {
+        notifier.withdraw(identifiers)
     }
 
     /// Whether a delivery attempt is still in flight, so a test can await it rather than guess.
@@ -1533,6 +1567,11 @@ public final class OrgController: ObservableObject {
             // lifetime. Guarded on something having actually been waiting, so an approval sent with no
             // gate on screen cannot wipe a notice about something else.
             if pendingGate != nil || proposedGraph != nil { notice = nil }
+            // **And the banner goes with it, for the same reason and by the same rule.** A delivered
+            // notification is a statement about the present — "run waiting on you", "a plan needs your
+            // approval" — and both are false from here on. `approve` answers either decision, so both
+            // identifiers are withdrawn; there is nothing to withdraw for the one that was not waiting.
+            withdrawNotifications([NotificationIdentifier.gate, NotificationIdentifier.plan])
             pendingGate = nil
             proposedGraph = nil
         }
@@ -1551,8 +1590,18 @@ public final class OrgController: ObservableObject {
     ///
     /// The acknowledgement arrives when the graph **settles** — the engine's convention for a command
     /// that starts a run — inside the caller's `Task`, so nothing in the console is blocked by it.
+    ///
+    /// `sendAccepted` rather than `send` because the banner is now part of the answer: the "a plan needs
+    /// your approval" notification is false the moment the engine takes the plan, and it is *not* false
+    /// if the command was refused — so the withdrawal happens on the acknowledgement and not on the
+    /// click. This is the same rule the gate's own Approve follows.
     public func approvePlan() async {
-        await send("approve_plan")
+        let ok = await sendAccepted("approve_plan")
+        if ok {
+            if proposedGraph != nil { notice = nil }
+            withdrawNotifications([NotificationIdentifier.plan])
+            proposedGraph = nil
+        }
         await refresh()
     }
 
@@ -1563,6 +1612,9 @@ public final class OrgController: ObservableObject {
         let ok = await sendAccepted("reject", payload: payload)
         if ok {
             if pendingGate != nil { notice = nil }
+            // The gate is answered by this too, so its banner goes — `reject` reaches only a gate, so
+            // only the gate's identifier is withdrawn.
+            withdrawNotifications([NotificationIdentifier.gate])
             pendingGate = nil
         }
         await refresh()
@@ -2029,6 +2081,9 @@ public final class OrgController: ObservableObject {
             // The decision is made and recorded, so the status bar's "waiting on you" is now false and
             // goes at once rather than lapsing on its own twenty seconds later.
             notice = nil
+            // And the banner that asked for it: no click was ever going to arrive, because the engine
+            // answered the gate itself, so a person following the banner would find the gate gone.
+            withdrawNotifications([NotificationIdentifier.gate])
         }
     }
 
@@ -3380,6 +3435,12 @@ public final class OrgController: ObservableObject {
             // that no longer holds — "engine failed", "the engine is not running", "a retry cannot fix
             // that" — and it would otherwise sit there for its full lifetime after the problem is gone.
             notice = nil
+            // **The banner about the dead engine goes with it.** It says the engine stopped, which is
+            // now false, and a notification is the one surface here that nothing else would take away:
+            // without this a person could be looking at a running console with a "The engine stopped"
+            // banner in Notification Centre beside it. One name covers both frames that post it — the
+            // engine's own fatal error and the bridge's report of the process stopping.
+            withdrawNotifications([NotificationIdentifier.engineFailed])
             // **Load what only a running engine can answer.** Every pane loads providers on its own
             // `.task`, which runs when the view appears — and the view appears *before* the engine has
             // booted, because starting it takes seconds. So the load hit a dead pipe, left `providers`

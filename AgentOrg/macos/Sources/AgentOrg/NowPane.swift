@@ -1885,8 +1885,24 @@ struct UsageSection: View {
             if let error = controller.engineError {
                 KeyValueRow(key: "error", value: error, tone: .red)
             }
-            if !controller.engineDiagnostics.isEmpty {
-                Text("Engine diagnostics (last 8 lines)").font(.caption).foregroundStyle(.secondary)
+            if controller.engineDiagnostics.count > 1 {
+                // **The second buffer, and the one with no control of its own.** `engineDiagnostics`
+                // holds up to 500 lines of the engine's stderr, and the only thing that could clear them
+                // was the *terminal's* Clear menu — reachable only by showing the terminal, which this
+                // app hides by default. So the block below accumulated in plain sight with no way to
+                // remove it, which is exactly the complaint. The count is shown for the same reason: a
+                // buffer that holds 500 lines and says "last 8" hides its own growth. The first entry is
+                // the controller's own runtime line (the `runtime` row above), so it is not counted.
+                HStack(spacing: 8) {
+                    Text("Engine diagnostics — \(controller.engineDiagnostics.count - 1) line(s), "
+                         + "last 8 shown")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Clear") { controller.clearEngineDiagnostics() }
+                        .controlSize(.small)
+                        .help("Remove the engine's stderr lines from the console. The engine's own "
+                              + "trace file is a different thing and is not touched.")
+                        .accessibilityLabel("Clear the engine's stderr diagnostics")
+                }
                 Text(controller.engineDiagnostics.suffix(8).joined(separator: "\n"))
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
@@ -1914,6 +1930,13 @@ struct UsageSection: View {
     /// `swift run` build, which has no bundle for macOS to attach a notification to) has nothing to do
     /// with permission at all. The advice under it is the fix, in the one place a person would look
     /// for it.
+    ///
+    /// **And the control that empties them.** A delivered banner is the one message surface in this app
+    /// that nothing else can clear: the terminal has its Clear menu, the engine's stderr lines have the
+    /// button below, the status bar's notice has a dismiss button — and Notification Centre kept
+    /// everything this app ever posted, including the stops a later event resolved. That is what the
+    /// person meant by "no way to clean up any messages", so the control sits with the sentence that
+    /// says whether there are any.
     @ViewBuilder
     private var notificationRow: some View {
         let state: (sentence: String, advice: String?, attention: Bool) = {
@@ -1937,6 +1960,21 @@ struct UsageSection: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityLabel(advice)
             }
+            HStack(spacing: 8) {
+                Button("Clear delivered notifications") { controller.clearDeliveredNotifications() }
+                    .controlSize(.small)
+                    // Disabled rather than hidden where this build cannot post: the row above already
+                    // says why in the engine's absence of a bundle, and a control that vanished would
+                    // make "cannot notify" look like "nothing to clear".
+                    .disabled(!controller.notificationsAvailable)
+                    .help("Take this app's banners back out of Notification Centre. Nothing in the "
+                          + "console changes — the spine, the badge and the menu-bar panel still show "
+                          + "anything that needs you.")
+                    .accessibilityLabel("Clear the notifications AgentOrg delivered to Notification "
+                                        + "Centre")
+            }
+            .padding(.leading, 98)
+            .padding(.top, 2)
         }
     }
 }

@@ -23,6 +23,18 @@
 //  moment a notification would actually be delivered means the request arrives with its own
 //  justification. It also means the app must run correctly *denied*: a refused notification is a
 //  person's decision, not an error, so every path here degrades to "said nothing" rather than throwing.
+//
+//  WHY A BANNER HAS TO BE TAKABLE BACK
+//  -----------------------------------
+//  A notification is the one message surface this app puts somewhere it cannot reach: Notification
+//  Centre, which keeps it until something removes it. Everything else here can be emptied — the
+//  terminal has a Clear menu, the engine's stderr a button, the status bar's notice a dismiss — and the
+//  banner had nothing at all, so a gate that had already been answered went on asking for a decision
+//  beside a console that was running fine. So the plan carries an identifier out of one vocabulary
+//  (`NotificationIdentifier`, one name per *stop*), the notifier can `withdraw` by those names, and the
+//  console calls it at the moment the thing a banner announced stops being true: the gate answered, the
+//  plan taken, the engine back. Reusing a name is also what makes a second frame about one stop replace
+//  the first banner rather than join it.
 
 import Foundation
 import UserNotifications
@@ -30,9 +42,15 @@ import UserNotifications
 /// What the console decided to tell a person, and why.
 ///
 /// A value rather than a side effect, because "should this interrupt someone" is the part worth
-/// testing and the part that is easy to get wrong. The identifier is derived from the source so two
-/// events about the same gate replace each other rather than stacking — a run that reaches a gate,
-/// is released by the goal, and reaches another should leave one banner, not three.
+/// testing and the part that is easy to get wrong. The identifier comes from `NotificationIdentifier`,
+/// one name per *stop* rather than per event kind, so the frames that describe one stop replace each
+/// other rather than stacking — a run that reaches a gate, is released by the goal, and reaches another
+/// should leave one banner, not three.
+///
+/// **And the body carries both halves of what a person needs**: the engine's own sentence about what
+/// happened (its `reason`, its `why`, its `error`) and the place in this app where the control for it
+/// lives. A banner is read at a glance and then dismissed, so a body that names a state and not an
+/// action is a banner a person has to go looking after.
 public struct NotificationPlan: Equatable, Sendable {
     public enum Urgency: String, Sendable, Equatable {
         /// Work stopped and only a person can restart it.
@@ -59,10 +77,49 @@ public struct NotificationPlan: Equatable, Sendable {
     }
 }
 
+/// The identifiers this app posts under — **one per stop, not one per event kind**.
+///
+/// **Why this is a vocabulary and not a literal at each call site.** The identifier is the thing that
+/// decides whether a second banner joins the first in Notification Centre or *replaces* it, and it is
+/// the only handle the app has for taking a banner back. Two frames that describe one stop therefore
+/// have to agree on it: a run that parks at a gate arrives as `human.gate` and, a moment later, as a
+/// gated `run.end`. Two event kinds, one stop — and with an identifier each, the person was left two
+/// banners saying the same thing in different words, which is the noise that trains someone to dismiss
+/// without reading.
+///
+/// It is also what the *cleanup* is addressed by: `withdraw` takes banners out by these names, so a
+/// gate the person has already answered stops being announced as still waiting.
+public enum NotificationIdentifier {
+    /// A gate the engine left to a person — carried by `human.gate` and by a run that ended at one.
+    public static let gate = "run.gate"
+    /// A graph the engine proposed and parked the run on for approval (`manifest.proposed`).
+    public static let plan = "run.plan"
+    /// A run that ended: finished, stopped, or failed.
+    public static let runEnd = "run.end"
+    public static let goalCompleted = "goal.completed"
+    public static let goalBlocked = "goal.blocked"
+    public static let goalPaused = "goal.paused"
+    /// **The engine is gone** — carried by both frames that say so: the engine's own fatal `error`
+    /// frame, and the process bridge's report that the engine stopped. One stop, so one name: an engine
+    /// that reports a fatal error and then dies would otherwise arrive as two banners, the second
+    /// replacing the first only if they agreed on this.
+    public static let engineFailed = "engine.failed"
+
+    /// Every identifier this build can post under, for a caller that has to take them all back.
+    ///
+    /// Kept as a list rather than using `removeAllDeliveredNotifications()`, and a test holds it to the
+    /// planner's own cases: the identifiers are the same vocabulary the planner posts under, so a plan
+    /// this app can post but cannot withdraw would be a banner that stays in Notification Centre for
+    /// ever — which is the thing the list exists to make impossible.
+    public static let all: [String] = [
+        gate, plan, runEnd, goalCompleted, goalBlocked, goalPaused, engineFailed,
+    ]
+}
+
 /// The pure decision: should this engine event notify anyone?
 ///
-/// Deliberately a function of the event *alone*, plus the one booleans it needs. It reads the same
-/// fields the UI reads (`waiting_on`, `reason`, `summary`, `outcome`) rather than re-deriving any
+/// Deliberately a function of the event *alone*, plus the booleans it needs. It reads the same fields
+/// the UI reads (`waiting_on`, `reason`, `why`, `approvable`, `state`) rather than re-deriving any
 /// engine policy — so a gate the engine declined to answer is reported as waiting, and a gate the
 /// engine answered never reaches a person as a question.
 public enum NotificationPlanner {
@@ -78,14 +135,21 @@ public enum NotificationPlanner {
     ///     in rather than read from the event so that a `human.gate` the engine *declined to answer*
     ///     is the only gate that notifies; a gate the goal released never reaches this path with
     ///     `true`, because the release arrives as `policy.changed`/`human.decision` instead.
+    ///   - planIsAwaitingApproval: whether the console is holding a graph the engine proposed and
+    ///     parked the run on. **The same kind of fact as the one above, for the other stop that is a
+    ///     person's**: a run parked at `awaiting_approval` announces itself as `manifest.proposed` and
+    ///     then ends, and the `run.end` it ends with must not be announced a second time. It is passed
+    ///     in because the event cannot say it — `run.end` carries the outcome, not the history that led
+    ///     to it — and the console is the thing holding that history.
     public static func plan(for event: EngineEvent,
-                            gateIsWaitingOnAHuman: Bool) -> NotificationPlan? {
+                            gateIsWaitingOnAHuman: Bool,
+                            planIsAwaitingApproval: Bool) -> NotificationPlan? {
         let thread = "\(threadPrefix).\(event.runId ?? "current")"
         switch event.type {
         case "goal.completed":
             let summary = event.payload["summary"]?.stringValue ?? ""
             return NotificationPlan(
-                identifier: "goal.completed",
+                identifier: NotificationIdentifier.goalCompleted,
                 title: "Goal complete",
                 body: summary.isEmpty ? "The objective was reached." : summary,
                 urgency: .inform,
@@ -94,24 +158,54 @@ public enum NotificationPlanner {
         case "goal.blocked":
             let reason = event.payload["reason"]?.stringValue ?? ""
             return NotificationPlan(
-                identifier: "goal.blocked",
+                identifier: NotificationIdentifier.goalBlocked,
                 title: "Goal blocked",
-                body: reason.isEmpty ? "The run could not continue." : reason,
+                body: andWhereToAct(reason.isEmpty ? "The goal stopped and needs you" : reason,
+                                    "open Now to act on it"),
                 urgency: .interrupt,
                 thread: thread)
 
         case "goal.paused":
             let reason = event.payload["reason"]?.stringValue ?? "manual"
-            // A pause at a gate is the gate's own notification arriving a moment later; two banners
-            // for one stop is exactly the noise this planner exists to prevent. A pause for budget is
-            // a real "I stopped and it was not you" and is worth saying.
+            // **A pause at a gate notifies nobody, because the gate already did.** `goal.paused` with
+            // `reason: gate` and `human.gate` are one stop seen twice; the pause was de-escalated to
+            // `.inform` rather than dropped, which still posted a *second banner with its own
+            // identifier* — and a second banner for one stop is the noise this planner exists to
+            // prevent, in the module's own words above. The rest of the console already reads it this
+            // way: `OrgController`'s `goal.paused` case sets a notice for every reason *except* a gate,
+            // and the gate's own row is the thing that says it. A pause for budget is a real "I stopped
+            // and it was not you", and is worth saying.
+            if reason == "gate" { return nil }
             return NotificationPlan(
-                identifier: "goal.paused",
+                identifier: NotificationIdentifier.goalPaused,
                 title: reason == "budget_spend" ? "Goal paused: budget reached" : "Goal paused",
-                body: reason == "gate"
-                    ? "Waiting at a gate."
-                    : "Stopped because: \(reason).",
+                body: andWhereToAct("Stopped because: \(reason)", "open Now to continue it"),
                 urgency: .inform,
+                thread: thread)
+
+        case "manifest.proposed":
+            // **The stop that notified nobody.** `_cmd_start` and `Orchestrator.prepare` emit this and
+            // park the run at `awaiting_approval`, where it stays until a person approves the graph —
+            // and the planner had no case for it, so the one engine state that asks a person for
+            // something reached them as nothing at all while the sidebar quietly grew a badge. The
+            // fields read here are the ones the plan card reads, so the banner and the card say the
+            // same thing: the engine's own `approvable`, and its own `reason` when it is not.
+            return plan(forProposedGraph: event.payload, thread: thread)
+
+        case "error":
+            // **The engine's own report that it is dying, and it notified nobody either.** A `fatal`
+            // error frame is what the console already treats as the reason the engine is about to stop
+            // (it sets the failure banner from it), but the notification path only ever saw the *bridge*
+            // failing afterwards — and an engine that dies without its pipe closing reaches nobody at
+            // all. Every other `error` is ordinary traffic: the recorded trace's own is a retryable
+            // rate limit, and a banner for that would be a banner per rate-limited minute.
+            guard event.payload["fatal"]?.boolValue == true else { return nil }
+            let message = event.payload["message"]?.stringValue ?? "the engine reported a fatal error"
+            return NotificationPlan(
+                identifier: NotificationIdentifier.engineFailed,
+                title: "The engine reported a fatal error",
+                body: andWhereToAct(message, "the engine is stopping — start it again from Now"),
+                urgency: .interrupt,
                 thread: thread)
 
         case "run.end":
@@ -134,10 +228,28 @@ public enum NotificationPlanner {
                 || state == "gated"
                 || summary == "awaiting_human" || summary == "gated" || summary == "awaiting_gate"
             if atAGate {
+                // **One stop, one banner — and the frame that says the most is the one that speaks.**
+                // A run that parks at a gate emits `human.gate` and then this frame, and this frame
+                // carries no `why`: announcing both left the person two banners for one stop, the
+                // second of them the poorer one. When the gate or a proposed plan is already on screen it
+                // has been announced, so this is the same stop seen again and stays quiet.
+                //
+                // When neither is on screen — a gate whose decision the goal took, a frame dropped — no
+                // banner has announced this stop and this frame is all the evidence there is, so it
+                // speaks: a missing banner is recoverable, a person who has learned to dismiss banners
+                // without reading is not.
+                //
+                // The one case where this stays quiet and *this process* posted no banner is a console
+                // relaunched into a parked run: the poll restores the proposal from the checkpoint, so
+                // the plan card is on screen with its Approve button while this frame is suppressed —
+                // and a banner from the earlier process said so at the time. That is the trade this rule
+                // makes on purpose: the card is the surface that carries the control, and it is where a
+                // banner would have sent the person anyway.
+                guard !gateIsWaitingOnAHuman, !planIsAwaitingApproval else { return nil }
                 return NotificationPlan(
-                    identifier: "run.end",
+                    identifier: NotificationIdentifier.gate,
                     title: "Run waiting on you",
-                    body: "The run stopped at a gate and needs a decision.",
+                    body: "The run stopped at a gate and needs a decision — open Now to decide it.",
                     urgency: .interrupt,
                     thread: thread)
             }
@@ -148,7 +260,7 @@ public enum NotificationPlanner {
             // The rule is the engine's own word rather than an inference from `killed`.
             if termination == "aborted" || termination == "shutdown" {
                 return NotificationPlan(
-                    identifier: "run.end",
+                    identifier: NotificationIdentifier.runEnd,
                     title: "Run stopped",
                     body: termination == "aborted"
                         ? "Stopped at your request — the checkpoint is kept."
@@ -160,17 +272,19 @@ public enum NotificationPlanner {
             if broken {
                 // A run that broke is work that stopped with nobody watching, which is the case this
                 // whole app exists for. The body is the engine's own `error` — the same sentence the
-                // host wrote — rather than one composed here.
+                // host wrote — rather than one composed here, and the place to read what it left behind
+                // is named after it, because "the run failed" alone leaves a person with nowhere to go.
                 let reason = event.payload["error"]?.stringValue ?? ""
                 return NotificationPlan(
-                    identifier: "run.end",
+                    identifier: NotificationIdentifier.runEnd,
                     title: "Run failed",
-                    body: reason.isEmpty ? "The run stopped before it finished." : reason,
+                    body: andWhereToAct(reason.isEmpty ? "The run stopped before it finished" : reason,
+                                        "open Runs to read what it left behind"),
                     urgency: .interrupt,
                     thread: thread)
             }
             return NotificationPlan(
-                identifier: "run.end",
+                identifier: NotificationIdentifier.runEnd,
                 title: "Run finished",
                 body: "Outcome: \(summary.isEmpty ? (state.isEmpty ? "unknown" : state) : summary).",
                 urgency: .inform,
@@ -193,15 +307,106 @@ public enum NotificationPlanner {
                 title = "Waiting on you at a gate"
             }
             return NotificationPlan(
-                identifier: "human.gate",
+                identifier: NotificationIdentifier.gate,
                 title: title,
-                body: why.isEmpty ? reason : "\(reason) — \(why)",
+                body: andWhereToAct(why.isEmpty ? reason : "\(reason) — \(why)",
+                                    "approve or reject it on Now"),
                 urgency: .interrupt,
                 thread: thread)
 
         default:
             return nil
         }
+    }
+
+    /// The plan for the *bridge's* own failure — the engine process stopped.
+    ///
+    /// Not a case in `plan(for:)` because it is not one of the engine's events: this is the app's
+    /// process bridge reporting that the engine is gone. It lives here so the sentence, the identifier
+    /// and the thread a person sees are decided in the one place all the others are — and so a banner
+    /// about a dead engine is asserted in a suite rather than composed at a call site no test reaches.
+    ///
+    /// It shares its identifier with the engine's own fatal `error` frame on purpose: an engine that
+    /// reports a fatal error and then dies produces both frames, and one death must leave one banner —
+    /// the later one, which is the bridge's account of what actually happened to the process.
+    public static func engineStopped(reason: String) -> NotificationPlan {
+        NotificationPlan(
+            identifier: NotificationIdentifier.engineFailed,
+            title: "The engine stopped",
+            body: andWhereToAct(reason, "press Try again in AgentOrg"),
+            urgency: .interrupt,
+            thread: threadPrefix)
+    }
+
+    /// The plan for a graph the engine proposed and parked the run on.
+    ///
+    /// **The engine's own verdict decides the sentence.** `approvable` is the engine saying it will
+    /// accept `approve_plan`, and `reason` is its own account of what blocks it — the same two fields
+    /// the Now pane's plan card renders (`NowPane.approveControl`). A banner that said only "a plan is
+    /// waiting" would leave a person to open the window and find out what the engine thinks, which is
+    /// the guessing this console does not do.
+    ///
+    /// Three branches, because the engine's *silence* is one of them: `approvable: true`, `approvable:
+    /// false`, and a payload that carries neither — the last said as not knowing rather than as a
+    /// refusal the engine never made. Inside the refusal there is a fourth: a `false` with no `reason`,
+    /// which is also reported as what it is instead of filled in with an invented cause.
+    static func plan(forProposedGraph payload: [String: JSONValue],
+                     thread: String) -> NotificationPlan {
+        let nodes = (payload["nodes"]?.arrayValue ?? []).count
+        let steps = "\(nodes) step\(nodes == 1 ? "" : "s")"
+        let gaps = (payload["staffing_gaps"]?.arrayValue ?? []).count
+        let reason = payload["reason"]?.stringValue ?? ""
+        switch payload["approvable"]?.boolValue {
+        case .some(true):
+            let gapNote = gaps == 0
+                ? ""
+                : " \(gaps) capability(ies) nobody holds — the card names them."
+            return NotificationPlan(
+                identifier: NotificationIdentifier.plan,
+                title: "A plan needs your approval",
+                body: andWhereToAct("\(steps) for this run\(gapNote)",
+                                    "approve it on Now to run it"),
+                urgency: .interrupt,
+                thread: thread)
+        case .some(false):
+            return NotificationPlan(
+                identifier: NotificationIdentifier.plan,
+                title: "A plan cannot be approved yet",
+                body: andWhereToAct(reason.isEmpty
+                                        ? "the engine refused this plan without saying why"
+                                        : reason,
+                                    "the plan is on Now with the engine's verdict"),
+                urgency: .interrupt,
+                thread: thread)
+        case .none:
+            return NotificationPlan(
+                identifier: NotificationIdentifier.plan,
+                title: "A plan is waiting for your decision",
+                body: andWhereToAct(steps, "the plan card on Now carries the engine's terms"),
+                urgency: .interrupt,
+                thread: thread)
+        }
+    }
+
+    /// The engine's own fact, then the one clause that says where to act on it.
+    ///
+    /// **Both halves are required of a banner, and the second is the one that was missing.** "The run
+    /// is waiting" tells a person a state and not an action; every body here now carries the engine's
+    /// sentence (its `reason`, its `why`, its `error`) *and* names the surface in this app that holds the
+    /// control. The clause is the app's own business rather than an inference about the engine — it
+    /// names a destination or a button this console actually renders — so it cannot become a confident
+    /// claim about a state nobody checked.
+    static func andWhereToAct(_ fact: String, _ actClause: String) -> String {
+        let trimmed = fact.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sentence = actClause.prefix(1).uppercased() + actClause.dropFirst() + "."
+        guard !trimmed.isEmpty else { return sentence }
+        // The engine's sentences usually end in a full stop and sometimes do not; one separator for both
+        // is the difference between a banner and a run-on.
+        let endsItsSentence = trimmed.hasSuffix(".") || trimmed.hasSuffix("!")
+            || trimmed.hasSuffix("?") || trimmed.hasSuffix("…")
+        return endsItsSentence
+            ? "\(trimmed) \(actClause.prefix(1).uppercased())\(actClause.dropFirst())."
+            : "\(trimmed) — \(actClause)."
     }
 }
 
@@ -321,6 +526,18 @@ public protocol ConsoleNotifier: AnyObject, Sendable {
     /// the console, which is why this returns a plain Bool rather than being `throws`.
     @discardableResult
     func deliver(_ plan: NotificationPlan) async -> Bool
+    /// Take banners back out of Notification Centre.
+    ///
+    /// **The other half of having posted one.** A banner says something about the present — "the run is
+    /// waiting on you" — and that stops being true the moment the decision is made. Without this the
+    /// app's own answer to a resolved gate was to leave the question in Notification Centre for ever,
+    /// where the next person to look at the screen reads a state that no longer holds.
+    ///
+    /// Synchronous because the system's own call is (`removeDeliveredNotifications(withIdentifiers:)`
+    /// returns nothing and cannot fail), so there is nothing here for a caller to await. Not
+    /// `removeAllDeliveredNotifications()`: the identifiers are the vocabulary the planner posts under,
+    /// so what is withdrawn is exactly what this app said.
+    func withdraw(_ identifiers: [String])
 }
 
 /// The real notifier, over `UNUserNotificationCenter`.
@@ -410,6 +627,18 @@ public final class SystemConsoleNotifier: ConsoleNotifier, @unchecked Sendable {
             // in front of someone who is trying to watch a run.
             return false
         }
+    }
+
+    /// Take banners back out of Notification Centre, by the names this app posted them under.
+    ///
+    /// Silent, like every other path here, and for a stronger reason than the delivery: this is called
+    /// from the console's ordinary bookkeeping — a gate answered, a plan approved, an engine that came
+    /// back — and a failure reported from there would put a modal in front of someone who has just done
+    /// the thing the app asked. There is also nothing to report: the call cannot fail, and a process
+    /// with no notification centre has nothing to withdraw.
+    public func withdraw(_ identifiers: [String]) {
+        guard let center, !identifiers.isEmpty else { return }
+        center.removeDeliveredNotifications(withIdentifiers: identifiers)
     }
 }
 

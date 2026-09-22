@@ -28,6 +28,7 @@ final class RecordingNotifier: ConsoleNotifier, @unchecked Sendable {
 
     private let lock = NSLock()
     private var deliveredPlans: [NotificationPlan] = []
+    private var withdrawnGroups: [[String]] = []
     private var requests = 0
     private var authorized: Bool
     private var grantOnRequest: Bool
@@ -60,6 +61,13 @@ final class RecordingNotifier: ConsoleNotifier, @unchecked Sendable {
         lock.withLock { deliveredPlans.removeAll() }
     }
 
+    /// Every identifier handed to `withdraw`, in the order it was withdrawn, as one flat list.
+    ///
+    /// Flat rather than grouped because almost every assertion is "was this banner taken back", and the
+    /// one that is not — the whole vocabulary — reads better as a set. The *order* is kept so a caller
+    /// can still tell the two withdrawals apart if it needs to.
+    var withdrawn: [String] { lock.withLock { withdrawnGroups.flatMap { $0 } } }
+
     var isAuthorized: Bool {
         get async { lock.withLock { authorized } }
     }
@@ -80,6 +88,12 @@ final class RecordingNotifier: ConsoleNotifier, @unchecked Sendable {
             deliveredPlans.append(plan)
             return true
         }
+    }
+
+    /// Record the withdrawal, and report nothing back — the protocol's own shape, because the system
+    /// call returns nothing and a console decision cannot depend on removing a banner.
+    func withdraw(_ identifiers: [String]) {
+        lock.withLock { withdrawnGroups.append(identifiers) }
     }
 }
 
