@@ -1148,6 +1148,71 @@ time.sleep(60)
             subprocess.run(["kill", "-9", pid_file.read_text().strip()], capture_output=True)
 
 
+def test_the_liveness_check_answers_gone_rather_than_unknown_for_a_dead_pid():
+    """The branch the orphan came from — pinned, because "unknown" read as "alive" is unfalsifiable.
+
+    `_pid_alive` must be able to say *gone*, and say it the same way for both shapes a dead parent
+    takes: a pid that is free (the app reaped by launchd — the normal case) and a pid that is still
+    held by a zombie (the app not yet reaped — the case the docstring names). A check that answered
+    "alive" for either would poll for ever, which is what left the engine holding the project.
+    """
+    import engine.serve as serve
+
+    # Beyond any `pid_max` (Linux caps at 2**22, macOS's is smaller still), so it cannot name a process.
+    assert serve._pid_alive(2 ** 30) is False
+    # We are running, so we are alive — the check must not answer False to everything.
+    assert serve._pid_alive(os.getpid()) is True
+
+    # A zombie: exited, not yet reaped. Its pid still exists and `kill -0` still succeeds, which is
+    # exactly why the status has to be read rather than asked about.
+    zombie = os.fork()
+    if zombie == 0:  # pragma: no cover - the child's whole job is to exit
+        os._exit(0)
+    try:
+        time.sleep(0.5)
+        assert serve._pid_alive(zombie) is False, (
+            "a zombie is a dead process: reporting it alive is a check that cannot fail")
+    finally:
+        os.waitpid(zombie, 0)
+
+
+def test_an_unanswerable_liveness_check_ends_in_gone(monkeypatch):
+    """What the check does when the platform will not describe the process — the case that used to leak.
+
+    `_pid_alive` answering `None` must not be read as alive. The verdict comes from one fact the
+    platform always supplies: a process is our parent until it exits, so if the named pid is no longer
+    our parent it is gone; and if it *is* still our parent it exists, and a failed read is not a reason
+    to stop a working engine.
+    """
+    import engine.serve as serve
+
+    monkeypatch.setattr(serve, "_pid_alive", lambda pid: None)
+    monkeypatch.setattr(serve.os, "getppid", lambda: 1)
+    assert serve._parent_is_gone(4242, started_as_child=True) is True
+
+    monkeypatch.setattr(serve.os, "getppid", lambda: 4242)
+    assert serve._parent_is_gone(4242, started_as_child=True) is False
+
+
+def test_a_live_pid_is_only_proof_the_app_lives_while_it_is_our_parent(monkeypatch):
+    """A live pid is not proof the *app* is alive: pids are reused.
+
+    When we were spawned by the named pid, being reparented away from it is the kernel saying it
+    exited — whatever the pid now refers to. This is the one check that cannot be fooled by a pid
+    reused by an unrelated process, each of which the other checks would report as alive for ever.
+    """
+    import engine.serve as serve
+
+    # Our own pid is certainly alive; with `getppid` still naming us, it is the parent and alive.
+    monkeypatch.setattr(serve.os, "getppid", lambda: os.getpid())
+    assert serve._parent_is_gone(os.getpid(), started_as_child=True) is False
+
+    # The same live pid, no longer our parent: the app that spawned us is gone and something else now
+    # holds the number.
+    monkeypatch.setattr(serve.os, "getppid", lambda: 1)
+    assert serve._parent_is_gone(os.getpid(), started_as_child=True) is True
+
+
 # ── a slow command's acknowledgement must not be lost on shutdown ────────────
 
 

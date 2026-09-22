@@ -193,6 +193,10 @@ class Server:
     #: pays nothing for the multi-org layer.
     _portfolio: Any = None
     _portfolio_loaded: bool = False
+    #: The register file's `(size, mtime_ns)` when it was last read, so a rewrite by another writer —
+    #: the CLI, another console — is noticed rather than served from a copy that has gone stale.
+    #: See `_load_portfolio`.
+    _portfolio_stamp: tuple[int, int] | None = None
     #: The fleet, built on first use, so several orgs can run at once from one server.
     _fleet: Any = None
 
@@ -517,14 +521,25 @@ class Server:
         Falls back to change-detection when the variable is absent, which is the case for a CLI launch —
         where `getppid()` becoming 1 is legitimate (detached with `nohup`/`setsid`) and must not be
         treated as a reason to exit.
+
+        **The verdict is three-way, and that is the fix on this side.** `_pid_alive` used to answer
+        "alive" whenever it could not answer anything else, so a platform that could not describe the
+        parent produced a check that could never fail: the poll ran for ever against a pid that no
+        longer existed, and the engine stayed up holding the project — the failure this whole method
+        exists to prevent. It now answers True/False/None, and `_parent_is_gone` turns all three into a
+        verdict, using one fact the platform always supplies: whether `expected` is still *our* parent.
         """
         expected_raw = os.environ.get("AGENTORG_PARENT_PID", "").strip()
         expected = int(expected_raw) if expected_raw.isdigit() else 0
 
         if expected > 1:
+            # Recorded once, because it is a fact about how this process started and cannot change:
+            # we were spawned by `expected` exactly when it is our parent at this moment.
+            started_as_child = os.getppid() == expected
+
             def _poll_expected() -> None:
                 while not self._stop.wait(2.0):
-                    if not _pid_alive(expected):
+                    if _parent_is_gone(expected, started_as_child=started_as_child):
                         # Stop FIRST, then log. The log goes to stderr, which is the dead app's pipe —
                         # writing to it raises `BrokenPipeError`, and anything after that line would
                         # never run. Ordering this the other way round made the watchdog silently
@@ -2690,8 +2705,23 @@ class Server:
 
     # ── portfolio: one principal, several orgs ──────────────────────────────
 
+    def _register_stamp(self) -> tuple[int, int] | None:
+        """The register file's identity right now — ``(size, mtime_ns)``, or None when it is absent.
+
+        Only ever used to notice that **another process** rewrote the file: see `_load_portfolio`.
+        """
+        from .portfolio import Portfolio
+
+        try:
+            stat = Portfolio.path_for().stat()
+        except OSError:
+            return None
+        return (stat.st_size, stat.st_mtime_ns)
+
     def _load_portfolio(self) -> Any:
-        """The portfolio, loaded once. None when there is none (a single-org setup).
+        """The portfolio, loaded once — and re-read whenever the file has moved on without us.
+
+        None when there is none (a single-org setup).
 
         **Loaded is marked on success only.** It used to be marked *before* the attempt, which turned one
         transient read failure into a permanent one: the failure was remembered as "there is no
@@ -2700,21 +2730,43 @@ class Server:
         A register that could not be read is not a register that is absent, so the read is retried on
         the next command, and `_portfolio_error` remembers *why* it failed for the commands that must
         refuse rather than act on it.
+
+        **Re-read when the file changed.** The register is one file with several writers: the CLI's
+        `portfolio` commands (and `portfolio remove` among them), and any other `serve` on the same
+        machine. This used to be read once and then answered from memory for the life of the process,
+        so an org removed from a terminal went on being listed here, `active_org_id` went on naming an
+        org the register no longer held, and every panel went on describing it. The console was a
+        second copy of the register that could not be corrected — which is what "the engine is the
+        single source of truth" exists to forbid. A stat pair rather than a read, so the common case
+        (an unchanged register, asked once per 2s poll) still costs nothing.
         """
-        if self._portfolio_loaded:
+        # Read *before* the file, deliberately: a write landing between this stat and the read leaves
+        # the recorded stamp older than the content, which the next call re-reads. The other order
+        # would record a stamp for content never read, which is a change nobody would ever notice.
+        stamp = self._register_stamp()
+        if self._portfolio_loaded and stamp == self._portfolio_stamp:
             return self._portfolio
         from .portfolio import Portfolio, PortfolioError
 
         try:
-            portfolio = Portfolio.load()
+            # In place when an object is already held — the fleet and every reader have it, and
+            # swapping it would leave one of them acting on a register the file no longer agrees with.
+            portfolio = (self._portfolio.reload() if self._portfolio is not None
+                         else Portfolio.load())
         except PortfolioError as exc:
             # A broken register must not kill the server — but it must not be papered over either.
             _log(f"serve: cannot read the portfolio: {exc}")
             self._portfolio_error = str(exc)
+            # The stamp is deliberately left alone: a register that could not be read is retried on
+            # the next command rather than remembered as read.
             return None
-        self._portfolio = portfolio
         self._portfolio_error = ""
+        # A register that has gone from disk is *no register*, and holding the orgs it used to have
+        # would be the stale copy this method exists to prevent. `_cmd_portfolio_add` then builds a new
+        # one, which is what "the file is gone" licenses and what a failed read must never license.
+        self._portfolio = portfolio
         self._portfolio_loaded = True
+        self._portfolio_stamp = stamp
         return self._portfolio
 
     def _fleet_for(self, portfolio: Any) -> Any:
@@ -3331,8 +3383,8 @@ def _pid() -> int:
     return os.getpid()
 
 
-def _pid_alive(pid: int) -> bool:
-    """Whether a process is still running — excluding a zombie.
+def _pid_alive(pid: int) -> bool | None:
+    """Whether a process is still running: True, False, or **None when it cannot be determined**.
 
     `os.kill(pid, 0)` is the portable existence test, but it returns success for a **zombie**: a dead
     process not yet reaped still has a pid, and signalling it "succeeds". That is not a corner case
@@ -3342,9 +3394,15 @@ def _pid_alive(pid: int) -> bool:
 
     So the real status is read where the platform exposes it: `/proc/<pid>/stat` on Linux, and
     `proc_pidinfo` on macOS (there is no `/proc` there, and shelling out to `ps` is slow and blocked in
-    some sandboxes — which would silently degrade to "alive" and make this useless). When neither is
-    available the process is assumed alive, which is the conservative direction: better to keep a
-    working engine than to stop a live one.
+    some sandboxes — which would silently degrade to "alive" and make this useless).
+
+    **Why the third answer exists, and why it was the bug.** This used to collapse "I could not tell"
+    into "alive". That made the watchdog's question unfalsifiable in exactly the case it was written
+    for: a platform or an errno the status read does not describe produced "alive" for ever, so the
+    poll ran on against a pid that no longer existed and the engine outlived its app while holding the
+    project. `None` states that the platform did not answer instead of mistaking silence for a verdict;
+    deciding what to do about it belongs to the caller, and `_parent_is_gone` is where that decision is
+    made.
     """
     if pid <= 1:
         return False
@@ -3374,7 +3432,40 @@ def _pid_alive(pid: int) -> bool:
     except Exception:  # noqa: BLE001 - any failure here must not stop a working engine
         pass
 
-    return True
+    # The pid exists (`os.kill` said so) but nothing here could describe what state it is in.
+    return None
+
+
+def _parent_is_gone(expected: int, *, started_as_child: bool) -> bool:
+    """Whether the process that started this engine is gone. Always answers, and answers with a reason.
+
+    **One question the platform always answers about our own parent.** Every check above is about the
+    pid; this one is about the *relationship* the pid was named for. `expected` is the app that spawned
+    us, so it is our parent until it exits, and a process is reparented (to launchd, pid 1) exactly
+    when its parent goes away. That single fact resolves the three-valued answer `_pid_alive` can give:
+
+    1. **`False` — the platform described it as dead or a zombie.** Gone, the ordinary case.
+    2. **We were its child and are not any more.** Gone, whatever the pid says. This is also the only
+       check that catches the pid having been *reused* by an unrelated process, which every other check
+       would report as alive for ever.
+    3. **`None` — the pid exists but its state could not be read.** If it is still our parent it exists,
+       and "alive" is the honest reading of a read that failed; if it is not our parent, nothing here
+       connects the pid to the app that started us, and the verdict is **gone**.
+
+    The unknown case therefore ends in "gone" — the direction of error that cannot leak. An engine that
+    stops when it should not have is a restartable inconvenience; an engine that survives its app keeps
+    a project its owner has walked away from, runs code nobody is watching, and makes the next launch
+    start a second engine on the same checkpoint. This does not weaken the rule the named pid exists
+    for: a live app is *alive* on the first check and needs none of the rest.
+    """
+    alive = _pid_alive(expected)
+    if alive is False:
+        return True
+    if started_as_child and os.getppid() != expected:
+        return True
+    if alive is None:
+        return os.getppid() != expected
+    return False
 
 
 def _pid_alive_via_libproc(pid: int) -> bool | None:

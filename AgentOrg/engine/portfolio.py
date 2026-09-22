@@ -536,6 +536,30 @@ class Portfolio:
             raise PortfolioError(f"failed to write portfolio {target}: {exc}") from exc
         return target
 
+    def reload(self, root: Any = None) -> "Portfolio | None":
+        """Re-read the register from disk into **this** object, keeping its identity, and return it.
+
+        Identity is the whole point, and it is the reason this exists rather than a second `load`:
+        a long-lived holder — `serve`, and the fleet it hands the register to — must see a register
+        another process rewrote without being handed a different object, or one of them goes on
+        acting on the copy the file no longer agrees with. `serve._reload_config` reloads the
+        configuration in place for the same reason.
+
+        None when the file is gone. A register that was deleted is not the register that was here a
+        moment ago, and the caller has to decide what that means rather than be left holding orgs
+        from a file that no longer exists.
+        """
+        fresh = Portfolio.load(root)
+        if fresh is None:
+            return None
+        self.principal = fresh.principal
+        self.orgs = fresh.orgs
+        self.active_org_id = fresh.active_org_id
+        self.created_at = fresh.created_at
+        self.updated_at = fresh.updated_at
+        self.version = fresh.version
+        return self
+
     @classmethod
     def load(cls, root: Any = None) -> "Portfolio | None":
         """Read the portfolio, or None when there is none.

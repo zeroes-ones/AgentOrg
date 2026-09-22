@@ -77,4 +77,54 @@ final class ConsoleAppDelegateTests: XCTestCase {
         XCTAssertNil(probe, "the delegate must not retain the controller")
         ConsoleAppDelegate.controller = nil
     }
+
+    func testATerminationSignalQuitsThroughTheOrdinaryPathRatherThanKillingTheApp() {
+        // The failure this protects, reproduced against the running `.app`: `applicationWillTerminate`
+        // runs only for a quit the app starts itself, so a signal from `kill`/`pkill` took SIGTERM's
+        // default action — the process stopped where it stood, no delegate method ran, and the engine
+        // was left behind, reparented to launchd and still holding the project. Handled, the signal
+        // becomes the same quit ⌘Q performs, which is what stops the engine.
+        var delegate: ConsoleAppDelegate? = ConsoleAppDelegate()
+        var quits = 0
+        delegate?.quit = { quits += 1 }
+        delegate?.installTerminationSignalHandlers()
+        // Installing twice — the app activating, or a second call from anywhere — must not add a
+        // second source that would ask to quit twice.
+        delegate?.installTerminationSignalHandlers()
+
+        // The signal is delivered through a dispatch source on the main queue, which this test's own
+        // run loop drains — so the assertion follows a pump, not the next line.
+        XCTAssertEqual(kill(getpid(), SIGTERM), 0)
+        pumpRunLoop { quits == 1 }
+
+        XCTAssertEqual(quits, 1, "SIGTERM must become the app's own quit, not the default action")
+        // Still here, which is the point: an app that could be killed outright is an app that can
+        // orphan its engine, and stopping the engine is the whole reason this path exists.
+        XCTAssertEqual(kill(getpid(), 0), 0, "the process must survive SIGTERM")
+
+        // A further signal arrives while the quit it asked for is already under way — a retrying
+        // supervisor, `pkill` followed by ⌘Q. It must not start a second quit.
+        XCTAssertEqual(kill(getpid(), SIGTERM), 0)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        XCTAssertEqual(quits, 1, "a second signal must not quit again")
+
+        // Leave the test process as it was found: releasing the delegate cancels its sources, and the
+        // disposition is put back, so no later test (or the runner) is left with an app's signal
+        // handling. The delegate is dropped first, because a live source plus a fatal disposition is a
+        // signal that kills the process instead of being delivered.
+        delegate = nil
+        signal(SIGTERM, SIG_DFL)
+    }
+
+    /// Run the main run loop until `condition` holds, or `timeout` elapses.
+    ///
+    /// A dispatch source's event is delivered *asynchronously* to the queue it was created on, so
+    /// asserting on the line after `kill` would assert on a turn that has not run yet. This is that
+    /// turn, bounded so a source that never fires fails an assertion rather than hanging the suite.
+    private func pumpRunLoop(timeout: TimeInterval = 2, until condition: () -> Bool) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() && Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+    }
 }

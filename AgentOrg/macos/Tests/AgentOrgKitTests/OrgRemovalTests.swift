@@ -223,7 +223,12 @@ final class OrgRemovalTests: XCTestCase {
         XCTAssertEqual(controller.activeOrgId, "org_beta",
                        "the engine must select a successor rather than keep a dangling active id")
         XCTAssertEqual(try activeOrgIdOnDisk(), "org_beta")
-        XCTAssertNil(controller.activeOrg, "no row may be marked active while none exists")
+        // The row as well as the id, and it must be the *successor*: a register that re-points the id
+        // while the panel still resolves the row it had is the same bug one layer down. (This assertion
+        // used to demand nil here, which only holds when nothing is left to point at — that is the
+        // separate case the disappearing-register test covers.)
+        XCTAssertEqual(controller.activeOrg?["id"]?.stringValue, "org_beta",
+                       "the row marked active must be the successor, not the org that was removed")
     }
 
     func testARemovalPreviewReportsTheBytesThatWillStayOnDisk() async throws {
@@ -321,15 +326,28 @@ final class OrgRemovalTests: XCTestCase {
         // `del self.agents[agent_id]`), so it is not a no-op dressed up as a delete. What the UI must not
         // imply is that a record survives — nothing in `terminate` writes the reason anywhere — which is
         // why no confirmation here collects one.
+        //
+        // **A fresh project has no hired agent, so one is hired first.** `_cmd_agents` marks an agent
+        // `hired` only when its `origin` is `owner`, and the seeded default company is seven built-ins
+        // plus the Owner — the engine's own reply says `hired: 0`. This test used to read the roster
+        // looking for a `hired` row and failed on its own premise. Retiring a *built-in* would not be
+        // the same test either, and would be a worse one: `People.save` writes only owner-hired agents,
+        // so a terminated built-in is simply re-derived by the next load, under a freshly generated id —
+        // the entry the test holds would vanish from the list while the agent itself came back. That is
+        // exactly the "hide, not remove" this test exists to catch, so the fixture is a real hire.
         let project = try makeProject(named: "people")
         try seededPortfolio(orgs: [("People", project.path)])
         let controller = try await launchedController(project: project)
         defer { controller.stop() }
         await controller.loadWindow()
 
+        let skill = try XCTUnwrap(controller.skills.first,
+                                  "the engine's own skill catalogue is what a hire is for")
+        let hiredOK = await controller.hireAgent(AgentDraft(name: "Nadia", skill: skill))
+        XCTAssertTrue(hiredOK, "the agent this test retires has to be a real hire first")
+
         let hired = controller.roster.first { $0["status"]?.stringValue == "hired" }
-        let target = try XCTUnwrap(hired,
-                                   "the engine seeds a default company; a hired agent is what retire takes")
+        let target = try XCTUnwrap(hired, "the agent just hired is the one retire takes")
         let id = try XCTUnwrap(target["id"]?.stringValue)
 
         let ok = await controller.retireAgent(id: id)
