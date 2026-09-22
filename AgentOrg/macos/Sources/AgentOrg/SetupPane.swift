@@ -500,14 +500,40 @@ struct HowItWorksCard: View {
 struct EngineStep: View {
     @ObservedObject var controller: OrgController
 
+    /// Whether a launch is already in flight.
+    ///
+    /// The gate answers `.engineUnavailable` for anything short of readiness, so while the bridge was
+    /// launching this step read "The engine has not started yet, so there is nothing to ask it" and
+    /// offered a Start button — at the very moment the sidebar said "Working…". Two surfaces, one
+    /// process, opposite accounts of it. The button was worse than the sentence: `launch()` returns
+    /// early while the state is live, so pressing it did nothing at all.
+    private var isLaunching: Bool { controller.engineState == .launching }
+
+    /// What to say while the launch runs. The console's own words, for the same reason every other
+    /// figure in this app is the engine's: a second account of one launch is a second thing to drift.
+    private var launchDetail: String {
+        controller.waitingAdvice
+            ?? "The engine is starting. This step becomes the model question as soon as it reports ready."
+    }
+
     var body: some View {
-        StepCard(symbol: "power.circle", title: controller.setupGate.title,
-                 detail: controller.setupGate.detail) {
+        StepCard(symbol: "power.circle",
+                 title: isLaunching ? "Starting the engine" : controller.setupGate.title,
+                 detail: isLaunching ? launchDetail : controller.setupGate.detail) {
             HStack(spacing: 8) {
-                Button("Start the engine") { controller.launch() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!controller.canLaunch)
-                    .accessibilityLabel("Start the engine")
+                if isLaunching {
+                    // No control here, because there is nothing to control: what the person needs is the
+                    // state and the deadline it is being held to, not a button that cannot act.
+                    Label(controller.launchProgress?.summary(now: Date())
+                            ?? "Waiting for the engine to report ready",
+                          systemImage: "hourglass")
+                        .font(.callout).foregroundStyle(.secondary)
+                } else {
+                    Button("Start the engine") { controller.launch() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!controller.canLaunch)
+                        .accessibilityLabel("Start the engine")
+                }
                 if let problem = controller.runtimeProblem {
                     // The reason, not the fact: a first-run step that cannot explain a missing
                     // interpreter is not a first-run step.

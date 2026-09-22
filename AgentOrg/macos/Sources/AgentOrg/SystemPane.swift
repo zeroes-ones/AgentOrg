@@ -254,6 +254,10 @@ struct SystemPane: View {
         let total = reach.capabilities.count
         let unheld = reach.heldByNobody.count
         let unbuilt = controller.systemUnavailableCount
+        // The engine's own titles for the grants it reports as unbuilt, so what a person reads names
+        // real capabilities instead of leaving a count to be guessed at. Decoded from the reply, because
+        // the app keeps no list of its own.
+        let unbuiltNames = controller.systemCapabilities.filter { !$0.available }.map(\.title)
         return HStack(alignment: .top, spacing: 18) {
             Button { showHolders.toggle() } label: {
                 HStack(alignment: .top, spacing: 5) {
@@ -272,8 +276,25 @@ struct SystemPane: View {
             .accessibilityHint(showHolders ? "Hides the two lists"
                                            : "Shows the two lists, and where to grant one")
 
+            // The second figure was "declared, no tool behind it" — a description of the state with no
+            // verb, sitting beside a figure that *is* actionable. A count with no action still reads as
+            // a to-do, which is how "6 of 12" became a question about what to do next.
+            //
+            // The answer is that there is nothing to do, and it is the engine's answer rather than this
+            // pane's: `syscap.summary` reports a capability with no tool separately from one no agent
+            // holds, because "a capability with no tool yet is a *build* fact, not a permission the
+            // agent lacks, and conflating them would have the console asking a person to grant
+            // something that would not work" (`engine/syscap.py`). So the sentence names the ones still
+            // to be built and says outright that granting one would not help.
             Metric(label: "no tool yet", value: "\(unbuilt) of \(total)",
-                   detail: unbuilt == 0 ? "every one is built" : "declared, no tool behind it")
+                   detail: unbuilt == 0
+                       ? "every one is built"
+                       : "nothing to grant — these are not written yet")
+                .help(unbuiltNames.isEmpty
+                      ? "Every declared capability has a tool behind it."
+                      : "Still to be built: \(unbuiltNames.joined(separator: ", ")). "
+                        + "Granting one of these would not make it work — the tool itself does not exist "
+                        + "yet, so there is no switch here and nothing to change in the roster.")
 
             // Only where the engine named the acting holder. A missing holder is not zero — see
             // `ownerGapNote`, which says so in words instead of printing a figure that would be a lie.
