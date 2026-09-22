@@ -257,6 +257,11 @@ struct PortfolioSection: View {
         let isActive = id == controller.activeOrgId
         let running = row["running"]?.boolValue ?? false
         let headline = row["headline"]?.stringValue ?? (org["exists"]?.boolValue == true ? "loaded" : "")
+        // Whether this org is stopped pending a decision by a person. The engine's own read: `fleet.py`
+        // sets `waiting_host` for a parked gate or a waiting phase, and `blocked` counts node stops. It
+        // decides the *emphasis* of the switch control below and nothing else — never whether a control
+        // exists, which would be this view inventing the engine's answer.
+        let waitingOnPerson = row["waiting_host"]?.boolValue == true || (row["blocked"]?.intValue ?? 0) > 0
         let tone: Color = !enabled ? .secondary
             : (row["waiting_host"]?.boolValue == true ? .orange
                : ((row["blocked"]?.intValue ?? 0) > 0 ? .red : (running ? .blue : .primary)))
@@ -299,6 +304,23 @@ struct PortfolioSection: View {
                     .font(.caption2).foregroundStyle(.orange).lineLimit(1)
             }
 
+            // A row waiting on a person showed the engine's headline ("Waiting on you: approve the
+            // release") and then offered exactly one control that could resolve it — named "Switch to
+            // this", which is the mechanism rather than what the person gets. So what is being waited
+            // for and the step that resolves it now sit together, and the switch is emphasised and named
+            // for its outcome. Switching is the real remedy and not a shortcut around one: a parked plan
+            // is decided in its own org's context, which is what makes an org the one the window
+            // describes.
+            if waitingOnPerson {
+                Label(isActive
+                        ? "waiting on you — its parked plan, and the decision it needs, are on Now"
+                        : "waiting on you — its parked plan is decided in that org's own context",
+                      systemImage: "hand.raised")
+                    .font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityElement(children: .combine)
+            }
+
             HStack(spacing: 8) {
                 TextField("Goal for \(org["name"]?.stringValue ?? "this org")",
                           text: binding(for: id))
@@ -317,8 +339,19 @@ struct PortfolioSection: View {
                         .help("Ask this org's run to pause at its next node boundary")
                 }
                 if !isActive {
-                    Button("Switch to this") { Task { await controller.selectOrg(id) } }
-                        .help("Make this org the one the rest of this window describes")
+                    if waitingOnPerson {
+                        // The emphasised control on a row that is going nowhere else. "Decide" rather
+                        // than "Switch": the switch is what the app does, the decision is what the
+                        // person came here to make.
+                        Button("Switch to it and decide") { Task { await controller.selectOrg(id) } }
+                            .buttonStyle(.borderedProminent)
+                            .help("Make this org the one this window describes. Its parked plan, and the "
+                                  + "decision it is waiting on, are shown on Now.")
+                            .accessibilityLabel("Switch to this org and decide what it is waiting on")
+                    } else {
+                        Button("Switch to this") { Task { await controller.selectOrg(id) } }
+                            .help("Make this org the one the rest of this window describes")
+                    }
                 }
                 // Destructive, so it is separated from the row's ordinary controls and named for what
                 // it does to the *register* rather than for the word "delete" — which would promise a
